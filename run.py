@@ -7,12 +7,12 @@ cam_view.py, with per-frame YOLO26 detection + box drawing added in.
 No ultralytics import anywhere — inference goes through trt_engine.py.
 
 Usage:
-    python3 cam_infer.py --engine best.engine
-    python3 cam_infer.py --engine best.engine --classes classes.txt --conf-thres 0.35
-    python3 cam_infer.py --engine best.engine --fps 15 --width 1280 --height 972
-    python3 cam_infer.py --engine best.engine --index 0        # skip auto-detect
-    python3 cam_infer.py --engine best.engine --no-display     # headless, prints detections
-    python3 cam_infer.py --engine best.engine --save out.mp4   # also record annotated video
+    python3 run.py --engine best.engine
+    python3 run.py --engine best.engine --classes classes.txt --conf-thres 0.35
+    python3 run.py --engine best.engine --fps 15 --width 1280 --height 972
+    python3 run.py --engine best.engine --index 0        # skip auto-detect
+    python3 run.py --engine best.engine --no-display     # headless, prints detections
+    python3 run.py --engine best.engine --save out.mp4   # also record annotated video
 """
 
 import argparse
