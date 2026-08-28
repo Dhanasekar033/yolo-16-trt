@@ -278,6 +278,20 @@ class RollingWindow:
         return self.start is not None and self.start >= len(self.sheet.rows)
 
 
+def _overlap(a, b):
+    """Intersection over union of two boxes — used to recognise the same
+    physical label from one frame to the next."""
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
 def sheet_period(sheet, limit=400):
     """Smallest number of rows after which the sheet repeats itself, or None.
 
@@ -454,10 +468,15 @@ def main():
                      help="where to write the sheet annotated with what was "
                           "decoded. Defaults to a fixed path per sheet so it "
                           "can be resumed; the source --xlsx is never touched.")
-    ap.add_argument("--xlsx-every", type=int, default=20,
-                     help="save the annotated sheet after this many rows "
-                          "retire, so a kill does not lose the run. Written on "
-                          "a background thread. 0 = only at exit.")
+    ap.add_argument("--xlsx-every", type=int, default=0,
+                     help="also rewrite the annotated .xlsx every N rows. "
+                          "Costly (openpyxl is pure Python and stalls the "
+                          "capture loop), and not needed for durability — "
+                          "progress is journalled continuously either way. "
+                          "0 = write the xlsx at exit only.")
+    ap.add_argument("--max-decodes", type=int, default=0,
+                     help="cap how many labels are decoded per frame. 0 = no "
+                          "cap. Labels already read are skipped regardless.")
     ap.add_argument("--no-resume", action="store_true",
                      help="ignore the annotated sheet from a previous run and "
                           "start the record empty, anchoring wherever the "
@@ -672,13 +691,47 @@ def main():
 
     xlsx_path = args.out_xlsx or os.path.join(
         args.result_dir, run_name, f"checked_{run_name}.xlsx")
+    journal_path = os.path.join(args.result_dir, run_name, "progress.csv")
+    journal = [None]         # append-only record; the durable source of truth
     xlsx_lock = threading.Lock()
     xlsx_busy = [False]
     # Where the previous run got to. A repeating sheet holds each payload many
     # times over, so without this the first code the camera sees anchors on
     # its copy in the very first block and the whole run starts again.
     resume_hint = [None]
+    handled = [[]]           # boxes whose code was accepted on the last frame
     verified = {}          # excel row number -> (per-column marks, status)
+
+    def _open_journal():
+        """A one-line-per-row append log, flushed as it goes.
+
+        The .xlsx is the deliverable, but writing it is far too slow to do
+        during a run — openpyxl is pure Python, so it holds the GIL and stalls
+        the capture loop. This carries the same information at a cost of
+        microseconds, and the workbook is rebuilt from it at the end.
+        """
+        os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
+        fresh = not os.path.exists(journal_path)
+        journal[0] = open(journal_path, "a", buffering=1)
+        if fresh:
+            per_row = len(sheet.rows[0].texts)
+            journal[0].write("sheet_row,status," +
+                             ",".join(f"d{i+1}" for i in range(per_row)) + "\n")
+
+    def _load_journal():
+        """Rows verified by earlier runs. Last entry for a row wins."""
+        if args.no_resume or not os.path.exists(journal_path):
+            return
+        import csv as _csv
+        with open(journal_path, newline="") as fh:
+            for rec in _csv.reader(fh):
+                if len(rec) < 3 or rec[0] == "sheet_row":
+                    continue
+                try:
+                    number = int(rec[0])
+                except ValueError:
+                    continue
+                verified[number] = (rec[2:], rec[1])
 
     def _load_previous():
         """Pick up what an earlier run already verified, so the record adds up
@@ -717,14 +770,7 @@ def main():
             marks = [values[first + i] if first + i < len(values) else None
                      for i in range(per_row)]
             verified[n] = (marks, status)
-        done = sum(1 for _, st in verified.values() if st == "OK")
-        if verified:
-            last = max(verified)
-            by_number = {r.number: i for i, r in enumerate(sheet.rows)}
-            resume_hint[0] = by_number.get(last)
-        print(f"[window] resuming: {done} rows already verified in "
-              f"{xlsx_path} — continuing from sheet row "
-              f"{max(verified) if verified else '?'}")
+        pass
 
     def record_row(row_idx, complete):
         """Fold one retired row into the record kept for the sheet."""
@@ -746,6 +792,8 @@ def main():
         if verified.get(number, (None, None))[1] == "OK" and status != "OK":
             return
         verified[number] = (marks, status)
+        if journal[0] is not None:
+            journal[0].write(f"{number},{status}," + ",".join(marks) + "\n")
 
     def write_annotated_xlsx(background=False):
         """Copy the source sheet and add, per row, which codes were decoded.
@@ -906,7 +954,16 @@ def main():
         return img
 
     if window is not None:
-        _load_previous()
+        _load_previous()      # an .xlsx from an older run, if there is one
+        _load_journal()       # then the journal, which wins where they differ
+        _open_journal()
+        if verified:
+            last = max(verified)
+            by_number = {r.number: i for i, r in enumerate(sheet.rows)}
+            resume_hint[0] = by_number.get(last)
+            done = sum(1 for _, st in verified.values() if st == "OK")
+            print(f"[window] resuming from row {last} — {done} rows already "
+                  f"verified ({len(verified)} recorded)")
 
     def draw_window(frame, compact=False):
         """One status line on the video, since the detail now lives in its own
@@ -958,9 +1015,27 @@ def main():
             return
 
         qr_dets = [d for d in dets if int(d[5]) == qr_cls]
+        settled = list(handled[0])       # labels dealt with on the last frame
+        handled[0] = []
+        budget = args.max_decodes or None
+
         for det in dets:
             if int(det[5]) != label_cls:
                 continue
+
+            # A label sits in view for many frames and would otherwise be
+            # decoded on every one of them. Once its code has been accepted
+            # there is nothing more to learn from it, so carry the box forward
+            # by overlap and skip it — this is most of the per-frame cost.
+            box = det[:4]
+            if any(_overlap(box, prev) > 0.45 for prev in settled):
+                handled[0].append(tuple(float(v) for v in box))
+                continue
+
+            if budget is not None:
+                if budget <= 0:
+                    continue         # rest of the labels wait for next frame
+                budget -= 1
 
             qr = pick_qr_for_label(det[:4], qr_dets)
             text, box = decode_qr(frame, det[:4], margin=0.0, min_px=0)
@@ -1000,9 +1075,17 @@ def main():
                 if saver is not None:
                     saver.save(frame, det[:4], text)
                 stop_machine(f"unexpected code ({belongs})")
+                # Carried forward like an accepted label so the same offending
+                # code is reported once while it is in view, not every frame.
+                handled[0].append(tuple(float(v) for v in det[:4]))
+                continue
+
+            if status == RollingWindow.REPEAT:
+                handled[0].append(tuple(float(v) for v in det[:4]))
                 continue
 
             if status == RollingWindow.MATCH:
+                handled[0].append(tuple(float(v) for v in det[:4]))
                 row_no = sheet.rows[row_idx].number
                 if args.debug:
                     print(f"[window] row {row_no} QR DATA{col + 1} ok "
@@ -1028,7 +1111,7 @@ def main():
         missing = sorted(window.missing(row_idx))
         record_row(row_idx, complete)
         if args.xlsx_every and len(verified) % args.xlsx_every == 0:
-            write_annotated_xlsx(background=True)
+            write_annotated_xlsx(background=True)   # off unless asked for
         if complete and not missing:
             gap_streak = 0
             gap_recent.append(False)
@@ -1235,6 +1318,8 @@ def main():
             writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
+        if journal[0] is not None:
+            journal[0].close()
         if window is not None:
             for _ in range(60):          # let any background save finish first
                 with xlsx_lock:
