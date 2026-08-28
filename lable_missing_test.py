@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Global Shutter Camera viewer + live YOLO26 TensorRT inference.
+Global Shutter Camera + live YOLO26 TensorRT inference, with a geometric
+check for label detections the model MISSED at high speed.
 
-Same GStreamer/OpenCV capture pipeline and staleness-guard setup as
-cam_view.py, with per-frame YOLO26 detection + box drawing added in.
-No ultralytics import anywhere — inference goes through trt_engine.py.
+The labels flow horizontally in a regular grid, so each row of labels lies on
+a 1-D lattice of equally spaced x-centres. The average distance between
+neighbouring labels (the pitch) is measured live from the smallest recurring
+gaps; any row gap that comes out as ~2x / ~3x that pitch means the detector
+dropped one/two labels there, and any row that is short at one end while its
+neighbour rows are not means a label was dropped at the edge. Missed slots are
+drawn in red and can be logged to CSV / dumped as frames for review.
 
 Usage:
-    python3 run.py --engine best.engine
-    python3 run.py --engine best.engine --classes classes.txt --conf-thres 0.35
-    python3 run.py --engine best.engine --fps 15 --width 1280 --height 972
-    python3 run.py --engine best.engine --index 0        # skip auto-detect
-    python3 run.py --engine best.engine --no-display     # headless, prints detections
-    python3 run.py --engine best.engine --save out.mp4   # also record annotated video
+    python3 lable_missing_test.py --engine best.engine
+    python3 lable_missing_test.py --engine best.engine --miss-log misses.csv
+    python3 lable_missing_test.py --engine best.engine --save-miss-frames misses/
+    python3 lable_missing_test.py --engine best.engine --pitch 190   # fix the pitch
+    python3 lable_missing_test.py --engine best.engine --no-miss-check
+    python3 lable_missing_test.py --engine best.engine --no-display  # headless
 """
 
 import argparse
@@ -21,7 +26,7 @@ import time
 
 import cv2
 
-from utils.qr import CenterLineQRDecoder
+from utils.grid import MissingLabelDetector
 from utils.trt_engine import YOLO26TRT
 from utils.utils import preprocess, postprocess, draw_detections
 
@@ -40,11 +45,9 @@ DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/2
 DEFAULT_IMGSZ      = 640
 DEFAULT_CONF_THRES = 0.25
 
-# ── QR decode config ─────────────────────────────────────────────────────────
-DEFAULT_LABEL_CLASS = "label"      # class whose crossing triggers a decode
-DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
-DEFAULT_LINE_POS    = 0.5          # vertical trigger line, fraction of width
-DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
+# ── Missing-label check config ───────────────────────────────────────────────
+DEFAULT_LABEL_CLASS = "label"   # class laid out on the grid
+MISS_PRINT_EVERY    = 0.5       # s, rate-limit for repeating the same complaint
 
 ROTATE_MAP = {
     0:   None,
@@ -122,7 +125,7 @@ def class_index(class_names, name, fallback):
     classes.txt was supplied (or the name isn't in it)."""
     if class_names and name in class_names:
         return class_names.index(name)
-    print(f"[qr] class '{name}' not found in --classes, using index {fallback}")
+    print(f"[miss] class '{name}' not found in --classes, using index {fallback}")
     return fallback
 
 
@@ -141,25 +144,25 @@ def main():
                      help="Just print FPS/detections instead of opening a window (headless).")
     # inference args
     ap.add_argument("--engine", default="best.engine", help="path to .engine file")
-    ap.add_argument("--classes", default=None, help="txt file, one class name per line")
+    ap.add_argument("--classes", default="classes.txt", help="txt file, one class name per line")
     ap.add_argument("--conf-thres", type=float, default=DEFAULT_CONF_THRES)
     ap.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
     ap.add_argument("--save", default=None, help="optional path to record annotated video")
-    # qr decode args
-    ap.add_argument("--no-qr", action="store_true",
-                     help="disable the center-line QR decoding.")
+    # missing-label check args
+    ap.add_argument("--no-miss-check", action="store_true",
+                     help="disable the grid-based missing-label check.")
     ap.add_argument("--label-class", default=DEFAULT_LABEL_CLASS,
-                     help="class name that triggers a decode when it crosses the line.")
-    ap.add_argument("--qr-class", default=DEFAULT_QR_CLASS,
-                     help="class name of the QR box that gets cropped and decoded.")
-    ap.add_argument("--line-pos", type=float, default=DEFAULT_LINE_POS,
-                     help="vertical trigger line as a fraction of frame width (0-1).")
-    ap.add_argument("--qr-margin", type=float, default=DEFAULT_QR_MARGIN,
-                     help="quiet zone around the qr box, as a fraction of its size.")
-    ap.add_argument("--qr-margin-min", type=int, default=8,
-                     help="minimum quiet zone in pixels.")
-    ap.add_argument("--dump-crops", default=None,
-                     help="directory to save qr crops that failed to decode.")
+                     help="class name laid out on the grid.")
+    ap.add_argument("--pitch", type=float, default=None,
+                     help="fix the label-to-label distance in px instead of measuring it.")
+    ap.add_argument("--lattice-tol", type=float, default=0.30,
+                     help="how far a gap may sit off a whole pitch multiple (0-1).")
+    ap.add_argument("--no-end-check", action="store_true",
+                     help="only flag gaps inside a row, never a short row end.")
+    ap.add_argument("--miss-log", default=None,
+                     help="CSV file to append every missed slot to.")
+    ap.add_argument("--save-miss-frames", default=None,
+                     help="directory to dump annotated frames that contain a miss.")
     args = ap.parse_args()
 
     cam_index = args.index if args.index is not None else find_camera_index()
@@ -178,19 +181,27 @@ def main():
     # 90/270 rotation swaps the effective width/height for sizing the window/writer.
     disp_w, disp_h = (args.height, args.width) if args.rotate in (90, 270) else (args.width, args.height)
 
-    decoder = None
-    if not args.no_qr:
-        decoder = CenterLineQRDecoder(
-            line_x=int(disp_w * args.line_pos),
+    checker = None
+    if not args.no_miss_check:
+        checker = MissingLabelDetector(
             label_cls=class_index(class_names, args.label_class, 0),
-            qr_cls=class_index(class_names, args.qr_class, 1),
-            margin=args.qr_margin,
-            min_px=args.qr_margin_min,
-            on_decode=lambda t: print(f"\n[qr] decoded: {t}"),
-            dump_dir=args.dump_crops,
+            pitch=args.pitch,
+            lattice_tol=args.lattice_tol,
+            end_check=not args.no_end_check,
         )
-        print(f"[qr] trigger line at x={decoder.line_x} "
-              f"({args.label_class} crossing -> decode {args.qr_class})")
+        print(f"[miss] grid check on '{args.label_class}'"
+              f"{f' with a fixed pitch of {args.pitch:.0f}px' if args.pitch else ''}")
+
+    miss_log = None
+    if args.miss_log:
+        new_file = not os.path.exists(args.miss_log)
+        miss_log = open(args.miss_log, "a", buffering=1)
+        if new_file:
+            miss_log.write("frame,time,row,kind,x,y,pitch,n_labels\n")
+        print(f"[miss] logging missed slots to {args.miss_log}")
+
+    if args.save_miss_frames:
+        os.makedirs(args.save_miss_frames, exist_ok=True)
 
     writer = None
     if args.save:
@@ -210,6 +221,9 @@ def main():
     try:
         prev_t = time.time()
         fps = 0.0
+        frame_idx = 0
+        last_miss_print = 0.0
+        last_miss_count = 0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -222,17 +236,40 @@ def main():
             inp, ratio, pad = preprocess(frame, model.input_size)
             raw = model.infer(inp)
             dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres)
+            frame_idx += 1
 
-            # ── center-line QR decode ────────────────────────────────────
-            # Every label crossing the line is decoded once — labels are kept
-            # apart by the y-centre of their box, and the set is cleared when
-            # the line goes clear again (no tracker involved).
-            if decoder is not None:
-                decoder.update(frame, dets)
+            # ── missing-label check ──────────────────────────────────────
+            # Rows of labels sit on an even lattice, so an empty slot in a row
+            # is a detection the model dropped — no tracker needed.
+            misses = checker.update(dets, frame.shape) if checker else []
 
             frame = draw_detections(frame, dets, class_names)
-            if decoder is not None:
-                decoder.draw(frame)
+            if checker:
+                checker.draw(frame)
+
+            if misses:
+                now_t = time.time()
+                # The same physical label stays missing for many frames as it
+                # travels, so only shout when the count changes or twice a second.
+                if (len(misses) != last_miss_count
+                        or now_t - last_miss_print >= MISS_PRINT_EVERY):
+                    where = ", ".join(f"row {m['row']} @ x={m['x']:.0f} ({m['kind']})"
+                                      for m in misses[:4])
+                    more = f" +{len(misses) - 4} more" if len(misses) > 4 else ""
+                    print(f"\n[miss] frame {frame_idx}: {len(misses)} label(s) "
+                          f"not detected — {where}{more}")
+                    last_miss_print = now_t
+                    last_miss_count = len(misses)
+                if miss_log:
+                    for m in misses:
+                        miss_log.write(f"{frame_idx},{now_t:.3f},{m['row']},{m['kind']},"
+                                       f"{m['x']:.1f},{m['y']:.1f},"
+                                       f"{checker.pitch:.1f},{checker.n_labels}\n")
+                if args.save_miss_frames:
+                    cv2.imwrite(os.path.join(args.save_miss_frames,
+                                             f"miss_{frame_idx:06d}.jpg"), frame)
+            else:
+                last_miss_count = 0
 
             # Simple running FPS: time between consecutive frames, smoothed
             # with an exponential moving average so the readout doesn't
@@ -245,9 +282,10 @@ def main():
                 fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
             if args.no_display:
-                qr_status = f"  qr={decoder.count}" if decoder is not None else ""
+                miss_status = (f"  labels={checker.n_labels}  missing={len(misses)}"
+                               if checker else "")
                 print(f"[camera] frame {frame.shape}  fps={fps:.1f}  "
-                      f"dets={len(dets)}{qr_status}", end="\r")
+                      f"dets={len(dets)}{miss_status}   ", end="\r")
             else:
                 cv2.putText(frame, f"FPS: {fps:.1f}  dets: {len(dets)}", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
@@ -262,6 +300,10 @@ def main():
         cap.release()
         if writer:
             writer.release()
+        if miss_log:
+            miss_log.close()
+        if checker:
+            print(f"\n[miss] {checker.summary()}")
         if not args.no_display:
             cv2.destroyAllWindows()
 

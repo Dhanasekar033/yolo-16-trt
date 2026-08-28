@@ -102,7 +102,8 @@ class CenterLineQRDecoder:
     labels are told apart by the y-centre of their box, which barely moves
     while they travel across a vertical line. A label is retried every frame
     until it decodes, then skipped for the rest of the crossing. The whole set
-    is cleared once the line goes clear again, ready for the next batch.
+    -- including the decoded texts shown in the overlay -- is cleared once the
+    line goes clear again, ready for the next batch.
     """
 
     def __init__(self, line_x, label_cls, qr_cls, margin=0.15, min_px=8,
@@ -119,7 +120,6 @@ class CenterLineQRDecoder:
         self.done = []             # [(y_centre, text)] decoded this crossing
         self.results = []          # [(crop_box, text_or_None)] for drawing
         self.pending = 0           # labels on the line still undecoded
-        self.last_texts = []       # last crossing's texts, kept for the overlay
         self.count = 0             # successful decodes so far
 
     def _crossing_labels(self, dets):
@@ -139,9 +139,8 @@ class CenterLineQRDecoder:
         labels = self._crossing_labels(dets)
 
         if not labels:
-            # Line is clear: this batch has passed, reset for the next one.
-            if self.done:
-                self.last_texts = [t for _, t in self.done]
+            # Line is clear: this batch has passed, wipe the decoded texts so
+            # the overlay goes blank until the next label reaches the line.
             self.occupied = False
             self.done = []
             self.results = []
@@ -203,7 +202,7 @@ class CenterLineQRDecoder:
             cv2.rectangle(frame, (x1, y1), (x2, y2),
                           (255, 0, 255) if text else (0, 0, 255), 2)
 
-        texts = [t for _, t in self.done] or self.last_texts
+        texts = [t for _, t in self.done]
         cv2.putText(frame, f"QR total: {self.count}  on line: {len(self.done)}"
                            f" ok / {self.pending} pending", (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)

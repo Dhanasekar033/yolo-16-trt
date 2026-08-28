@@ -6,6 +6,13 @@ Same GStreamer/OpenCV capture pipeline and staleness-guard setup as
 cam_view.py, with per-frame YOLO26 detection + box drawing added in.
 No ultralytics import anywhere — inference goes through trt_engine.py.
 
+QR handling in this version:
+  Every detection box classified as --qr-class is cropped (with a margin)
+  and decoded EVERY FRAME. There is no "trigger line" / "label crossing"
+  logic — if a QR box is visible and readable, it gets decoded. A small
+  dedup cache avoids reprinting the same code on every consecutive frame
+  while it sits in view.
+
 Usage:
     python3 run.py --engine best.engine
     python3 run.py --engine best.engine --classes classes.txt --conf-thres 0.35
@@ -21,7 +28,6 @@ import time
 
 import cv2
 
-from utils.qr import CenterLineQRDecoder
 from utils.trt_engine import YOLO26TRT
 from utils.utils import preprocess, postprocess, draw_detections
 
@@ -41,10 +47,9 @@ DEFAULT_IMGSZ      = 640
 DEFAULT_CONF_THRES = 0.25
 
 # ── QR decode config ─────────────────────────────────────────────────────────
-DEFAULT_LABEL_CLASS = "label"      # class whose crossing triggers a decode
-DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
-DEFAULT_LINE_POS    = 0.5          # vertical trigger line, fraction of width
-DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
+DEFAULT_QR_CLASS  = "qr_code"    # class that is cropped and decoded
+DEFAULT_QR_MARGIN = 0.15         # quiet zone added around the qr box
+DEDUP_TTL_SEC     = 2.0          # suppress reprinting the same string for this long
 
 ROTATE_MAP = {
     0:   None,
@@ -126,6 +131,88 @@ def class_index(class_names, name, fallback):
     return fallback
 
 
+class AllBoxQRDecoder:
+    """
+    Decodes every detection box of a given class, every frame — no trigger
+    line, no label-crossing state machine.
+
+    ASSUMPTION (adjust `_unpack` below if wrong): each item in `dets` is a
+    row/sequence [x1, y1, x2, y2, conf, cls_id]. If your postprocess()
+    returns objects/dicts instead, only `_unpack` needs to change.
+    """
+
+    def __init__(self, qr_cls, margin=DEFAULT_QR_MARGIN, min_px=8,
+                 on_decode=None, dump_dir=None, dedup_ttl=DEDUP_TTL_SEC):
+        self.qr_cls = qr_cls
+        self.margin = margin
+        self.min_px = min_px
+        self.on_decode = on_decode or (lambda t: None)
+        self.dump_dir = dump_dir
+        self.dedup_ttl = dedup_ttl
+        self.detector = cv2.QRCodeDetector()
+        self.count = 0
+        self._last_boxes = []          # boxes decoded this frame, for draw()
+        self._recent = {}              # decoded text -> last-seen timestamp
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+
+    @staticmethod
+    def _unpack(det):
+        x1, y1, x2, y2, conf, cls_id = det[0], det[1], det[2], det[3], det[4], det[5]
+        return float(x1), float(y1), float(x2), float(y2), float(conf), int(cls_id)
+
+    def _expand_box(self, x1, y1, x2, y2, w, h):
+        bw, bh = x2 - x1, y2 - y1
+        mx = max(bw * self.margin, self.min_px)
+        my = max(bh * self.margin, self.min_px)
+        nx1 = max(0, int(x1 - mx))
+        ny1 = max(0, int(y1 - my))
+        nx2 = min(w, int(x2 + mx))
+        ny2 = min(h, int(y2 + my))
+        return nx1, ny1, nx2, ny2
+
+    def update(self, frame, dets):
+        """Crop + decode every qr_cls box in this frame. Call once per frame."""
+        h, w = frame.shape[:2]
+        now = time.time()
+        self._last_boxes = []
+
+        for det in dets:
+            x1, y1, x2, y2, conf, cls_id = self._unpack(det)
+            if cls_id != self.qr_cls:
+                continue
+
+            nx1, ny1, nx2, ny2 = self._expand_box(x1, y1, x2, y2, w, h)
+            if nx2 <= nx1 or ny2 <= ny1:
+                continue
+
+            crop = frame[ny1:ny2, nx1:nx2]
+            self._last_boxes.append((nx1, ny1, nx2, ny2))
+
+            text, points, _ = self.detector.detectAndDecode(crop)
+
+            if text:
+                last_seen = self._recent.get(text, 0.0)
+                if now - last_seen > self.dedup_ttl:
+                    self.count += 1
+                    self.on_decode(text)
+                self._recent[text] = now
+            elif self.dump_dir:
+                fname = os.path.join(self.dump_dir, f"qr_fail_{int(now * 1000)}.png")
+                cv2.imwrite(fname, crop)
+
+        # prune old dedup entries
+        stale = [t for t, ts in self._recent.items() if now - ts > self.dedup_ttl]
+        for t in stale:
+            del self._recent[t]
+
+    def draw(self, frame):
+        for (x1, y1, x2, y2) in self._last_boxes:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+        cv2.putText(frame, f"QR decoded: {self.count}", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Stream the Global Shutter Camera + run live YOLO26 TensorRT inference.")
     # camera args
@@ -147,17 +234,15 @@ def main():
     ap.add_argument("--save", default=None, help="optional path to record annotated video")
     # qr decode args
     ap.add_argument("--no-qr", action="store_true",
-                     help="disable the center-line QR decoding.")
-    ap.add_argument("--label-class", default=DEFAULT_LABEL_CLASS,
-                     help="class name that triggers a decode when it crosses the line.")
+                     help="disable QR decoding.")
     ap.add_argument("--qr-class", default=DEFAULT_QR_CLASS,
                      help="class name of the QR box that gets cropped and decoded.")
-    ap.add_argument("--line-pos", type=float, default=DEFAULT_LINE_POS,
-                     help="vertical trigger line as a fraction of frame width (0-1).")
     ap.add_argument("--qr-margin", type=float, default=DEFAULT_QR_MARGIN,
                      help="quiet zone around the qr box, as a fraction of its size.")
     ap.add_argument("--qr-margin-min", type=int, default=8,
                      help="minimum quiet zone in pixels.")
+    ap.add_argument("--qr-dedup-sec", type=float, default=DEDUP_TTL_SEC,
+                     help="suppress reprinting the same decoded string for this many seconds.")
     ap.add_argument("--dump-crops", default=None,
                      help="directory to save qr crops that failed to decode.")
     args = ap.parse_args()
@@ -180,17 +265,16 @@ def main():
 
     decoder = None
     if not args.no_qr:
-        decoder = CenterLineQRDecoder(
-            line_x=int(disp_w * args.line_pos),
-            label_cls=class_index(class_names, args.label_class, 0),
+        decoder = AllBoxQRDecoder(
             qr_cls=class_index(class_names, args.qr_class, 1),
             margin=args.qr_margin,
             min_px=args.qr_margin_min,
             on_decode=lambda t: print(f"\n[qr] decoded: {t}"),
             dump_dir=args.dump_crops,
+            dedup_ttl=args.qr_dedup_sec,
         )
-        print(f"[qr] trigger line at x={decoder.line_x} "
-              f"({args.label_class} crossing -> decode {args.qr_class})")
+        print(f"[qr] decoding every '{args.qr_class}' box every frame "
+              f"(dedup window {args.qr_dedup_sec}s)")
 
     writer = None
     if args.save:
@@ -223,10 +307,7 @@ def main():
             raw = model.infer(inp)
             dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres)
 
-            # ── center-line QR decode ────────────────────────────────────
-            # Every label crossing the line is decoded once — labels are kept
-            # apart by the y-centre of their box, and the set is cleared when
-            # the line goes clear again (no tracker involved).
+            # ── decode every QR box in this frame ───────────────────────
             if decoder is not None:
                 decoder.update(frame, dets)
 
