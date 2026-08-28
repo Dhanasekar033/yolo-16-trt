@@ -25,6 +25,7 @@ the QR DATA1..4 columns of validation.xlsx.
 
 import argparse
 import os
+import threading
 import time
 from collections import deque
 
@@ -32,13 +33,14 @@ import cv2
 
 from utils.crops import LabelSaver
 from utils.mapview import MappingView
-from utils.qr import LABEL, QR, CenterLineQRDecoder
+from utils.qr import LABEL, QR, CenterLineQRDecoder, decode_qr, pick_qr_for_label
 from utils.relay import RelayController
 from utils.results import ResultLog
 from utils.trt_engine import YOLO26TRT
 from utils.ui import ControlPanel
 from utils.utils import preprocess, postprocess, draw_detections
-from utils.validation import BOTTOM_UP, TOP_DOWN, SequenceValidator, ValidationSheet
+from utils.validation import (BOTTOM_UP, TOP_DOWN, SequenceValidator,
+                              ValidationSheet, normalize)
 
 # ── Stream config (same defaults as cam_view.py) ────────────────────────────
 DEFAULT_CAM_INDEX = 0
@@ -87,6 +89,7 @@ def rotate_frame(frame, degrees):
 
 GS_CAMERA_NAME = "Global Shutter Camera"
 MAP_WINDOW = "Sheet vs decoded"
+WINDOW_VIEW = "Rolling window"
 
 
 def list_cameras():
@@ -141,6 +144,156 @@ def load_class_names(path):
         return None
     with open(path) as f:
         return [line.strip() for line in f if line.strip()]
+
+
+class RollingWindow:
+    """A sliding window of expected sheet rows, matched in any order.
+
+    Line-crossing validation required the labels to arrive in sequence: a row
+    was judged as its column passed a fixed point, and anything the camera
+    missed became an out-of-sequence fault. Here the sequence constraint is
+    dropped. Every QR the detector finds anywhere in the frame is offered to a
+    window of the next `size` sheet rows; if the payload belongs to any cell
+    inside that window, the cell is ticked off. Order does not matter, and a
+    label can be read on whichever frame it happens to be legible in.
+
+    A row leaves the window once every checked cell has been ticked, and the
+    head slides forward one row at a time. A payload that belongs to no cell
+    in the window is the fault worth stopping for — it means a label is on the
+    web that the sheet does not expect here.
+    """
+
+    MATCH, REPEAT, UNKNOWN = "match", "repeat", "unknown"
+
+    def __init__(self, sheet, size=8, check=None, grace=4):
+        self.sheet = sheet
+        self.size = max(1, size)
+        self.check = check
+        # Rows kept in the lookup *behind* the head. A label stays in view for
+        # many frames and is decoded on every one, so codes keep arriving for
+        # rows that already finished. Keeping those rows matchable lets such a
+        # read be recognised as a repeat instead of being mistaken for the
+        # next block's copy of the same code, or for a code from nowhere.
+        self.grace = max(0, grace)
+        self.start = None            # sheet row index at the head of the window
+        self.seen = {}               # row index -> set of columns ticked off
+        self.index = {}              # payload -> [(row index, column)]
+        self.done = []               # [(row index, complete?)] as rows retire
+        self.decoded_cells = set()   # (row index, column) ever decoded
+        self.texts = {}              # (row index, column) -> payload as read
+        self.last_hit = None         # (row index, column) most recently ticked
+        self.unexpected = []         # recent payloads that belonged nowhere
+        self.reads = 0
+        self.repeats = 0
+
+    # ── window contents ───────────────────────────────────────────────────
+    def rows(self):
+        if self.start is None:
+            return []
+        end = min(self.start + self.size, len(self.sheet.rows))
+        return list(range(self.start, end))
+
+    def required(self, row_idx):
+        """Columns that must be decoded before this row can retire."""
+        n = len(self.sheet.rows[row_idx].texts)
+        if self.check is None:
+            return {c for c in range(n) if normalize(self.sheet.rows[row_idx].texts[c])}
+        return {c for c in self.check if c < n}
+
+    def missing(self, row_idx):
+        return self.required(row_idx) - self.seen.get(row_idx, set())
+
+    def _rebuild(self):
+        """The payload lookup covers the window plus the grace rows behind it,
+        which is what makes 'not expected here' meaningful."""
+        self.index = {}
+        lo = max(0, self.start - self.grace) if self.start is not None else 0
+        for row_idx in list(range(lo, self.start or 0)) + self.rows():
+            for col, text in enumerate(self.sheet.rows[row_idx].texts):
+                key = normalize(text)
+                if key:
+                    self.index.setdefault(key, []).append((row_idx, col))
+
+    def anchor(self, row_idx):
+        self.start = max(0, row_idx)
+        self.seen = {}
+        self._rebuild()
+        return self.sheet.rows[self.start].number
+
+    # ── matching ──────────────────────────────────────────────────────────
+    def offer(self, text):
+        """Tick off whatever cell this payload belongs to.
+        Returns (status, row_index, column, slot) — slot is how deep into the
+        window the hit landed, 0 being the head."""
+        hits = self.index.get(normalize(text))
+        if not hits:
+            return self.UNKNOWN, None, None, None
+        row_idx, col = min(hits, key=lambda h: h[0])   # nearest the head
+        if row_idx < self.start:
+            self.repeats += 1        # a finished row being read again
+            return self.REPEAT, row_idx, col, None
+        slot = row_idx - self.start
+        self.last_hit = (row_idx, col)
+        if col in self.seen.get(row_idx, set()):
+            self.repeats += 1
+            return self.REPEAT, row_idx, col, slot
+        self.seen.setdefault(row_idx, set()).add(col)
+        self.decoded_cells.add((row_idx, col))
+        self.texts[(row_idx, col)] = text
+        self.reads += 1
+        return self.MATCH, row_idx, col, slot
+
+    # ── sliding ───────────────────────────────────────────────────────────
+    def note_unexpected(self, text, belongs):
+        """Keep the last few codes that matched nothing, for the view."""
+        self.unexpected.append((text, belongs))
+        del self.unexpected[:-4]
+
+    def advance(self):
+        """Retire finished rows from the head. Returns [(row index, True)]."""
+        retired = []
+        while self.start is not None and self.start < len(self.sheet.rows):
+            if self.missing(self.start):
+                break
+            retired.append((self.start, True))
+            self.done.append((self.start, True))
+            self.start += 1
+        if retired:
+            self._rebuild()
+        return retired
+
+    def evict_head(self):
+        """Drop the head row even though it is short — the web has moved a
+        whole window past it, so it is never going to be completed."""
+        if self.start is None or self.start >= len(self.sheet.rows):
+            return None
+        row_idx = self.start
+        self.done.append((row_idx, False))
+        self.start += 1
+        self._rebuild()
+        return row_idx
+
+    @property
+    def exhausted(self):
+        return self.start is not None and self.start >= len(self.sheet.rows)
+
+
+def sheet_period(sheet, limit=400):
+    """Smallest number of rows after which the sheet repeats itself, or None.
+
+    A production sheet is often one block of codes duplicated many times over
+    (validation_x300.xlsx is 17 rows copied 300 times). The window has to stay
+    shorter than that block: if it spans a whole period, every payload appears
+    in it twice and the matching cannot tell one pass from the next.
+    """
+    rows = [tuple(r.texts) for r in sheet.rows]
+    n = len(rows)
+    for period in range(1, min(limit, n // 2 + 1)):
+        if n % period:
+            continue
+        if all(rows[i] == rows[i % period] for i in range(n)):
+            return period
+    return None
 
 
 def parse_check(spec, per_row):
@@ -283,6 +436,33 @@ def main():
                           "chronic problem that no single streak would.")
     ap.add_argument("--no-result-log", action="store_true",
                      help="don't write the per-row CSV of verdicts.")
+    ap.add_argument("--mode", default="window", choices=["window", "line"],
+                     help="'window' decodes every QR the detector finds "
+                          "anywhere in the frame and validates it against a "
+                          "rolling window of sheet rows, in any order. 'line' "
+                          "is the original: decode only what crosses the "
+                          "trigger zone, and require rows in sequence.")
+    ap.add_argument("--window-size", type=int, default=8,
+                     help="how many sheet rows the rolling window holds. "
+                          "Bigger tolerates more out-of-order arrival and more "
+                          "missed rows; smaller catches a stray label sooner.")
+    ap.add_argument("--window-grace", type=int, default=4,
+                     help="rows kept matchable behind the window, so a label "
+                          "still in view after its row finished is recognised "
+                          "as a re-read instead of an unexpected code.")
+    ap.add_argument("--out-xlsx", default=None,
+                     help="where to write the sheet annotated with what was "
+                          "decoded. Defaults to a fixed path per sheet so it "
+                          "can be resumed; the source --xlsx is never touched.")
+    ap.add_argument("--xlsx-every", type=int, default=20,
+                     help="save the annotated sheet after this many rows "
+                          "retire, so a kill does not lose the run. Written on "
+                          "a background thread. 0 = only at exit.")
+    ap.add_argument("--no-resume", action="store_true",
+                     help="ignore the annotated sheet from a previous run and "
+                          "start the record empty, anchoring wherever the "
+                          "sheet first matches. By default a previous run is "
+                          "picked up and the window continues past it.")
     ap.add_argument("--no-map", action="store_true",
                      help="don't open the second window showing the sheet "
                           "against what was decoded.")
@@ -308,8 +488,25 @@ def main():
                                       check=checked)
         print(f"[validate] checking {validator.describe_checks()}")
 
+    window = None
+    if validator is not None and args.mode == "window":
+        size, grace = args.window_size, args.window_grace
+        period = sheet_period(sheet)
+        if period:
+            room = period - grace - 1
+            if size > room:
+                print(f"[window] the sheet repeats every {period} rows, so a "
+                      f"window of {size} would see each code twice — "
+                      f"using {max(1, room)} instead")
+                size = max(1, room)
+        window = RollingWindow(sheet, size=size, check=checked, grace=grace)
+        print(f"[window] rolling window of {window.size} sheet rows "
+              f"(+{window.grace} kept behind for re-reads); decoding every QR "
+              f"in frame, order does not matter")
+
     mapview = None
-    if validator is not None and not args.no_map and not args.no_display:
+    if (validator is not None and args.mode == "line"
+            and not args.no_map and not args.no_display):
         mapview = MappingView(per_row=validator.per_row)
 
     machine_running = False
@@ -473,8 +670,427 @@ def main():
         if mapview is not None:
             mapview.update(result)
 
+    xlsx_path = args.out_xlsx or os.path.join(
+        args.result_dir, run_name, f"checked_{run_name}.xlsx")
+    xlsx_lock = threading.Lock()
+    xlsx_busy = [False]
+    # Where the previous run got to. A repeating sheet holds each payload many
+    # times over, so without this the first code the camera sees anchors on
+    # its copy in the very first block and the whole run starts again.
+    resume_hint = [None]
+    verified = {}          # excel row number -> (per-column marks, status)
+
+    def _load_previous():
+        """Pick up what an earlier run already verified, so the record adds up
+        across sessions instead of starting blank each time."""
+        if args.no_resume or not os.path.exists(xlsx_path):
+            return
+        import openpyxl
+        try:
+            wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+            rows = list(wb.worksheets[0].iter_rows(values_only=True))
+            wb.close()
+        except Exception as exc:
+            # A file left over from a kill during an older, non-atomic save.
+            # Starting fresh beats refusing to run.
+            spoiled = xlsx_path + ".damaged"
+            try:
+                os.replace(xlsx_path, spoiled)
+                where = f" — moved to {spoiled}"
+            except OSError:
+                where = ""
+            print(f"[window] could not read {xlsx_path} ({exc}){where}; "
+                  f"starting the record fresh")
+            return
+        if not rows:
+            return
+        header = [str(c) if c is not None else "" for c in rows[0]]
+        try:
+            first = header.index("READ D1")
+        except ValueError:
+            return
+        per_row = len(sheet.rows[0].texts)
+        for n, values in enumerate(rows[1:], start=2):
+            status = values[first + per_row] if first + per_row < len(values) else None
+            if not status:
+                continue
+            marks = [values[first + i] if first + i < len(values) else None
+                     for i in range(per_row)]
+            verified[n] = (marks, status)
+        done = sum(1 for _, st in verified.values() if st == "OK")
+        if verified:
+            last = max(verified)
+            by_number = {r.number: i for i, r in enumerate(sheet.rows)}
+            resume_hint[0] = by_number.get(last)
+        print(f"[window] resuming: {done} rows already verified in "
+              f"{xlsx_path} — continuing from sheet row "
+              f"{max(verified) if verified else '?'}")
+
+    def record_row(row_idx, complete):
+        """Fold one retired row into the record kept for the sheet."""
+        per_row = len(sheet.rows[0].texts)
+        required = window.required(row_idx)
+        seen = window.seen.get(row_idx, set())
+        marks = []
+        for col in range(per_row):
+            if col not in required:
+                marks.append("not checked")
+            elif col in seen:
+                marks.append("OK")
+            else:
+                marks.append("NOT DECODED")
+        status = "OK" if complete and not (required - seen) else "INCOMPLETE"
+        number = sheet.rows[row_idx].number
+        # A row verified on an earlier pass is not un-verified by a later one
+        # that happened to read it badly.
+        if verified.get(number, (None, None))[1] == "OK" and status != "OK":
+            return
+        verified[number] = (marks, status)
+
+    def write_annotated_xlsx(background=False):
+        """Copy the source sheet and add, per row, which codes were decoded.
+
+        The source file is the reference for what was printed and is never
+        touched — this is a second file recording what the camera could
+        actually read of it. Written to a fixed path so --resume can find it.
+        """
+        if window is None or not verified:
+            return
+        if background:
+            with xlsx_lock:
+                if xlsx_busy[0]:
+                    return          # one already in flight; the next will cover it
+                xlsx_busy[0] = True
+            snapshot = dict(verified)
+            threading.Thread(target=_do_write, args=(snapshot, True),
+                             daemon=True).start()
+            return
+        _do_write(dict(verified), False)
+
+    def _do_write(snapshot, background):
+        try:
+            import openpyxl
+            os.makedirs(os.path.dirname(xlsx_path) or ".", exist_ok=True)
+            wb = openpyxl.load_workbook(args.xlsx)
+            ws = wb[args.sheet] if args.sheet else wb.worksheets[0]
+            first = ws.max_column + 1
+            per_row = len(sheet.rows[0].texts)
+            for i in range(per_row):
+                ws.cell(row=1, column=first + i, value=f"READ D{i + 1}")
+            ws.cell(row=1, column=first + per_row, value="ROW STATUS")
+            ws.cell(row=1, column=first + per_row + 1, value="CHECKED AT")
+
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            for number, (marks, status) in snapshot.items():
+                for col, mark in enumerate(marks):
+                    ws.cell(row=number, column=first + col, value=mark)
+                ws.cell(row=number, column=first + per_row, value=status)
+                ws.cell(row=number, column=first + per_row + 1, value=stamp)
+            # Written to one side and moved into place, because os.replace is
+            # atomic: a kill during the save leaves the previous good file
+            # intact rather than a truncated one that cannot be reopened.
+            tmp = xlsx_path + ".tmp"
+            wb.save(tmp)
+            wb.close()
+            os.replace(tmp, xlsx_path)
+            if not background:
+                ok = sum(1 for _, st in snapshot.values() if st == "OK")
+                print(f"[window] wrote {xlsx_path} — {ok} rows OK, "
+                      f"{len(snapshot) - ok} incomplete")
+        except Exception as exc:
+            print(f"[window] could not write the annotated sheet: {exc}")
+        finally:
+            if background:
+                with xlsx_lock:
+                    xlsx_busy[0] = False
+
+    def render_window_view():
+        """The rolling window as its own panel: what the sheet expects against
+        what has actually been read, plus the state of every open row."""
+        import numpy as np
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        W = 1120
+        open_rows = window.rows()[:8] if window.start is not None else []
+        H = 150 + 4 * 30 + 40 + max(len(open_rows), 1) * 28 + 90
+        img = np.full((H, W, 3), (32, 32, 32), np.uint8)
+
+        BG_OK, BG_BAD, DIM = (80, 220, 80), (70, 70, 235), (130, 130, 130)
+        HEAD, WHITE, AMBER = (200, 200, 200), (240, 240, 240), (60, 200, 235)
+
+        def put(text, x, y, colour=WHITE, scale=0.55, thick=1):
+            cv2.putText(img, text, (x, y), font, scale, colour, thick, cv2.LINE_AA)
+
+        def tail(text, n=30):
+            if not text:
+                return ""
+            text = str(text)
+            return text if len(text) <= n else ".." + text[-(n - 2):]
+
+        if window.start is None:
+            put("ROLLING WINDOW", 24, 42, WHITE, 0.9, 2)
+            put("waiting for a code the sheet recognises", 24, 80, DIM, 0.65)
+            return img
+
+        passed = sum(1 for _, ok in window.done if ok)
+        short = len(window.done) - passed
+        put("ROLLING WINDOW", 24, 42, WHITE, 0.9, 2)
+        put(f"{passed} pass   {short} short   {window.reads} codes read   "
+            f"window {window.size} rows",
+            24, 72, BG_BAD if short else BG_OK, 0.6)
+
+        # ── the row most recently touched, expected against decoded ───────
+        y = 110
+        if window.last_hit is not None:
+            row_idx, _ = window.last_hit
+            row_no = sheet.rows[row_idx].number
+            required = window.required(row_idx)
+            seen = window.seen.get(row_idx, set())
+            put(f"LAST MATCHED  ->  sheet row {row_no}", 24, y, HEAD, 0.65)
+            y += 26
+            for label, x in (("POS", 24), ("EXPECTED (xlsx)", 96),
+                             ("DECODED (camera)", 450), ("RESULT", 810)):
+                put(label, x, y, HEAD, 0.5)
+            cv2.line(img, (16, y + 10), (W - 16, y + 10), (70, 70, 70), 1)
+            for col, expected in enumerate(sheet.rows[row_idx].texts):
+                y2 = y + 10 + (col + 1) * 30
+                if col not in required:
+                    got, res, colour = "(not checked)", "-", DIM
+                elif col in seen:
+                    got = tail(window.texts.get((row_idx, col), expected))
+                    res, colour = "OK", BG_OK
+                else:
+                    got, res, colour = "(waiting)", "..", AMBER
+                put(f"D{col + 1}", 24, y2, HEAD, 0.55)
+                put(tail(expected) or "-", 96, y2, DIM, 0.5)
+                put(got, 450, y2, colour, 0.5)
+                put(res, 810, y2, colour, 0.5)
+            y = y + 10 + 5 * 30
+        else:
+            y += 20
+
+        # ── every open row, and what each still needs ─────────────────────
+        y += 14
+        put("OPEN ROWS", 24, y, HEAD, 0.6)
+        y += 8
+        for i, row_idx in enumerate(open_rows):
+            y2 = y + (i + 1) * 28
+            row_no = sheet.rows[row_idx].number
+            required = window.required(row_idx)
+            seen = window.seen.get(row_idx, set())
+            complete = required and required <= seen
+            colour = BG_OK if complete else (AMBER if i == 0 else WHITE)
+            put(("> " if i == 0 else "  ") + f"row {row_no:<6}", 24, y2, colour, 0.55)
+            x = 190
+            for col in range(len(sheet.rows[row_idx].texts)):
+                if col not in required:
+                    mark, c = "-", DIM
+                elif col in seen:
+                    mark, c = "OK", BG_OK
+                else:
+                    mark, c = "..", AMBER
+                put(f"D{col + 1}:{mark}", x, y2, c, 0.55)
+                x += 92
+            still = sorted(required - seen)
+            if still:
+                put("needs " + ", ".join(f"D{c + 1}" for c in still),
+                    x + 20, y2, AMBER, 0.5)
+        y += (len(open_rows) + 1) * 28
+
+        # ── anything that matched nothing at all ──────────────────────────
+        if window.unexpected:
+            y += 24
+            put("UNEXPECTED", 24, y, BG_BAD, 0.6)
+            for i, (text, belongs) in enumerate(window.unexpected[-2:]):
+                put(f"{tail(text, 44)}   -> {belongs}", 190, y + i * 24,
+                    BG_BAD, 0.5)
+        return img
+
+    if window is not None:
+        _load_previous()
+
+    def draw_window(frame, compact=False):
+        """One status line on the video, since the detail now lives in its own
+        window. `compact` skips the per-row breakdown."""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        x, y = 20, 120
+        if window.start is None:
+            cv2.putText(frame, "WINDOW: waiting for a known code", (x, y),
+                        font, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+            return frame
+
+        passed = sum(1 for _, ok in window.done if ok)
+        failed = len(window.done) - passed
+        head = sheet.rows[window.start].number if not window.exhausted else "-"
+        cv2.putText(frame, f"WINDOW  {passed} pass / {failed} short"
+                           f"   reads {window.reads}   head row {head}",
+                    (x, y), font, 0.8,
+                    (0, 0, 255) if failed else (0, 255, 0), 2, cv2.LINE_AA)
+        if compact:
+            return frame
+
+        for i, row_idx in enumerate(window.rows()[:8]):
+            row_no = sheet.rows[row_idx].number
+            required = window.required(row_idx)
+            seen = window.seen.get(row_idx, set())
+            marks = []
+            for col in range(len(sheet.rows[row_idx].texts)):
+                if col not in required:
+                    marks.append("-")
+                elif col in seen:
+                    marks.append("OK")
+                else:
+                    marks.append("..")
+            head = ">" if i == 0 else " "
+            colour = ((0, 255, 0) if required and required <= seen
+                      else (255, 255, 255) if i else (0, 255, 255))
+            cv2.putText(frame, f"{head} row {row_no:<5} "
+                               + "  ".join(f"D{c+1}:{m}" for c, m in enumerate(marks)),
+                        (x, y + 32 + i * 30), font, 0.6, colour, 2, cv2.LINE_AA)
+        return frame
+
+    def scan_frame(frame, dets):
+        """Decode every label in the frame and offer each payload to the
+        window. No trigger line: a label is read on whichever frame it happens
+        to be legible in, and the window decides whether it belongs here.
+        """
+        nonlocal gap_streak
+        if window is None or label_cls is None:
+            return
+
+        qr_dets = [d for d in dets if int(d[5]) == qr_cls]
+        for det in dets:
+            if int(det[5]) != label_cls:
+                continue
+
+            qr = pick_qr_for_label(det[:4], qr_dets)
+            text, box = decode_qr(frame, det[:4], margin=0.0, min_px=0)
+            if not text and qr is not None:
+                text, box = decode_qr(frame, qr[:4], args.qr_margin,
+                                      args.qr_margin_min)
+            if not text:
+                continue
+
+            # The first payload the sheet recognises decides where the window
+            # sits; until then there is nothing to hold anything against.
+            if window.start is None:
+                hit = sheet.find(text, near=resume_hint[0])
+                if hit is None:
+                    continue
+                anchored = window.anchor(hit[0])
+                note = ("" if resume_hint[0] is None else
+                        f", carrying on from row "
+                        f"{sheet.rows[resume_hint[0]].number}")
+                print(f"[window] anchored on sheet row {anchored}"
+                      f"{note} — window covers {window.size} rows from there")
+
+            status, row_idx, col, slot = window.offer(text)
+
+            if status == RollingWindow.UNKNOWN:
+                # A real code that belongs to no row inside the window: either
+                # the wrong label is on the web, or the window has been left
+                # far behind. Either way it is not something to tolerate.
+                where = sheet.find(text)
+                belongs = (f"sheet row {sheet.rows[where[0]].number} "
+                           f"QR DATA{where[1] + 1}" if where else
+                           "nothing in the sheet")
+                head = sheet.rows[window.start].number if not window.exhausted else "?"
+                print(f"\n[window] UNEXPECTED code: {text}")
+                print(f"[window]   belongs to {belongs}; window starts at row {head}")
+                window.note_unexpected(text, belongs)
+                if saver is not None:
+                    saver.save(frame, det[:4], text)
+                stop_machine(f"unexpected code ({belongs})")
+                continue
+
+            if status == RollingWindow.MATCH:
+                row_no = sheet.rows[row_idx].number
+                if args.debug:
+                    print(f"[window] row {row_no} QR DATA{col + 1} ok "
+                          f"(slot {slot})")
+                if saver is not None:
+                    saver.save(frame, det[:4], text)
+
+                # A hit in the last slot means the web has run a full window
+                # past the head, which is never going to be completed now.
+                if slot >= window.size - 1:
+                    stale = window.evict_head()
+                    if stale is not None:
+                        retire_row(stale, complete=False)
+
+                for done_idx, _ in window.advance():
+                    retire_row(done_idx, complete=True)
+
+    def retire_row(row_idx, complete):
+        """A sheet row has left the window — record it and, if it left short,
+        count it against the miss budget."""
+        nonlocal gap_streak
+        row_no = sheet.rows[row_idx].number
+        missing = sorted(window.missing(row_idx))
+        record_row(row_idx, complete)
+        if args.xlsx_every and len(verified) % args.xlsx_every == 0:
+            write_annotated_xlsx(background=True)
+        if complete and not missing:
+            gap_streak = 0
+            gap_recent.append(False)
+            print(f"[window] PASS row {row_no}: all "
+                  f"{len(window.required(row_idx))} codes read")
+            if results is not None:
+                results.write(_window_result(row_idx, True))
+            return
+
+        cols = ", ".join(f"QR DATA{c + 1}" for c in missing)
+        print(f"[window] FAIL row {row_no}: never read {cols}")
+        if results is not None:
+            results.write(_window_result(row_idx, False))
+        if args.no_stop_on_fail:
+            return
+        gap_streak += 1
+        gap_recent.append(True)
+        window_misses = sum(gap_recent)
+        if gap_streak > args.gap_tolerance:
+            stop_machine(f"{gap_streak} consecutive rows short "
+                        f"(row {row_no} missing {cols})")
+        elif window_misses > args.gap_window_max:
+            stop_machine(f"{window_misses} of the last {len(gap_recent)} rows "
+                        f"short (row {row_no})")
+        else:
+            print(f"[window] tolerating it ({gap_streak} in a row, "
+                  f"{window_misses} in the last {len(gap_recent)})")
+
+    class _WindowResult:
+        """Shaped like a BatchResult so the existing CSV writer can take it."""
+        def __init__(self, row, entries, ok):
+            self.row, self.entries, self.ok = row, entries, ok
+        def summary(self):
+            bad = [e.column for e in self.entries if e.status not in ("OK", "SKIPPED")]
+            return f"row {self.row} missing {', '.join(bad)}" if bad else f"row {self.row}"
+
+    class _WindowEntry:
+        __slots__ = ("pos", "text", "expected", "status")
+        def __init__(self, pos, text, expected, status):
+            self.pos, self.text, self.expected, self.status = pos, text, expected, status
+        @property
+        def column(self):
+            return f"QR DATA{self.pos + 1}"
+
+    def _window_result(row_idx, ok):
+        row = sheet.rows[row_idx]
+        required = window.required(row_idx)
+        seen = window.seen.get(row_idx, set())
+        entries = []
+        for col, expected in enumerate(row.texts):
+            if col not in required:
+                status = "SKIPPED"
+            elif col in seen:
+                status = "OK"
+            else:
+                status = "NO-READ"
+            entries.append(_WindowEntry(col, expected if col in seen else None,
+                                        expected, status))
+        return _WindowResult(row.number, entries, ok)
+
     decoder = None
-    if not args.no_qr:
+    if not args.no_qr and args.mode == "line":
         decoder = CenterLineQRDecoder(
             line_x=int(disp_w * args.line_pos),
             label_cls=label_cls,
@@ -516,6 +1132,11 @@ def main():
             cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(MAP_WINDOW, mapview.WIDTH,
                              mapview.render().shape[0])
+        if window is not None:
+            view = render_window_view()
+            cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_VIEW, view.shape[1], view.shape[0])
+            print(f"[window] comparison panel in the '{WINDOW_VIEW}' window")
 
         panel = ControlPanel(disp_w, disp_h,
                              on_start=lambda: start_machine("start button"),
@@ -550,11 +1171,15 @@ def main():
             # the line goes clear again (no tracker involved).
             if decoder is not None:
                 decoder.update(frame, dets)
+            if window is not None:
+                scan_frame(frame, dets)
 
             frame = draw_detections(frame, dets, class_names)
             if decoder is not None:
                 decoder.draw(frame)
-            if validator is not None:
+            if window is not None:
+                draw_window(frame, compact=True)
+            elif validator is not None:
                 validator.draw(frame)
             if panel is not None:
                 panel.draw(frame, machine_running)
@@ -574,8 +1199,14 @@ def main():
                              f"  web={decoder.step:.0f}px/f"
                              f"  zone={decoder.frames_in_zone:.1f}f"
                              if decoder is not None else "")
-                val_status = (f"  ok={validator.batches_ok} fail={validator.batches_bad}"
-                              if validator is not None else "")
+                if window is not None:
+                    passed = sum(1 for _, ok in window.done if ok)
+                    val_status = (f"  pass={passed} short={len(window.done)-passed}"
+                                  f"  reads={window.reads}")
+                else:
+                    val_status = (f"  ok={validator.batches_ok} "
+                                  f"fail={validator.batches_bad}"
+                                  if validator is not None else "")
                 print(f"[camera] frame {frame.shape}  fps={fps:.1f}  "
                       f"dets={len(dets)}{qr_status}{val_status}   ", end="\r")
             else:
@@ -584,6 +1215,8 @@ def main():
                 cv2.imshow(win_name, frame)
                 if mapview is not None:
                     cv2.imshow(MAP_WINDOW, mapview.render())
+                if window is not None:
+                    cv2.imshow(WINDOW_VIEW, render_window_view())
 
             if writer:
                 writer.write(frame)
@@ -602,6 +1235,13 @@ def main():
             writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
+        if window is not None:
+            for _ in range(60):          # let any background save finish first
+                with xlsx_lock:
+                    if not xlsx_busy[0]:
+                        break
+                time.sleep(0.1)
+            write_annotated_xlsx()
         if results is not None:
             print(f"[results] {results.rows} rows written to {results.path}")
             results.close()
