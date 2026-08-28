@@ -26,15 +26,12 @@ the QR DATA1..4 columns of validation.xlsx.
 import argparse
 import os
 import time
-from collections import deque
 
 import cv2
 
 from utils.crops import LabelSaver
-from utils.mapview import MappingView
 from utils.qr import LABEL, QR, CenterLineQRDecoder
 from utils.relay import RelayController
-from utils.results import ResultLog
 from utils.trt_engine import YOLO26TRT
 from utils.ui import ControlPanel
 from utils.utils import preprocess, postprocess, draw_detections
@@ -62,8 +59,6 @@ DEFAULT_LABEL_CLASS = "label"      # class whose crossing triggers a decode
 DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
 DEFAULT_LINE_POS    = 0.5          # vertical trigger line, fraction of width
 DEFAULT_LINE_WIDTH  = 0            # widen the line into a band, in pixels
-DEFAULT_ZONE        = 0            # decode zone half-width in px; 0 = use the
-                                   # band. Wider = more frames per label.
 DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 
 # ── Validation / machine config ──────────────────────────────────────────────
@@ -86,7 +81,6 @@ def rotate_frame(frame, degrees):
 
 
 GS_CAMERA_NAME = "Global Shutter Camera"
-MAP_WINDOW = "Sheet vs decoded"
 
 
 def list_cameras():
@@ -143,28 +137,6 @@ def load_class_names(path):
         return [line.strip() for line in f if line.strip()]
 
 
-def parse_check(spec, per_row):
-    """Turn "D2,D3" (or "2 3", or "d2;d4") into the 0-based positions to check.
-    None means every position."""
-    if not spec:
-        return None
-    wanted = set()
-    for part in spec.replace(";", ",").replace(" ", ",").split(","):
-        part = part.strip().upper().lstrip("D")
-        if not part:
-            continue
-        if not part.isdigit():
-            raise SystemExit(f"--check: '{part}' is not a QR DATA number")
-        n = int(part)
-        if not 1 <= n <= per_row:
-            raise SystemExit(f"--check: QR DATA{n} is out of range — the sheet "
-                             f"has {per_row} code columns")
-        wanted.add(n - 1)
-    if not wanted:
-        return None
-    return wanted
-
-
 def class_index(class_names, name, fallback):
     """Resolve a class name to its id; fall back to a fixed index when no
     classes.txt was supplied (or the name isn't in it)."""
@@ -192,9 +164,7 @@ def main():
                           "the sheet; without it only the per-row verdicts print.")
     # inference args
     ap.add_argument("--engine", default="best.engine", help="path to .engine file")
-    ap.add_argument("--classes", default=None,
-                     help="txt file, one class name per line "
-                          "(default: classes.txt beside run.py, if present)")
+    ap.add_argument("--classes", default=None, help="txt file, one class name per line")
     ap.add_argument("--conf-thres", type=float, default=DEFAULT_CONF_THRES,
                      help="confidence threshold for classes without their own.")
     ap.add_argument("--conf-label", type=float, default=DEFAULT_CONF_LABEL,
@@ -217,14 +187,6 @@ def main():
     ap.add_argument("--line-width", type=int, default=DEFAULT_LINE_WIDTH,
                      help="widen the trigger line into a band, this many pixels "
                           "either side — keeps an angled row of labels together.")
-    ap.add_argument("--zone", type=int, default=DEFAULT_ZONE,
-                     help="decode zone half-width in pixels. A label is read "
-                          "for every frame it spends in the zone, so widening "
-                          "it gives a stubborn code more attempts. 0 = just the "
-                          "trigger band.")
-    ap.add_argument("--column-gap", type=int, default=0,
-                     help="max x-centre spread within one column of labels "
-                          "(0 = derive it from the label width).")
     ap.add_argument("--decode-source", default=LABEL, choices=[LABEL, QR],
                      help="what gets handed to zxing: the whole label crop "
                           "(default) or just the detected qr box.")
@@ -255,10 +217,6 @@ def main():
     ap.add_argument("--labels-per-row", type=int, default=None,
                      help="labels per crossing (default: the number of QR DATA "
                           "columns found in the sheet).")
-    ap.add_argument("--check", default=None,
-                     help="which label positions to validate, top to bottom, "
-                          "e.g. 'D2,D3' or '2,3'. The rest are neither decoded "
-                          "nor held against the row. Default: all of them.")
     ap.add_argument("--label-order", default=TOP_DOWN, choices=[TOP_DOWN, BOTTOM_UP],
                      help="does the topmost label on screen hold QR DATA1 "
                           "(top-down) or the last column (bottom-up)?")
@@ -268,24 +226,6 @@ def main():
     ap.add_argument("--no-stop-on-fail", action="store_true",
                      help="keep the machine running when a row fails "
                           "validation (default: stop it).")
-    ap.add_argument("--gap-tolerance", type=int, default=2,
-                     help="consecutive rows the vision side can miss (never "
-                          "detected, or read nothing) before that alone stops "
-                          "the machine. A row with a wrong or misplaced code "
-                          "always stops it immediately, regardless of this. "
-                          "0 = stop on the first miss, same as strict mode.")
-    ap.add_argument("--gap-window", type=int, default=20,
-                     help="how many recent judged rows --gap-window-max looks "
-                          "back over.")
-    ap.add_argument("--gap-window-max", type=int, default=5,
-                     help="stop if this many misses land inside --gap-window "
-                          "judged rows, even if never consecutive — catches a "
-                          "chronic problem that no single streak would.")
-    ap.add_argument("--no-result-log", action="store_true",
-                     help="don't write the per-row CSV of verdicts.")
-    ap.add_argument("--no-map", action="store_true",
-                     help="don't open the second window showing the sheet "
-                          "against what was decoded.")
     # relay args
     ap.add_argument("--no-relay", action="store_true",
                      help="don't touch the relay board (vision only).")
@@ -301,38 +241,16 @@ def main():
     validator = None
     if not args.no_validate:
         sheet = ValidationSheet(args.xlsx, args.sheet)
-        checked = parse_check(args.check, args.labels_per_row or sheet.per_row)
         validator = SequenceValidator(sheet, per_row=args.labels_per_row,
                                       order=args.label_order,
-                                      resync=not args.no_resync,
-                                      check=checked)
-        print(f"[validate] checking {validator.describe_checks()}")
-
-    mapview = None
-    if validator is not None and not args.no_map and not args.no_display:
-        mapview = MappingView(per_row=validator.per_row)
+                                      resync=not args.no_resync)
 
     machine_running = False
-    gap_streak = 0            # consecutive vision-side misses since the last
-                              # clean row (or the last stop)
-    gap_recent = deque(maxlen=max(args.gap_window, 1))  # True = miss, per row
 
     def start_machine(reason="operator"):
-        nonlocal machine_running, gap_streak
+        nonlocal machine_running
         if machine_running:
             return
-        # A fresh start gets a fresh miss budget — whatever ran up the streak
-        # before is done with, not carried into the next run.
-        gap_streak = 0
-        gap_recent.clear()
-        # The web coasts to a halt and is nudged while stopped, so whatever is
-        # in front of the camera now is not what the sequence left off at.
-        # Clear the zone and let the next column re-anchor, instead of
-        # reporting the jump as a fault and stopping again.
-        if validator is not None and reason != "startup":
-            validator.reanchor()
-        if decoder is not None:
-            decoder.reset()
         relay.on(args.start_relay)
         machine_running = True
         if panel is not None:
@@ -351,16 +269,11 @@ def main():
         print(f"\n[relay] winding machine STOPPED ({reason}) "
               f"— relay {args.start_relay} OFF")
 
-    run_name = os.path.splitext(os.path.basename(args.xlsx))[0]
     saver = None
     if not args.no_save_labels:
-        saver = LabelSaver(root=args.result_dir, name=run_name,
+        saver = LabelSaver(root=args.result_dir,
+                           name=os.path.splitext(os.path.basename(args.xlsx))[0],
                            ext=args.label_format, pad=args.label_pad)
-
-    results = None
-    if validator is not None and not args.no_result_log:
-        results = ResultLog(root=args.result_dir, name=run_name,
-                            columns=validator.per_row)
 
     relay = RelayController(port=args.relay_port, enabled=not args.no_relay,
                             verbose=args.relay_verbose)
@@ -375,14 +288,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera via GStreamer pipeline")
 
-    classes_path = args.classes
-    if classes_path is None:
-        beside = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "classes.txt")
-        if os.path.exists(beside):
-            classes_path = beside
-            print(f"[model] using {beside}")
-    class_names = load_class_names(classes_path)
+    class_names = load_class_names(args.classes)
     model = YOLO26TRT(args.engine, input_size=(args.imgsz, args.imgsz))
     print(f"[model] loaded {args.engine}")
 
@@ -427,51 +333,18 @@ def main():
 
     def on_batch(texts):
         """Once per crossing, with the payloads in top-to-bottom slot order."""
-        nonlocal gap_streak
         if validator is None:
             return
         result = validator.check_batch(texts)
         validator.report(result)
-        if results is not None:
-            results.write(result)
-        if result is None or args.no_stop_on_fail:
-            return
-        if not result.anchored:
-            return                 # nothing to hold it against yet
-
-        if result.ok:
-            gap_streak = 0
-            gap_recent.append(False)
-            if mapview is not None:
-                mapview.update(result)
-            return
-
-        if not result.is_gap:
-            # A real code sitting in the wrong place, or one that belongs to
-            # a different row: never tolerated, whatever the budget says —
-            # this is the one fault the whole system exists to catch.
-            stop_machine(result.summary())
-            if mapview is not None:
-                mapview.update(result, result.summary())
-            return
-
-        # A pure vision-side miss: the row was never detected, or nothing on
-        # it read. Log it and keep running, up to the budget.
-        gap_streak += 1
-        gap_recent.append(True)
-        window_misses = sum(gap_recent)
-        if gap_streak > args.gap_tolerance:
-            stop_machine(f"{gap_streak} consecutive rows missed by the camera "
-                        f"({result.summary()})")
-        elif window_misses > args.gap_window_max:
-            stop_machine(f"{window_misses} of the last {len(gap_recent)} rows "
-                        f"missed by the camera ({result.summary()})")
-        else:
-            print(f"[validate] tolerating a miss ({gap_streak} in a row, "
-                  f"{window_misses} in the last {len(gap_recent)}) "
-                  f"— {result.summary()}")
-        if mapview is not None:
-            mapview.update(result)
+        # Any failed row stops the machine — a wrong code, a code from another
+        # row, a label out of order, or one that never read at all.
+        if (result is not None and not args.no_stop_on_fail
+                and result.anchored and not result.ok):
+            first = result.failures[0] if result.failures else None
+            why = (f"row {result.row} {first.column} {first.status}" if first
+                   else f"row {result.row} incomplete")
+            stop_machine(why)
 
     decoder = None
     if not args.no_qr:
@@ -487,12 +360,8 @@ def main():
                      if saver is not None else None,
             dump_dir=args.dump_crops,
             half_width=args.line_width,
-            zone=max(args.zone, args.line_width) or None,
-            column_gap=args.column_gap or None,
             source=args.decode_source,
             expect=validator.per_row if validator is not None else args.labels_per_row,
-            identify=validator.identify if validator is not None else None,
-            check=validator.check if validator is not None else None,
         )
         print(f"[qr] trigger line at x={decoder.line_x} "
               f"({args.label_class} crossing -> decode {args.qr_class})")
@@ -511,11 +380,6 @@ def main():
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
         cv2.resizeWindow(win_name, int(disp_w * scale), int(disp_h * scale))
-
-        if mapview is not None:
-            cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(MAP_WINDOW, mapview.WIDTH,
-                             mapview.render().shape[0])
 
         panel = ControlPanel(disp_w, disp_h,
                              on_start=lambda: start_machine("start button"),
@@ -570,20 +434,15 @@ def main():
                 fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
             if args.no_display:
-                qr_status = (f"  qr={decoder.count}"
-                             f"  web={decoder.step:.0f}px/f"
-                             f"  zone={decoder.frames_in_zone:.1f}f"
-                             if decoder is not None else "")
+                qr_status = f"  qr={decoder.count}" if decoder is not None else ""
                 val_status = (f"  ok={validator.batches_ok} fail={validator.batches_bad}"
                               if validator is not None else "")
                 print(f"[camera] frame {frame.shape}  fps={fps:.1f}  "
-                      f"dets={len(dets)}{qr_status}{val_status}   ", end="\r")
+                      f"dets={len(dets)}{qr_status}{val_status}", end="\r")
             else:
                 cv2.putText(frame, f"FPS: {fps:.1f}  dets: {len(dets)}", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow(win_name, frame)
-                if mapview is not None:
-                    cv2.imshow(MAP_WINDOW, mapview.render())
 
             if writer:
                 writer.write(frame)
@@ -602,13 +461,8 @@ def main():
             writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
-        if results is not None:
-            print(f"[results] {results.rows} rows written to {results.path}")
-            results.close()
         if saver is not None:
             print(f"[crops] saved {saver.count} label crops to {saver.dir}/")
-        if decoder is not None and decoder.duplicates:
-            print(f"[qr] {decoder.duplicates} re-tracked columns suppressed")
         if validator is not None:
             print(f"[validate] done: {validator.batches_ok} rows passed, "
                   f"{validator.batches_bad} failed "

@@ -35,6 +35,7 @@ SWAPPED   = "SWAPPED"     # right row, but sitting in another column
 WRONG_ROW = "WRONG-ROW"   # a real code, but from a different sheet row
 UNKNOWN   = "UNKNOWN"     # decoded fine, but no such code in the sheet
 NODECODE  = "NO-READ"     # a label was there, but it never read
+SKIPPED   = "SKIPPED"     # this position is switched off, nothing checked
 
 TOP_DOWN  = "top-down"
 BOTTOM_UP = "bottom-up"
@@ -146,6 +147,8 @@ class Entry:
         return f"QR DATA{self.pos + 1}"
 
     def describe(self):
+        if self.status == SKIPPED:
+            return f"{self.column}: not checked"
         if self.status == NODECODE:
             return f"{self.column}: no read, expected '{self.expected}'"
         if self.status == UNKNOWN:
@@ -174,12 +177,55 @@ class BatchResult:
 
     @property
     def failures(self):
-        return [e for e in self.entries if e.status != OK]
+        return [e for e in self.entries if e.status not in (OK, SKIPPED)]
 
     @property
     def ok(self):
         return (self.anchored and self.complete and not self.resynced
                 and not self.failures)
+
+    def summary(self):
+        """Short reason this crossing failed, for the machine-stop message and
+        the results log. Says what actually went wrong rather than falling back
+        to a catch-all word."""
+        if not self.anchored:
+            return "codes not in the sheet"
+        if self.failures:
+            first = self.failures[0]
+            extra = f" (+{len(self.failures) - 1} more)" if len(self.failures) > 1 else ""
+            return f"row {self.row} {first.column} {first.status}{extra}"
+        if self.resynced:
+            return f"row {self.row} out of sequence"
+        if not self.complete:
+            return f"row {self.row} incomplete ({len(self.entries)} labels)"
+        return f"row {self.row}"
+
+    @property
+    def only_unread(self):
+        """True when every fault is a label that did not read — nothing was
+        wrong with the codes themselves."""
+        return bool(self.failures) and all(e.status == NODECODE
+                                           for e in self.failures)
+
+    @property
+    def has_wrong_code(self):
+        """True if a checked position holds a real payload that belongs
+        somewhere else — the one class of fault that should never be
+        tolerated, because it means the wrong product is going out the door."""
+        return any(e.status in (SWAPPED, WRONG_ROW, UNKNOWN)
+                  for e in self.failures)
+
+    @property
+    def is_gap(self):
+        """True for a failure that traces back to the *vision* side missing
+        something — a label that never read, a row the camera never even
+        detected (which surfaces as a clean resync with no bad codes in it),
+        or a column that left the zone short a label — rather than a real
+        wrong or misplaced code. Covers strictly more than `only_unread`: a
+        resync where every code that *did* decode is correct for its own row
+        is a pure detection gap too, not a mismatch, even though its
+        `failures` list can be empty."""
+        return not self.ok and not self.has_wrong_code
 
 
 class SequenceValidator:
@@ -193,11 +239,15 @@ class SequenceValidator:
     row failing too.
     """
 
-    def __init__(self, sheet, per_row=None, order=TOP_DOWN, resync=True):
+    def __init__(self, sheet, per_row=None, order=TOP_DOWN, resync=True,
+                 check=None):
         self.sheet = sheet
         self.per_row = per_row or sheet.per_row
         self.order = order
         self.resync = resync
+        # Which QR DATA positions are being checked, 0-based. None means all
+        # of them; anything left out is neither read nor held against the row.
+        self.check = None if check is None else set(check)
         self.cursor = None
 
         self.batches = 0
@@ -209,6 +259,35 @@ class SequenceValidator:
         self.exhausted = False
 
     # ── live, per label: pure lookup, so decode order cannot mislead it ────
+    def identify(self, text):
+        """Row index this payload belongs to, or None — the decoder's notion
+        of a column's identity. Two labels resolving to the same index are the
+        same physical row, whatever the position tracker thinks."""
+        hit = self.sheet.find(text, near=self.cursor)
+        return None if hit is None else hit[0]
+
+    def reanchor(self):
+        """Forget where in the sheet we are, so the next crossing re-anchors.
+
+        Called when the machine restarts: the web coasts and is nudged while
+        it is stopped, so the row that comes back past the camera is not
+        necessarily the one the sequence was expecting, and reporting that as
+        a fault would just stop the machine again."""
+        if self.cursor is not None:
+            print("[validate] machine restarted — re-anchoring on the next row")
+        self.cursor = None
+
+    def is_checked(self, pos):
+        return self.check is None or pos in self.check
+
+    def describe_checks(self):
+        if self.check is None:
+            return f"all {self.per_row} positions"
+        on = ", ".join(f"QR DATA{i + 1}" for i in sorted(self.check))
+        off = ", ".join(f"QR DATA{i + 1}" for i in range(self.per_row)
+                        if i not in self.check)
+        return on + (f" (ignoring {off})" if off else "")
+
     def peek(self, text):
         """Where this payload lives in the sheet: (row_number, col_no) or None."""
         hit = self.sheet.find(text, near=self.cursor)
@@ -223,7 +302,7 @@ class SequenceValidator:
         top to bottom, with None where a label never read. Returns a
         BatchResult, or None if the crossing produced no reads at all."""
         if not any(texts):
-            return None
+            return self._unread_batch(texts)
         if self.order == BOTTOM_UP:
             texts = list(reversed(texts))
 
@@ -257,6 +336,9 @@ class SequenceValidator:
         entries = []
         for pos, text in enumerate(texts):
             expected = row.texts[pos] if pos < len(row.texts) else None
+            if not self.is_checked(pos):
+                entries.append(Entry(pos, text, expected, SKIPPED))
+                continue
             if not text:
                 entries.append(Entry(pos, None, expected, NODECODE))
                 continue
@@ -273,18 +355,42 @@ class SequenceValidator:
             else:
                 entries.append(Entry(pos, text, expected, WRONG_ROW, found))
 
-        complete = len(texts) == self.per_row and all(texts)
+        complete = len(texts) == self.per_row and all(
+            text for pos, text in enumerate(texts) if self.is_checked(pos))
         result = BatchResult(row.number, entries, True, complete, resynced,
                              self.sheet.rows[expected_row].number)
         self.last = result
         self.batches += 1
         oks = sum(1 for e in entries if e.status == OK)
         self.labels_ok += oks
-        self.labels_bad += len(entries) - oks
+        self.labels_bad += sum(1 for e in entries
+                               if e.status not in (OK, SKIPPED))
         if result.ok:
             self.batches_ok += 1
         else:
             self.batches_bad += 1
+        self._advance()
+        return result
+
+    def _unread_batch(self, texts):
+        """A column went by and not one of its labels read. That is a fault in
+        its own right, but only once the sequence knows where it is — before
+        that there is no row to hold it against."""
+        if not texts or self.cursor is None:
+            return None
+        row = self.sheet.row(self.cursor)
+        if row is None:
+            return None
+        entries = [Entry(i, None, row.texts[i] if i < len(row.texts) else None,
+                         NODECODE if self.is_checked(i) else SKIPPED)
+                   for i in range(len(texts))]
+        if not any(e.status == NODECODE for e in entries):
+            return None                      # nothing that was being checked
+        result = BatchResult(row.number, entries, True, False, False, row.number)
+        self.last = result
+        self.batches += 1
+        self.batches_bad += 1
+        self.labels_bad += sum(1 for e in entries if e.status == NODECODE)
         self._advance()
         return result
 
@@ -311,16 +417,21 @@ class SequenceValidator:
             print(f"[validate] ?? none of these codes are in the sheet: {reads}")
             return
 
-        n = len(result.entries)
+        n = sum(1 for e in result.entries if e.status != SKIPPED)
         if result.ok:
-            print(f"[validate] PASS row {result.row}: {n}/{n} codes correct")
+            off = len(result.entries) - n
+            note = f" ({off} not checked)" if off else ""
+            print(f"[validate] PASS row {result.row}: {n}/{n} codes correct{note}")
             return
 
         why = []
         if result.failures:
             why.append(f"{len(result.failures)}/{n} wrong")
-        if n != self.per_row:
-            why.append(f"only {n} of {self.per_row} labels seen")
+        # Labels seen is about the physical column — every position has to be
+        # there for the ones being checked to line up, whether or not each is
+        # itself being checked.
+        if len(result.entries) != self.per_row:
+            why.append(f"only {len(result.entries)} of {self.per_row} labels seen")
         if result.resynced:
             why.append("arrived out of sequence")
         print(f"[validate] FAIL row {result.row}: " + ", ".join(why))
