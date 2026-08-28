@@ -13,6 +13,9 @@ import zxingcpp
 
 QR_FORMATS = zxingcpp.BarcodeFormat.QRCode | zxingcpp.BarcodeFormat.MicroQRCode
 
+LABEL = "label"    # hand zxing the whole label crop
+QR    = "qr"       # hand zxing just the detected qr box, plus a quiet zone
+
 
 def expand_box(box, frame_shape, margin=0.15, min_px=8):
     """Grow a box by `margin` (fraction of its own size, at least min_px),
@@ -110,7 +113,7 @@ class CenterLineQRDecoder:
 
     def __init__(self, line_x, label_cls, qr_cls, margin=0.15, min_px=8,
                  on_decode=None, on_batch=None, on_label=None, dump_dir=None,
-                 half_width=0, expect=None):
+                 half_width=0, expect=None, source=LABEL):
         self.line_x = line_x
         self.half_width = half_width  # widen the line into a band, in pixels
         self.expect = expect          # labels per crossing; once that many have
@@ -119,6 +122,7 @@ class CenterLineQRDecoder:
         self.qr_cls = qr_cls
         self.margin = margin
         self.min_px = min_px
+        self.source = source          # what gets handed to zxing: LABEL or QR
         self.on_decode = on_decode   # (text, index) -> status str for overlay
         self.on_batch = on_batch     # (texts top-to-bottom) once per crossing
         self.on_label = on_label     # (frame, label box, text) per decode
@@ -201,11 +205,10 @@ class CenterLineQRDecoder:
                 continue
 
             qr = pick_qr_for_label(label[:4], qr_dets)
-            if qr is None:
-                self.pending += 1
+            text, crop_box = self._decode(frame, label, qr)
+            if crop_box is None:
+                self.pending += 1        # nothing to hand to zxing at all
                 continue
-
-            text, crop_box = decode_qr(frame, qr[:4], self.margin, self.min_px)
             self.results.append((crop_box, text))
 
             if not text:
@@ -240,6 +243,26 @@ class CenterLineQRDecoder:
                 self.on_batch(self.batch_texts())
 
         return new_texts
+
+    def _decode(self, frame, label, qr):
+        """Hand a crop to zxing and return (text, crop_box).
+
+        With LABEL the whole detected label goes in — the QR's printed quiet
+        zone comes along with it, and a label still decodes when the qr_code
+        detector misses its box entirely. The label box is used exactly as
+        detected, with no margin: growing it risks pulling a neighbouring
+        label's code into the crop, which would decode as the wrong payload.
+        A tight qr crop is tried afterwards if the label crop came up empty.
+        """
+        if self.source == QR:
+            if qr is None:
+                return None, None
+            return decode_qr(frame, qr[:4], self.margin, self.min_px)
+
+        text, box = decode_qr(frame, label[:4], margin=0.0, min_px=0)
+        if text or qr is None:
+            return text, box
+        return decode_qr(frame, qr[:4], self.margin, self.min_px)
 
     def batch_texts(self):
         """This crossing's payloads in slot order, None for labels that never

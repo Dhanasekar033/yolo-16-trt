@@ -30,7 +30,7 @@ import time
 import cv2
 
 from utils.crops import LabelSaver
-from utils.qr import CenterLineQRDecoder
+from utils.qr import LABEL, QR, CenterLineQRDecoder
 from utils.relay import RelayController
 from utils.trt_engine import YOLO26TRT
 from utils.ui import ControlPanel
@@ -187,6 +187,9 @@ def main():
     ap.add_argument("--line-width", type=int, default=DEFAULT_LINE_WIDTH,
                      help="widen the trigger line into a band, this many pixels "
                           "either side — keeps an angled row of labels together.")
+    ap.add_argument("--decode-source", default=LABEL, choices=[LABEL, QR],
+                     help="what gets handed to zxing: the whole label crop "
+                          "(default) or just the detected qr box.")
     ap.add_argument("--qr-margin", type=float, default=DEFAULT_QR_MARGIN,
                      help="quiet zone around the qr box, as a fraction of its size.")
     ap.add_argument("--qr-margin-min", type=int, default=8,
@@ -357,6 +360,7 @@ def main():
                      if saver is not None else None,
             dump_dir=args.dump_crops,
             half_width=args.line_width,
+            source=args.decode_source,
             expect=validator.per_row if validator is not None else args.labels_per_row,
         )
         print(f"[qr] trigger line at x={decoder.line_x} "
