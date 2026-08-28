@@ -36,6 +36,7 @@ Thumbs.db
 
 # Large binary outputs (keep source images in SIFT/ tracked)
 output/
+result/
 results/
 temp/
 tmp/

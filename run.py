@@ -16,6 +16,7 @@ Usage:
     python3 run.py --engine best.engine --save out.mp4   # also record annotated video
     python3 run.py --xlsx validation.xlsx                # validate against the sheet
     python3 run.py --no-relay --no-validate              # vision only, no machine
+    python3 run.py --debug                               # print every payload read
 
 On start-up relay 0 is switched ON to run the winding machine, and every
 label crossing the trigger line is decoded and checked, top to bottom, against
@@ -28,9 +29,11 @@ import time
 
 import cv2
 
+from utils.crops import LabelSaver
 from utils.qr import CenterLineQRDecoder
 from utils.relay import RelayController
 from utils.trt_engine import YOLO26TRT
+from utils.ui import ControlPanel
 from utils.utils import preprocess, postprocess, draw_detections
 from utils.validation import BOTTOM_UP, TOP_DOWN, SequenceValidator, ValidationSheet
 
@@ -61,6 +64,7 @@ DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 # ── Validation / machine config ──────────────────────────────────────────────
 DEFAULT_XLSX        = "validation_x300.xlsx"   # expected QR sequence
 DEFAULT_START_RELAY = 0                   # relay 0 = winding machine start
+DEFAULT_RESULT_DIR  = "result"            # <result>/<xlsx name>/labels/
 
 ROTATE_MAP = {
     0:   None,
@@ -155,6 +159,9 @@ def main():
                      help="Rotate every frame by a fixed angle (clockwise).")
     ap.add_argument("--no-display", action="store_true",
                      help="Just print FPS/detections instead of opening a window (headless).")
+    ap.add_argument("--debug", action="store_true",
+                     help="print every payload as it reads and where it sits in "
+                          "the sheet; without it only the per-row verdicts print.")
     # inference args
     ap.add_argument("--engine", default="best.engine", help="path to .engine file")
     ap.add_argument("--classes", default=None, help="txt file, one class name per line")
@@ -186,6 +193,17 @@ def main():
                      help="minimum quiet zone in pixels.")
     ap.add_argument("--dump-crops", default=None,
                      help="directory to save qr crops that failed to decode.")
+    # label crop args
+    ap.add_argument("--result-dir", default=DEFAULT_RESULT_DIR,
+                     help="root for saved label crops: "
+                          "<result-dir>/<xlsx name>/labels/.")
+    ap.add_argument("--no-save-labels", action="store_true",
+                     help="don't save a crop of each decoded label.")
+    ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
+                     help="image format for the saved label crops.")
+    ap.add_argument("--label-pad", type=float, default=0.0,
+                     help="padding around the saved label crop, as a fraction "
+                          "of the box size.")
     # validation args
     ap.add_argument("--xlsx", default=DEFAULT_XLSX,
                      help="xlsx holding the expected QR DATA1..N sequence.")
@@ -202,9 +220,9 @@ def main():
     ap.add_argument("--no-resync", action="store_true",
                      help="don't jump the cursor to a crossing that arrives out "
                           "of sequence (every later row then fails too).")
-    ap.add_argument("--stop-on-mismatch", action="store_true",
-                     help="switch the machine relay off as soon as a crossing "
-                          "fails validation.")
+    ap.add_argument("--no-stop-on-fail", action="store_true",
+                     help="keep the machine running when a row fails "
+                          "validation (default: stop it).")
     # relay args
     ap.add_argument("--no-relay", action="store_true",
                      help="don't touch the relay board (vision only).")
@@ -224,9 +242,39 @@ def main():
                                       order=args.label_order,
                                       resync=not args.no_resync)
 
+    machine_running = False
+
+    def start_machine(reason="operator"):
+        nonlocal machine_running
+        if machine_running:
+            return
+        relay.on(args.start_relay)
+        machine_running = True
+        if panel is not None:
+            panel.note = None
+        print(f"\n[relay] winding machine STARTED ({reason}) "
+              f"— relay {args.start_relay} ON")
+
+    def stop_machine(reason="operator"):
+        nonlocal machine_running
+        if not machine_running:
+            return
+        relay.off(args.start_relay)
+        machine_running = False
+        if panel is not None:
+            panel.note = reason
+        print(f"\n[relay] winding machine STOPPED ({reason}) "
+              f"— relay {args.start_relay} OFF")
+
+    saver = None
+    if not args.no_save_labels:
+        saver = LabelSaver(root=args.result_dir,
+                           name=os.path.splitext(os.path.basename(args.xlsx))[0],
+                           ext=args.label_format, pad=args.label_pad)
+
     relay = RelayController(port=args.relay_port, enabled=not args.no_relay,
                             verbose=args.relay_verbose)
-    machine_running = False
+    panel = None
 
     cam_index = args.index if args.index is not None else find_camera_index()
     pipeline = gstreamer_pipeline(cam_index, args.width, args.height, args.fps, args.format)
@@ -266,29 +314,34 @@ def main():
         reported here — which row and column of the sheet it is. Whether it is
         in the *right* place can't be known until the whole crossing is in, so
         that is left to the batch verdict."""
-        print(f"\n[qr] read: {text}")
+        if args.debug:
+            print(f"\n[qr] read: {text}")
         if validator is None:
             return None
         where = validator.peek(text)
         if where is None:
-            print("[qr]   not in the sheet")
+            if args.debug:
+                print("[qr]   not in the sheet")
             return "not in sheet", False
         row, col = where
-        print(f"[qr]   sheet row {row}, QR DATA{col}")
+        if args.debug:
+            print(f"[qr]   sheet row {row}, QR DATA{col}")
         return f"row {row} D{col}", True
 
     def on_batch(texts):
         """Once per crossing, with the payloads in top-to-bottom slot order."""
-        nonlocal machine_running
         if validator is None:
             return
         result = validator.check_batch(texts)
         validator.report(result)
-        if (result is not None and args.stop_on_mismatch
+        # Any failed row stops the machine — a wrong code, a code from another
+        # row, a label out of order, or one that never read at all.
+        if (result is not None and not args.no_stop_on_fail
                 and result.anchored and not result.ok):
-            print("[relay] mismatch — stopping the machine")
-            relay.off(args.start_relay)
-            machine_running = False
+            first = result.failures[0] if result.failures else None
+            why = (f"row {result.row} {first.column} {first.status}" if first
+                   else f"row {result.row} incomplete")
+            stop_machine(why)
 
     decoder = None
     if not args.no_qr:
@@ -300,6 +353,8 @@ def main():
             min_px=args.qr_margin_min,
             on_decode=on_decode,
             on_batch=on_batch,
+            on_label=(lambda f, box, text: saver.save(f, box, text))
+                     if saver is not None else None,
             dump_dir=args.dump_crops,
             half_width=args.line_width,
             expect=validator.per_row if validator is not None else args.labels_per_row,
@@ -322,12 +377,16 @@ def main():
         scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
         cv2.resizeWindow(win_name, int(disp_w * scale), int(disp_h * scale))
 
+        panel = ControlPanel(disp_w, disp_h,
+                             on_start=lambda: start_machine("start button"),
+                             on_stop=lambda: stop_machine("stop button"))
+        cv2.setMouseCallback(win_name, panel.on_mouse)
+        print("[ui] START/STOP buttons in the window (keys: s = start, x = stop)")
+
     try:
         # The machine starts once everything above is ready, so the very first
         # labels off the winder are already being watched.
-        relay.on(args.start_relay)
-        machine_running = True
-        print(f"[relay] winding machine started (relay {args.start_relay} ON)")
+        start_machine("startup")
 
         prev_t = time.time()
         fps = 0.0
@@ -357,6 +416,8 @@ def main():
                 decoder.draw(frame)
             if validator is not None:
                 validator.draw(frame)
+            if panel is not None:
+                panel.draw(frame, machine_running)
 
             # Simple running FPS: time between consecutive frames, smoothed
             # with an exponential moving average so the readout doesn't
@@ -382,18 +443,22 @@ def main():
             if writer:
                 writer.write(frame)
 
-            if not args.no_display and (cv2.waitKey(1) & 0xFF == ord("q")):
-                break
+            if not args.no_display:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if panel is not None:
+                    panel.on_key(key)
     finally:
-        if machine_running:
-            print(f"\n[relay] stopping the machine (relay {args.start_relay} OFF)")
-            relay.off(args.start_relay)
+        stop_machine("shutting down")
         relay.close()
         cap.release()
         if writer:
             writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
+        if saver is not None:
+            print(f"[crops] saved {saver.count} label crops to {saver.dir}/")
         if validator is not None:
             print(f"[validate] done: {validator.batches_ok} rows passed, "
                   f"{validator.batches_bad} failed "

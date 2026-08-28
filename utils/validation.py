@@ -83,8 +83,7 @@ class ValidationSheet:
         self.sheet_name = ws.title
         self.per_row = len(cols)
         self.rows = []
-        self.by_text = {}
-        duplicates = []
+        self.by_text = {}      # payload -> [(row_index, col_index), ...]
 
         for number, values in enumerate(raw[1:], start=2):
             texts = []
@@ -100,21 +99,30 @@ class ValidationSheet:
                 key = normalize(text)
                 if not key:
                     continue
-                if key in self.by_text:
-                    duplicates.append(text)
-                else:
-                    self.by_text[key] = (row.index, col)
+                self.by_text.setdefault(key, []).append((row.index, col))
 
         wb.close()
+        self.repeats = max((len(v) for v in self.by_text.values()), default=0)
         print(f"[validate] {path} [{self.sheet_name}]: {len(self.rows)} rows x "
               f"{self.per_row} codes = {len(self.by_text)} unique payloads")
-        if duplicates:
-            print(f"[validate] warning: {len(duplicates)} payloads appear more "
-                  f"than once — placement checks on those will be unreliable")
+        if self.repeats > 1:
+            print(f"[validate] the sheet repeats: each payload appears up to "
+                  f"{self.repeats} times, so a code is matched to the "
+                  f"occurrence nearest the expected row")
 
-    def find(self, text):
-        """(row_index, col_index) of this payload in the sheet, or None."""
-        return self.by_text.get(normalize(text))
+    def find(self, text, near=None):
+        """(row_index, col_index) of this payload, or None.
+
+        A sheet that repeats the same block of rows holds each payload many
+        times over. `near` picks the occurrence closest to the row the
+        sequence is expecting, so a repeated sheet walks straight through
+        instead of snapping back to the first copy every cycle."""
+        hits = self.by_text.get(normalize(text))
+        if not hits:
+            return None
+        if near is None or len(hits) == 1:
+            return hits[0]
+        return min(hits, key=lambda h: abs(h[0] - near))
 
     def row(self, index):
         return self.rows[index] if 0 <= index < len(self.rows) else None
@@ -203,7 +211,7 @@ class SequenceValidator:
     # ── live, per label: pure lookup, so decode order cannot mislead it ────
     def peek(self, text):
         """Where this payload lives in the sheet: (row_number, col_no) or None."""
-        hit = self.sheet.find(text)
+        hit = self.sheet.find(text, near=self.cursor)
         if hit is None:
             return None
         row_idx, col = hit
@@ -219,7 +227,8 @@ class SequenceValidator:
         if self.order == BOTTOM_UP:
             texts = list(reversed(texts))
 
-        hits = [self.sheet.find(t) if t else None for t in texts]
+        hits = [self.sheet.find(t, near=self.cursor) if t else None
+                for t in texts]
         seen = [row_idx for row_idx, _ in (h for h in hits if h)]
 
         if not seen:

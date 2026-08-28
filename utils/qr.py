@@ -109,7 +109,7 @@ class CenterLineQRDecoder:
     """
 
     def __init__(self, line_x, label_cls, qr_cls, margin=0.15, min_px=8,
-                 on_decode=None, on_batch=None, dump_dir=None,
+                 on_decode=None, on_batch=None, on_label=None, dump_dir=None,
                  half_width=0, expect=None):
         self.line_x = line_x
         self.half_width = half_width  # widen the line into a band, in pixels
@@ -121,6 +121,7 @@ class CenterLineQRDecoder:
         self.min_px = min_px
         self.on_decode = on_decode   # (text, index) -> status str for overlay
         self.on_batch = on_batch     # (texts top-to-bottom) once per crossing
+        self.on_label = on_label     # (frame, label box, text) per decode
         self.dump_dir = dump_dir
 
         self.occupied = False      # is any label on the line right now?
@@ -213,6 +214,11 @@ class CenterLineQRDecoder:
                     self._dump(frame, crop_box)
                 continue
 
+            # Saved from the frame handed to update(), which is still clean
+            # — the detection boxes are drawn onto it after this returns.
+            if self.on_label:
+                self.on_label(frame, label[:4], text)
+
             status = self.on_decode(text, index) if self.on_decode else None
             self.done[index] = (text, status)
             self.count += 1
@@ -226,6 +232,10 @@ class CenterLineQRDecoder:
                 and len(self.done) >= len(self.slots_y)):
             self.finalized = True
             self.pending = 0
+            # Crop boxes are drawn where the QR sat in the frame it decoded
+            # in. Decoding stops here, so keeping them would leave a box
+            # lagging behind the labels as the web moves on.
+            self.results = []
             if self.on_batch:
                 self.on_batch(self.batch_texts())
 
@@ -265,20 +275,27 @@ class CenterLineQRDecoder:
         cv2.putText(frame, f"QR total: {self.count}  on line: {len(self.done)}"
                            f" ok / {self.pending} pending", (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)
-        for i in range(min(len(self.slots_y), 8)):
+        # One line per column, always D1..Dn top to bottom, whether or not
+        # that label has read yet — the list keeps its shape instead of
+        # renumbering as labels arrive at the line.
+        lines = min(max(len(self.slots_y), self.expect or 0), 8)
+        for i in range(lines):
             if i not in self.done:
-                cv2.putText(frame, f"{i + 1}. ...", (20, 120 + i * 34),
+                cv2.putText(frame, f"D{i + 1}. ...", (20, 120 + i * 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (160, 160, 160), 2,
                             cv2.LINE_AA)
                 continue
             text, status = self.done[i]
-            shown = text if len(text) <= 40 else text[:37] + "..."
+            # The sheet position goes first so it is never the part that runs
+            # off the edge — reading "D2 [row 7 D3]" is the whole point.
             if status is None:
-                mark, tcolor = "", (255, 0, 255)
+                head, tcolor = "", (255, 0, 255)
             else:
                 note, good = status
-                mark = f"  [{note}]"
+                head = f"[{note}] "
                 tcolor = (0, 255, 0) if good else (0, 0, 255)
-            cv2.putText(frame, f"{i + 1}. {shown}{mark}", (20, 120 + i * 34),
+            room = max(48 - len(head), 12)
+            shown = text if len(text) <= room else text[:room - 3] + "..."
+            cv2.putText(frame, f"D{i + 1}. {head}{shown}", (20, 120 + i * 34),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, tcolor, 2, cv2.LINE_AA)
         return frame
