@@ -46,11 +46,22 @@ def scale_boxes(boxes, ratio, pad):
     return boxes
 
 
-def postprocess(raw_output, ratio, pad, orig_shape, conf_thres=0.25):
+def postprocess(raw_output, ratio, pad, orig_shape, conf_thres=0.25,
+                per_class=None):
     """raw_output: (1, max_det, 6) = [x1,y1,x2,y2,conf,cls] from an
-    end2end YOLO26 engine (NMS already applied by the model)."""
+    end2end YOLO26 engine (NMS already applied by the model).
+
+    conf_thres is the threshold every class is held to; per_class, a
+    {class_id: threshold} mapping, overrides it for the classes named in it."""
     dets = raw_output[0]
-    dets = dets[dets[:, 4] >= conf_thres]
+    if per_class:
+        keep = np.full(dets.shape[0], conf_thres, dtype=np.float32)
+        classes = dets[:, 5].astype(np.int32)
+        for cls_id, value in per_class.items():
+            keep[classes == cls_id] = value
+        dets = dets[dets[:, 4] >= keep]
+    else:
+        dets = dets[dets[:, 4] >= conf_thres]
     if dets.shape[0] == 0:
         return np.empty((0, 6), dtype=np.float32)
 

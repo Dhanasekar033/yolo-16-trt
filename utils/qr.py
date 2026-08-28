@@ -5,6 +5,8 @@ zone (blank margin) around it to be decodable, so every crop is expanded by a
 margin before it is handed to zxing.
 """
 
+import bisect
+
 import cv2
 import numpy as np
 import zxingcpp
@@ -107,31 +109,61 @@ class CenterLineQRDecoder:
     """
 
     def __init__(self, line_x, label_cls, qr_cls, margin=0.15, min_px=8,
-                 on_decode=None, dump_dir=None):
+                 on_decode=None, on_batch=None, dump_dir=None,
+                 half_width=0, expect=None):
         self.line_x = line_x
+        self.half_width = half_width  # widen the line into a band, in pixels
+        self.expect = expect          # labels per crossing; once that many have
+                                      # read, the crossing is judged right away
         self.label_cls = label_cls
         self.qr_cls = qr_cls
         self.margin = margin
         self.min_px = min_px
-        self.on_decode = on_decode
+        self.on_decode = on_decode   # (text, index) -> status str for overlay
+        self.on_batch = on_batch     # (texts top-to-bottom) once per crossing
         self.dump_dir = dump_dir
 
         self.occupied = False      # is any label on the line right now?
-        self.done = []             # [(y_centre, text)] decoded this crossing
+        self.finalized = False     # crossing already judged (all labels read)
+        self.slots_y = []          # y-centres of this crossing's labels, sorted
+        self.done = {}             # {slot index: (text, status)} this crossing
         self.results = []          # [(crop_box, text_or_None)] for drawing
         self.pending = 0           # labels on the line still undecoded
         self.count = 0             # successful decodes so far
 
     def _crossing_labels(self, dets):
+        """Labels overlapping the trigger band, ordered top to bottom.
+
+        The band is `half_width` px either side of the line. Labels printed at
+        a slight angle reach a zero-width line one at a time and can leave a
+        gap where none is touching it, which would split one physical row into
+        two crossings; widening the band keeps the row together."""
+        lo, hi = self.line_x - self.half_width, self.line_x + self.half_width
         labels = [d for d in dets
-                  if int(d[5]) == self.label_cls and d[0] <= self.line_x <= d[2]]
+                  if int(d[5]) == self.label_cls and d[0] <= hi and d[2] >= lo]
         return sorted(labels, key=lambda d: box_center(d)[1])   # top to bottom
 
-    def _already_done(self, label):
-        """Has this label (matched by y-centre) already been decoded?"""
+    def _slot_index(self, label):
+        """Position of this label within the crossing, counted top to bottom.
+
+        Slots are keyed by y-centre (which barely moves as a label travels
+        across a vertical line) and registered the first time a label is seen,
+        decoded or not — so a label that never decodes still holds its place
+        and the ones below it keep their QR DATA column.
+        """
         cy = box_center(label)[1]
         tol = max((label[3] - label[1]) * 0.5, 20.0)
-        return any(abs(cy - done_cy) <= tol for done_cy, _ in self.done)
+        for i, sy in enumerate(self.slots_y):
+            if abs(cy - sy) <= tol:
+                return i
+
+        at = bisect.bisect(self.slots_y, cy)
+        self.slots_y.insert(at, cy)
+        if at < len(self.slots_y) - 1:      # inserted above known labels: the
+            self.done = {                   # slots below it all shift down one
+                (k + 1 if k >= at else k): v for k, v in self.done.items()
+            }
+        return at
 
     def update(self, frame, dets):
         """Run one frame's detections through the line logic.
@@ -139,22 +171,32 @@ class CenterLineQRDecoder:
         labels = self._crossing_labels(dets)
 
         if not labels:
-            # Line is clear: this batch has passed, wipe the decoded texts so
-            # the overlay goes blank until the next label reaches the line.
+            # Line is clear: this batch has passed. Hand the whole crossing
+            # over (top to bottom, None where a label never decoded) for
+            # validation, then wipe the decoded texts so the overlay goes
+            # blank until the next label reaches the line.
+            if self.occupied and not self.finalized and self.on_batch:
+                self.on_batch(self.batch_texts())
             self.occupied = False
-            self.done = []
+            self.finalized = False
+            self.slots_y = []
+            self.done = {}
             self.results = []
             self.pending = 0
             return []
 
         self.occupied = True
+        if self.finalized:
+            return []              # judged already; wait for the line to clear
+
         qr_dets = [d for d in dets if int(d[5]) == self.qr_cls]
         new_texts = []
         self.results = []
         self.pending = 0
 
         for label in labels:
-            if self._already_done(label):
+            index = self._slot_index(label)
+            if index in self.done:
                 continue
 
             qr = pick_qr_for_label(label[:4], qr_dets)
@@ -171,13 +213,29 @@ class CenterLineQRDecoder:
                     self._dump(frame, crop_box)
                 continue
 
-            self.done.append((box_center(label)[1], text))
+            status = self.on_decode(text, index) if self.on_decode else None
+            self.done[index] = (text, status)
             self.count += 1
             new_texts.append(text)
-            if self.on_decode:
-                self.on_decode(text)
+
+        # Judge the crossing the moment every label has read, rather than
+        # waiting for it to clear the line — the verdict lands while the row
+        # is still in front of the camera.
+        if (self.expect and not self.finalized
+                and len(self.slots_y) >= self.expect
+                and len(self.done) >= len(self.slots_y)):
+            self.finalized = True
+            self.pending = 0
+            if self.on_batch:
+                self.on_batch(self.batch_texts())
 
         return new_texts
+
+    def batch_texts(self):
+        """This crossing's payloads in slot order, None for labels that never
+        decoded — so each text keeps the QR DATA column it belongs to."""
+        return [self.done[i][0] if i in self.done else None
+                for i in range(len(self.slots_y))]
 
     def _dump(self, frame, box):
         import os
@@ -192,6 +250,8 @@ class CenterLineQRDecoder:
         h = frame.shape[0]
         if not self.occupied:
             color = (0, 0, 255)         # red    – waiting for labels
+        elif self.finalized:
+            color = (255, 255, 0)       # cyan   – crossing judged
         elif self.pending:
             color = (0, 255, 255)       # yellow – still decoding this batch
         else:
@@ -202,12 +262,23 @@ class CenterLineQRDecoder:
             cv2.rectangle(frame, (x1, y1), (x2, y2),
                           (255, 0, 255) if text else (0, 0, 255), 2)
 
-        texts = [t for _, t in self.done]
         cv2.putText(frame, f"QR total: {self.count}  on line: {len(self.done)}"
                            f" ok / {self.pending} pending", (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)
-        for i, text in enumerate(texts[:8]):
+        for i in range(min(len(self.slots_y), 8)):
+            if i not in self.done:
+                cv2.putText(frame, f"{i + 1}. ...", (20, 120 + i * 34),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (160, 160, 160), 2,
+                            cv2.LINE_AA)
+                continue
+            text, status = self.done[i]
             shown = text if len(text) <= 40 else text[:37] + "..."
-            cv2.putText(frame, f"{i + 1}. {shown}", (20, 120 + i * 34),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+            if status is None:
+                mark, tcolor = "", (255, 0, 255)
+            else:
+                note, good = status
+                mark = f"  [{note}]"
+                tcolor = (0, 255, 0) if good else (0, 0, 255)
+            cv2.putText(frame, f"{i + 1}. {shown}{mark}", (20, 120 + i * 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, tcolor, 2, cv2.LINE_AA)
         return frame
