@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
 """
-Global Shutter Camera viewer + live YOLO26 TensorRT inference.
-
-Same GStreamer/OpenCV capture pipeline and staleness-guard setup as
-cam_view.py, with per-frame YOLO26 detection + box drawing added in.
-No ultralytics import anywhere — inference goes through trt_engine.py.
+Minimal viewer: auto-finds the Global Shutter Camera and streams it via
+GStreamer/OpenCV, using the same pipeline/staleness-guard setup as run-thread.py.
 
 Usage:
-    python3 cam_infer.py --engine best.engine
-    python3 cam_infer.py --engine best.engine --classes classes.txt --conf-thres 0.35
-    python3 cam_infer.py --engine best.engine --fps 15 --width 1280 --height 972
-    python3 cam_infer.py --engine best.engine --index 0        # skip auto-detect
-    python3 cam_infer.py --engine best.engine --no-display     # headless, prints detections
-    python3 cam_infer.py --engine best.engine --save out.mp4   # also record annotated video
+    python3 cam_view.py
+    python3 cam_view.py --fps 15 --width 1280 --height 972
+    python3 cam_view.py --index 0        # skip auto-detect, force /dev/video0
 """
 
 import argparse
 import os
 import time
-
 import cv2
 
-from utils.trt_engine import YOLO26TRT
-from utils.utils import preprocess, postprocess, draw_detections
-
-# ── Stream config (same defaults as cam_view.py) ────────────────────────────
+# ── Stream config (same defaults as run-thread.py) ─────────────────────────
 DEFAULT_CAM_INDEX = 0
 DEFAULT_WIDTH     = 2592
 DEFAULT_HEIGHT    = 1944
@@ -33,11 +23,7 @@ DEFAULT_FPS       = 60       # MJPG supports 60fps at full 2592x1944; YUYV only
 DEFAULT_FORMAT    = "MJPG"
 DISPLAY_MAX_W     = 1280     # imshow window is capped to this width so a full
 DISPLAY_MAX_H     = 960      # -res frame doesn't overflow the screen
-DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/270
-
-# ── Inference config ─────────────────────────────────────────────────────────
-DEFAULT_IMGSZ      = 640
-DEFAULT_CONF_THRES = 0.25
+DEFAULT_ROTATE    = 270        # fixed rotation applied to every frame: 0/90/180/270
 
 ROTATE_MAP = {
     0:   None,
@@ -51,9 +37,7 @@ def rotate_frame(frame, degrees):
     """Rotate a frame by a fixed angle (0/90/180/270). No-op for 0."""
     code = ROTATE_MAP[degrees]
     return frame if code is None else cv2.rotate(frame, code)
-
-
-GS_CAMERA_NAME = "Global Shutter Camera"
+GS_CAMERA_NAME    = "Global Shutter Camera"
 
 
 def list_cameras():
@@ -103,16 +87,8 @@ def gstreamer_pipeline(cam_index=DEFAULT_CAM_INDEX, width=DEFAULT_WIDTH,
         )
 
 
-def load_class_names(path):
-    if not path:
-        return None
-    with open(path) as f:
-        return [line.strip() for line in f if line.strip()]
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Stream the Global Shutter Camera + run live YOLO26 TensorRT inference.")
-    # camera args
+    ap = argparse.ArgumentParser(description="Stream the Global Shutter Camera via GStreamer.")
     ap.add_argument("--index", type=int, default=None,
                      help="Force a /dev/videoN index (skips auto-detect).")
     ap.add_argument("--width", type=int, default=DEFAULT_WIDTH)
@@ -122,13 +98,7 @@ def main():
     ap.add_argument("--rotate", type=int, default=DEFAULT_ROTATE, choices=[0, 90, 180, 270],
                      help="Rotate every frame by a fixed angle (clockwise).")
     ap.add_argument("--no-display", action="store_true",
-                     help="Just print FPS/detections instead of opening a window (headless).")
-    # inference args
-    ap.add_argument("--engine", default="best.engine", help="path to .engine file")
-    ap.add_argument("--classes", default=None, help="txt file, one class name per line")
-    ap.add_argument("--conf-thres", type=float, default=DEFAULT_CONF_THRES)
-    ap.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
-    ap.add_argument("--save", default=None, help="optional path to record annotated video")
+                     help="Just print FPS instead of opening a window (headless).")
     args = ap.parse_args()
 
     cam_index = args.index if args.index is not None else find_camera_index()
@@ -140,24 +110,15 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera via GStreamer pipeline")
 
-    class_names = load_class_names(args.classes)
-    model = YOLO26TRT(args.engine, input_size=(args.imgsz, args.imgsz))
-    print(f"[model] loaded {args.engine}")
-
-    # 90/270 rotation swaps the effective width/height for sizing the window/writer.
+    # 90/270 rotation swaps the effective width/height for sizing the window.
     disp_w, disp_h = (args.height, args.width) if args.rotate in (90, 270) else (args.width, args.height)
-
-    writer = None
-    if args.save:
-        writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"),
-                                  args.fps, (disp_w, disp_h))
 
     if not args.no_display:
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
-        # at the frame's native resolution which overflows most screens. We
-        # set an initial on-screen size, capped to DISPLAY_MAX_*, while the
-        # capture/inference itself still runs at full resolution.
-        win_name = "Global Shutter Camera - YOLO26 TRT"
+        # at the frame's native resolution (2592x1944) which overflows most
+        # screens. We set an initial on-screen size, capped to DISPLAY_MAX_*,
+        # while the capture itself still runs at full resolution.
+        win_name = "Global Shutter Camera"
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
         cv2.resizeWindow(win_name, int(disp_w * scale), int(disp_h * scale))
@@ -173,15 +134,9 @@ def main():
 
             frame = rotate_frame(frame, args.rotate)
 
-            # ── inference ────────────────────────────────────────────────
-            inp, ratio, pad = preprocess(frame, model.input_size)
-            raw = model.infer(inp)
-            dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres)
-            frame = draw_detections(frame, dets, class_names)
-
             # Simple running FPS: time between consecutive frames, smoothed
             # with an exponential moving average so the readout doesn't
-            # jitter frame-to-frame.
+            # jitter frame-to-frame. No frame counter / interval needed.
             now = time.time()
             dt = now - prev_t
             prev_t = now
@@ -190,21 +145,16 @@ def main():
                 fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
             if args.no_display:
-                print(f"[camera] frame {frame.shape}  fps={fps:.1f}  dets={len(dets)}", end="\r")
+                print(f"[camera] got frame {frame.shape}  fps={fps:.1f}", end="\r")
             else:
-                cv2.putText(frame, f"FPS: {fps:.1f}  dets: {len(dets)}", (20, 40),
+                print(fps, end="\r")
+                cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow(win_name, frame)
-
-            if writer:
-                writer.write(frame)
-
-            if not args.no_display and (cv2.waitKey(1) & 0xFF == ord("q")):
-                break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
     finally:
         cap.release()
-        if writer:
-            writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
 
