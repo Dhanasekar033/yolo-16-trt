@@ -1,53 +1,62 @@
 #!/usr/bin/env python3
 """
-Global Shutter Camera viewer + live YOLO26 TensorRT inference.
+Global Shutter Camera + YOLO26 TensorRT + rolling-window QR validation.
 
-Same GStreamer/OpenCV capture pipeline and staleness-guard setup as
-cam_view.py, with per-frame YOLO26 detection + box drawing added in.
-No ultralytics import anywhere — inference goes through trt_engine.py.
+A single-purpose build of run.py: rolling-window mode only. Every QR the
+detector finds anywhere in the frame is decoded once and offered, on its own,
+to a window of the next few sheet rows. Because every payload in the sheet is
+unique a code identifies itself — which row and which QR DATA column it
+belongs to — so the order codes happen to decode in never matters.
+
+Nothing is tolerated. A row that reaches the end of the window still missing
+a code does not get written off: the line stops and the row is held open at
+the head of the window. The operator winds the coil back, the same labels
+pass the camera again, and their codes tick off exactly as they would have the
+first time. Pressing START is the adjudication:
+
+    row filled in while winding back  ->  cleared, the run carries on
+    row still short                   ->  LABEL HAS ISSUE, recorded as a
+                                          defect, and the window moves past it
+
+Nothing is read while the machine is stopped. Pressing START does not energise
+the relay straight away: for --start-delay seconds the camera reads the labels
+standing in front of it while the coil is still, and only then does the relay
+go on. That read-in is what validates the position the coil is actually in,
+and it is also the second look a held row gets — starting the web first would
+drag those labels out of frame before they could be checked.
+
+What this build does NOT do, compared to run.py: no trigger-line mode, no
+label grouping, and so no check of *where* a label sat. Four correct codes in
+the wrong four positions tick four correct cells and the row passes. Use
+run.py --mode row if position matters.
 
 Usage:
-    python3 run.py --engine best.engine
-    python3 run.py --engine best.engine --classes classes.txt --conf-thres 0.35
-    python3 run.py --conf-label 0.35 --conf-qr 0.5       # per-class thresholds
-    python3 run.py --engine best.engine --fps 15 --width 1280 --height 972
-    python3 run.py --engine best.engine --index 0        # skip auto-detect
-    python3 run.py --engine best.engine --no-display     # headless, prints detections
-    python3 run.py --engine best.engine --save out.mp4   # also record annotated video
-    python3 run.py --xlsx validation.xlsx                # validate against the sheet
-    python3 run.py --no-relay --no-validate              # vision only, no machine
-    python3 run.py --debug                               # print every payload read
+    python3 run_window.py                                  # defaults
+    python3 run_window.py --xlsx validation.xlsx
+    python3 run_window.py --window-size 4                  # shorter rewind
+    python3 run_window.py --no-display                     # headless
+    python3 run_window.py --no-relay                       # vision only
+    python3 run_window.py --dump-crops bad/                # save failed crops
+    python3 run_window.py --debug                          # print every read
 
-On start-up relay 0 is switched ON to run the winding machine, and every
-label crossing the trigger line is decoded and checked, top to bottom, against
-the QR DATA1..4 columns of validation.xlsx.
+On start-up relay 0 is switched ON to run the winding machine, and it is
+switched OFF whenever a row will not validate.
 """
 
 import argparse
 import os
 import threading
 import time
-from collections import Counter, deque
-
 import cv2
 
 from utils.crops import LabelSaver
-from utils.mapview import MappingView
-from utils.qr import LABEL, QR, CenterLineQRDecoder, decode_qr, pick_qr_for_label
+from utils.qr import decode_qr, pick_qr_for_label
 from utils.relay import RelayController
-from utils.rowgroup import RowGroupDecoder
 from utils.results import ResultLog
 from utils.trt_engine import YOLO26TRT
 from utils.ui import ControlPanel
 from utils.utils import preprocess, postprocess, draw_detections
-from utils.validation import (BOTTOM_UP, NODECODE, OK, SKIPPED, SWAPPED,
-                              TOP_DOWN, WRONG_ROW, BatchResult, Entry,
-                              SequenceValidator, ValidationSheet, normalize)
-# The window's own UNKNOWN is a group-level status ("this group belongs
-# nowhere in the window"); validation's is a per-label one ("this payload is
-# not in the sheet at all"). Both are needed here, so the imported one is
-# renamed rather than shadowed.
-from utils.validation import UNKNOWN as UNKNOWN_CODE
+from utils.validation import ValidationSheet, normalize
 
 # ── Stream config (same defaults as cam_view.py) ────────────────────────────
 DEFAULT_CAM_INDEX = 0
@@ -69,15 +78,13 @@ DEFAULT_CONF_QR    = None
 # ── QR decode config ─────────────────────────────────────────────────────────
 DEFAULT_LABEL_CLASS = "label"      # class whose crossing triggers a decode
 DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
-DEFAULT_LINE_POS    = 0.5          # vertical trigger line, fraction of width
-DEFAULT_LINE_WIDTH  = 0            # widen the line into a band, in pixels
-DEFAULT_ZONE        = 0            # decode zone half-width in px; 0 = use the
-                                   # band. Wider = more frames per label.
 DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 
 # ── Validation / machine config ──────────────────────────────────────────────
 DEFAULT_XLSX        = "validation_x300.xlsx"   # expected QR sequence
 DEFAULT_START_RELAY = 0                   # relay 0 = winding machine start
+DEFAULT_START_DELAY = 2.0                 # seconds of reading after START is
+                                          # pressed, before the relay goes on
 DEFAULT_RESULT_DIR  = "result"            # <result>/<xlsx name>/labels/
 
 ROTATE_MAP = {
@@ -111,7 +118,6 @@ def rotate_frame(frame, degrees):
 
 
 GS_CAMERA_NAME = "Global Shutter Camera"
-MAP_WINDOW = "Sheet vs decoded"
 WINDOW_VIEW = "Rolling window"
 
 
@@ -273,101 +279,6 @@ class RollingWindow:
         self.reads += 1
         return self.MATCH, row_idx, col, slot
 
-    # ── matching a whole physical row at once ─────────────────────────────
-    def offer_group(self, texts, order=TOP_DOWN, near=None):
-        """Judge one physical row of labels as a unit.
-
-        `offer` above places each payload on its own, which is what makes the
-        window tolerant of any arrival order — and also what makes it blind to
-        four correct codes sitting in the wrong four positions, because the
-        column a payload ticks off comes from the sheet lookup rather than
-        from where the label actually sat.
-
-        This takes the whole group instead: `texts` holds the payloads in
-        on-screen slot order, top to bottom, with None where a label never
-        read. The group is pinned to one sheet row — whichever row most of its
-        payloads agree on — and every payload is then held to the column its
-        slot says it should be in. Sequence still does not matter: the row can
-        be any of the ones the window has open, in any order.
-
-        Returns (status, BatchResult). The result is shaped exactly like the
-        one SequenceValidator produces, so the reporting, the CSV, the journal
-        and the map view all take it unchanged.
-        """
-        if not any(texts):
-            return self.UNREAD, None
-        if order == BOTTOM_UP:
-            texts = list(reversed(texts))
-
-        # Identity comes from the whole sheet, not just the window: a code
-        # from far outside still has to be named in the stop message, and a
-        # code in the wrong column of the right row has to be told apart from
-        # one belonging to another row entirely.
-        anchor_near = self.start if self.start is not None else near
-        hits = [self.sheet.find(t, near=anchor_near) if t else None
-                for t in texts]
-        rows = [h[0] for h in hits if h]
-        if not rows:
-            return self.UNKNOWN, None
-
-        row_idx = Counter(rows).most_common(1)[0][0]
-        if self.start is None:
-            self.anchor(row_idx)
-
-        if row_idx < self.start:
-            return self.REPEAT, None          # a group still in view after its
-                                              # row finished — not a fault
-        slot = row_idx - self.start
-        if slot >= self.size:
-            return self.UNKNOWN, None         # belongs outside the window
-
-        row = self.sheet.rows[row_idx]
-        required = self.required(row_idx)
-        seen = self.seen.setdefault(row_idx, set())
-        entries = []
-        for pos, text in enumerate(texts):
-            expected = row.texts[pos] if pos < len(row.texts) else None
-            if pos not in required:
-                entries.append(Entry(pos, text, expected, SKIPPED))
-                continue
-            if not text:
-                entries.append(Entry(pos, None, expected, NODECODE))
-                continue
-            hit = hits[pos]
-            if hit is None:
-                entries.append(Entry(pos, text, expected, UNKNOWN_CODE))
-                continue
-            hit_row, hit_col = hit
-            found = (self.sheet.rows[hit_row].number, hit_col + 1)
-            if hit_row == row_idx and hit_col == pos:
-                entries.append(Entry(pos, text, expected, OK, found))
-                if pos not in seen:
-                    seen.add(pos)
-                    self.decoded_cells.add((row_idx, pos))
-                    self.texts[(row_idx, pos)] = text
-                    self.reads += 1
-            elif hit_row == row_idx:
-                entries.append(Entry(pos, text, expected, SWAPPED, found))
-            else:
-                entries.append(Entry(pos, text, expected, WRONG_ROW, found))
-
-        self.last_hit = (row_idx, min(seen)) if seen else (row_idx, 0)
-        per_row = len(row.texts)
-        complete = len(texts) == per_row and all(
-            texts[pos] for pos in required if pos < len(texts))
-        result = BatchResult(row.number, entries, True, complete, False,
-                             row.number)
-        return self.MATCH, result
-
-    def group_slot(self, row_number):
-        """How deep into the window a judged group landed, 0 being the head."""
-        if self.start is None:
-            return None
-        for i, row_idx in enumerate(self.rows()):
-            if self.sheet.rows[row_idx].number == row_number:
-                return i
-        return None
-
     # ── sliding ───────────────────────────────────────────────────────────
     def note_unexpected(self, text, belongs):
         """Keep the last few codes that matched nothing, for the view."""
@@ -467,7 +378,9 @@ def class_index(class_names, name, fallback):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Stream the Global Shutter Camera + run live YOLO26 TensorRT inference.")
+    ap = argparse.ArgumentParser(
+        description="Global Shutter Camera + YOLO26 TensorRT + rolling-window "
+                    "QR validation, with re-inspection on any short row.")
     # camera args
     ap.add_argument("--index", type=int, default=None,
                      help="Force a /dev/videoN index (skips auto-detect).")
@@ -498,28 +411,10 @@ def main():
     ap.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
     ap.add_argument("--save", default=None, help="optional path to record annotated video")
     # qr decode args
-    ap.add_argument("--no-qr", action="store_true",
-                     help="disable the center-line QR decoding.")
     ap.add_argument("--label-class", default=DEFAULT_LABEL_CLASS,
                      help="class name that triggers a decode when it crosses the line.")
     ap.add_argument("--qr-class", default=DEFAULT_QR_CLASS,
                      help="class name of the QR box that gets cropped and decoded.")
-    ap.add_argument("--line-pos", type=float, default=DEFAULT_LINE_POS,
-                     help="vertical trigger line as a fraction of frame width (0-1).")
-    ap.add_argument("--line-width", type=int, default=DEFAULT_LINE_WIDTH,
-                     help="widen the trigger line into a band, this many pixels "
-                          "either side — keeps an angled row of labels together.")
-    ap.add_argument("--zone", type=int, default=DEFAULT_ZONE,
-                     help="decode zone half-width in pixels. A label is read "
-                          "for every frame it spends in the zone, so widening "
-                          "it gives a stubborn code more attempts. 0 = just the "
-                          "trigger band.")
-    ap.add_argument("--column-gap", type=int, default=0,
-                     help="max x-centre spread within one column of labels "
-                          "(0 = derive it from the label width).")
-    ap.add_argument("--decode-source", default=LABEL, choices=[LABEL, QR],
-                     help="what gets handed to zxing: the whole label crop "
-                          "(default) or just the detected qr box.")
     ap.add_argument("--qr-margin", type=float, default=DEFAULT_QR_MARGIN,
                      help="quiet zone around the qr box, as a fraction of its size.")
     ap.add_argument("--qr-margin-min", type=int, default=8,
@@ -542,8 +437,6 @@ def main():
                      help="xlsx holding the expected QR DATA1..N sequence.")
     ap.add_argument("--sheet", default=None,
                      help="worksheet name inside --xlsx (default: the first one).")
-    ap.add_argument("--no-validate", action="store_true",
-                     help="decode only, don't check against the xlsx.")
     ap.add_argument("--labels-per-row", type=int, default=None,
                      help="labels per crossing (default: the number of QR DATA "
                           "columns found in the sheet).")
@@ -551,44 +444,11 @@ def main():
                      help="which label positions to validate, top to bottom, "
                           "e.g. 'D2,D3' or '2,3'. The rest are neither decoded "
                           "nor held against the row. Default: all of them.")
-    ap.add_argument("--label-order", default=TOP_DOWN, choices=[TOP_DOWN, BOTTOM_UP],
-                     help="does the topmost label on screen hold QR DATA1 "
-                          "(top-down) or the last column (bottom-up)?")
-    ap.add_argument("--no-resync", action="store_true",
-                     help="don't jump the cursor to a crossing that arrives out "
-                          "of sequence (every later row then fails too).")
     ap.add_argument("--no-stop-on-fail", action="store_true",
                      help="keep the machine running when a row fails "
                           "validation (default: stop it).")
-    ap.add_argument("--gap-tolerance", type=int, default=2,
-                     help="consecutive rows the vision side can miss (never "
-                          "detected, or read nothing) before that alone stops "
-                          "the machine. A row with a wrong or misplaced code "
-                          "always stops it immediately, regardless of this. "
-                          "0 = stop on the first miss, same as strict mode.")
-    ap.add_argument("--gap-window", type=int, default=20,
-                     help="how many recent judged rows --gap-window-max looks "
-                          "back over.")
-    ap.add_argument("--gap-window-max", type=int, default=5,
-                     help="stop if this many misses land inside --gap-window "
-                          "judged rows, even if never consecutive — catches a "
-                          "chronic problem that no single streak would.")
     ap.add_argument("--no-result-log", action="store_true",
                      help="don't write the per-row CSV of verdicts.")
-    ap.add_argument("--mode", default="window", choices=["row", "window", "line"],
-                     help="'window' (default) matches every QR the detector "
-                          "finds against a rolling window of sheet rows, each "
-                          "code on its own, in any order; a row that comes up "
-                          "short stops the line and is held open so the coil "
-                          "can be wound back and the row re-checked. 'row' is "
-                          "the same window with the labels first grouped into "
-                          "physical rows, which additionally holds each "
-                          "payload to the QR DATA column its top-to-bottom "
-                          "position claims — so four correct codes in the "
-                          "wrong places is a fault, which 'window' cannot "
-                          "see. 'line' judges a group against the *next* row "
-                          "in strict sequence, but only sees labels crossing "
-                          "a trigger zone that has to be tuned to web speed.")
     ap.add_argument("--window-size", type=int, default=8,
                      help="how many sheet rows the rolling window holds. "
                           "Bigger tolerates more out-of-order arrival and more "
@@ -615,130 +475,116 @@ def main():
                           "start the record empty, anchoring wherever the "
                           "sheet first matches. By default a previous run is "
                           "picked up and the window continues past it.")
-    ap.add_argument("--no-map", action="store_true",
-                     help="don't open the second window showing the sheet "
-                          "against what was decoded.")
     # relay args
     ap.add_argument("--no-relay", action="store_true",
                      help="don't touch the relay board (vision only).")
     ap.add_argument("--relay-port", default=None,
                      help="serial port of the relay board (default: auto-detect).")
+    ap.add_argument("--start-delay", type=float, default=DEFAULT_START_DELAY,
+                     help="seconds to spend reading the labels already in "
+                          "front of the camera after START is pressed, before "
+                          "the relay is switched on. This is what validates "
+                          "the coil at the position it is actually in — and "
+                          "what re-checks a row that was held open. 0 = "
+                          "energise immediately.")
     ap.add_argument("--start-relay", type=int, default=DEFAULT_START_RELAY,
                      help="relay that starts the winding machine.")
     ap.add_argument("--relay-verbose", action="store_true",
                      help="print every modbus frame sent to the relay board.")
     args = ap.parse_args()
 
-    # ── expected sequence + machine start ────────────────────────────────
-    validator = None
-    if not args.no_validate:
-        sheet = ValidationSheet(args.xlsx, args.sheet)
-        checked = parse_check(args.check, args.labels_per_row or sheet.per_row)
-        validator = SequenceValidator(sheet, per_row=args.labels_per_row,
-                                      order=args.label_order,
-                                      resync=not args.no_resync,
-                                      check=checked)
-        print(f"[validate] checking {validator.describe_checks()}")
+    # ── the expected sheet, and the window over it ───────────────────────
+    sheet = ValidationSheet(args.xlsx, args.sheet)
+    per_row = args.labels_per_row or sheet.per_row
+    checked = parse_check(args.check, per_row)
+    if checked is None:
+        print(f"[validate] checking all {per_row} positions")
+    else:
+        on = ", ".join(f"QR DATA{i + 1}" for i in sorted(checked))
+        off = ", ".join(f"QR DATA{i + 1}" for i in range(per_row)
+                        if i not in checked)
+        print(f"[validate] checking {on}" + (f" (ignoring {off})" if off else ""))
 
-    window = None
-    if validator is not None and args.mode in ("row", "window"):
-        size, grace = args.window_size, args.window_grace
-        period = sheet_period(sheet)
-        if period:
-            room = period - grace - 1
-            if size > room:
-                print(f"[window] the sheet repeats every {period} rows, so a "
-                      f"window of {size} would see each code twice — "
-                      f"using {max(1, room)} instead")
-                size = max(1, room)
-        window = RollingWindow(sheet, size=size, check=checked, grace=grace)
-        if args.mode == "row":
-            if args.gap_tolerance != 2 or args.gap_window_max != 5:
-                print("[row] note: --gap-tolerance/--gap-window-max do not "
-                      "apply in row mode — every group has to validate "
-                      "cleanly, and anything short of that stops the line "
-                      "for a re-check")
-            print(f"[window] rolling window of {window.size} sheet rows "
-                  f"(+{window.grace} kept behind for re-reads); each group of "
-                  f"labels is matched to whichever open row it belongs to, in "
-                  f"any order, and its positions held to QR DATA1..N")
-        else:
-            print(f"[window] rolling window of {window.size} sheet rows "
-                  f"(+{window.grace} kept behind for re-reads); decoding every "
-                  f"QR in frame, order does not matter")
-
-    # Row mode drives the same window, but feeds it whole groups from the
-    # decoder rather than one payload at a time — so the per-code scan must
-    # not also run, or every code would be counted twice.
-    per_code = window is not None and args.mode == "window"
-
-    mapview = None
-    if (validator is not None and args.mode in ("row", "line")
-            and not args.no_map and not args.no_display):
-        mapview = MappingView(per_row=validator.per_row)
+    size, grace = args.window_size, args.window_grace
+    period = sheet_period(sheet)
+    if period:
+        # A window that spans the sheet's repeat would hold the same payload
+        # twice over, and a code could tick off either copy.
+        room = period - grace - 1
+        if size > room:
+            print(f"[window] the sheet repeats every {period} rows, so a "
+                  f"window of {size} would see each code twice — "
+                  f"using {max(1, room)} instead")
+            size = max(1, room)
+    window = RollingWindow(sheet, size=size, check=checked, grace=grace)
+    print(f"[window] rolling window of {window.size} sheet rows "
+          f"(+{window.grace} kept behind for re-reads); every QR in frame "
+          f"is matched on its own, order does not matter")
+    print(f"[window] a row that comes up short stops the line and is held "
+          f"open — wind it back past the camera, then press START")
 
     machine_running = False
-    gap_streak = 0            # consecutive vision-side misses since the last
-                              # clean row (or the last stop)
-    gap_recent = deque(maxlen=max(args.gap_window, 1))  # True = miss, per row
+    # When START was pressed, or None when it was not. Between that moment and
+    # --start-delay seconds later the camera is reading but the relay is still
+    # off: the coil is standing still in front of the lens, which is the one
+    # chance to validate the position it is actually in before it moves.
+    starting_at = [None]
+    start_reason = [""]
+
+    def validating():
+        """Codes are only read when the machine is running, or about to be."""
+        return machine_running or starting_at[0] is not None
 
     def start_machine(reason="operator"):
-        nonlocal machine_running, gap_streak
-        if machine_running:
+        """Begin the start sequence. This does NOT energise the relay.
+
+        The relay goes on in _finish_start, once the labels standing in front
+        of the camera have had --start-delay seconds to read. Starting the web
+        first would drag them out of frame before they could be checked.
+        """
+        if machine_running or starting_at[0] is not None:
             return
-        # A fresh start gets a fresh miss budget — whatever ran up the streak
-        # before is done with, not carried into the next run.
-        gap_streak = 0
-        gap_recent.clear()
-        # The web coasts to a halt and is nudged while stopped, so whatever is
-        # in front of the camera now is not what the sequence left off at.
-        # Clear the zone and let the next column re-anchor, instead of
-        # reporting the jump as a fault and stopping again.
-        if validator is not None and reason != "startup":
-            validator.reanchor()
-        if decoder is not None:
-            decoder.reset()
+        starting_at[0] = time.time()
+        start_reason[0] = reason
+        if panel is not None:
+            panel.note = f"reading labels… ({args.start_delay:.0f}s)"
+        held = (f", re-checking row {recheck['row']}"
+                if recheck["row"] is not None else "")
+        print(f"\n[relay] START pressed ({reason}) — reading the labels in "
+              f"frame for {args.start_delay:.1f}s before the relay goes on"
+              f"{held}")
 
-        # In window mode START is the adjudication point for a row held open
-        # for re-inspection: either it filled in while the coil was wound
-        # back, or it has now failed twice and is a defect.
-        if args.mode == "window" and recheck["row"] is not None:
+    def _finish_start():
+        """The read-in has run its course: settle up and let the web go."""
+        nonlocal machine_running
+        starting_at[0] = None
+
+        # Now, not on the button press: a row held for re-inspection has just
+        # had its second look, so it either filled in during the read-in — in
+        # which case the retire path has already cleared it — or it is a
+        # confirmed defect.
+        if recheck["row"] is not None:
             _adjudicate_recheck()
-
-        # START is also how the operator accepts a confirmed defect: the row
-        # was shown to the camera twice and would not validate either time, so
-        # pressing START says "I have seen it, carry on past it".
-        if accept_on_start[0] is not None and window is not None:
-            row_idx = accept_on_start[0]
-            accept_on_start[0] = None
-            while (window.start is not None
-                   and window.start <= row_idx
-                   and not window.exhausted):
-                window.evict_head()
-            head = (sheet.rows[window.start].number
-                    if window.start is not None and not window.exhausted
-                    else "end of sheet")
-            print(f"[defect] accepted — window moves on to row {head}")
-        elif recheck["row"] is not None:
-            print(f"[recheck] note: row {recheck['row']} is still waiting to "
-                  f"be re-checked; wind it back past the camera")
 
         relay.on(args.start_relay)
         machine_running = True
         if panel is not None:
             panel.note = None
-        print(f"\n[relay] winding machine STARTED ({reason}) "
+        print(f"[relay] winding machine STARTED ({start_reason[0]}) "
               f"— relay {args.start_relay} ON")
 
     def stop_machine(reason="operator"):
         nonlocal machine_running
-        if not machine_running:
+        aborted = starting_at[0] is not None
+        starting_at[0] = None
+        if not machine_running and not aborted:
             return
         relay.off(args.start_relay)
         machine_running = False
         if panel is not None:
             panel.note = reason
-        print(f"\n[relay] winding machine STOPPED ({reason}) "
+        what = "start ABORTED" if aborted and not machine_running else "STOPPED"
+        print(f"\n[relay] winding machine {what} ({reason}) "
               f"— relay {args.start_relay} OFF")
 
     run_name = os.path.splitext(os.path.basename(args.xlsx))[0]
@@ -748,9 +594,9 @@ def main():
                            ext=args.label_format, pad=args.label_pad)
 
     results = None
-    if validator is not None and not args.no_result_log:
+    if not args.no_result_log:
         results = ResultLog(root=args.result_dir, name=run_name,
-                            columns=validator.per_row)
+                            columns=per_row)
 
     relay = RelayController(port=args.relay_port, enabled=not args.no_relay,
                             verbose=args.relay_verbose)
@@ -792,247 +638,17 @@ def main():
 
     # Per-class thresholds: the label one gates line crossings, the qr one
     # gates which box gets cropped and decoded, and --conf-thres is what every
-    # other class is held to. Class ids are only resolved when something
-    # actually needs them, so --no-qr runs stay quiet.
-    label_cls = qr_cls = None
+    # other class is held to.
     conf_per_class = {}
-    if not args.no_qr or args.conf_label is not None or args.conf_qr is not None:
-        label_cls = class_index(class_names, args.label_class, 0)
-        qr_cls = class_index(class_names, args.qr_class, 1)
-        if args.conf_label is not None:
-            conf_per_class[label_cls] = args.conf_label
-        if args.conf_qr is not None:
-            conf_per_class[qr_cls] = args.conf_qr
+    label_cls = class_index(class_names, args.label_class, 0)
+    qr_cls = class_index(class_names, args.qr_class, 1)
+    if args.conf_label is not None:
+        conf_per_class[label_cls] = args.conf_label
+    if args.conf_qr is not None:
+        conf_per_class[qr_cls] = args.conf_qr
     print(f"[model] conf thresholds: default={args.conf_thres}"
           + "".join(f"  {args.label_class if c == label_cls else args.qr_class}={v}"
                     for c, v in conf_per_class.items()))
-
-    def on_decode(text, index):
-        """Per label, the moment it reads. Only the payload's own identity is
-        reported here — which row and column of the sheet it is. Whether it is
-        in the *right* place can't be known until the whole crossing is in, so
-        that is left to the batch verdict."""
-        if args.debug:
-            print(f"\n[qr] read: {text}")
-        if validator is None:
-            return None
-        where = validator.peek(text)
-        if where is None:
-            if args.debug:
-                print("[qr]   not in the sheet")
-            return "not in sheet", False
-        row, col = where
-        if args.debug:
-            print(f"[qr]   sheet row {row}, QR DATA{col}")
-        return f"row {row} D{col}", True
-
-    def on_batch(texts):
-        """Once per group of labels, with the payloads in slot order, top to
-        bottom, and None where a label never read."""
-        nonlocal gap_streak
-        if validator is None:
-            return
-        if window is not None:
-            on_group(texts)
-            return
-        result = validator.check_batch(texts)
-        validator.report(result)
-        record_batch(result)
-        if results is not None:
-            results.write(result)
-        if result is None or args.no_stop_on_fail:
-            return
-        if not result.anchored:
-            return                 # nothing to hold it against yet
-
-        if result.ok:
-            gap_streak = 0
-            gap_recent.append(False)
-            if mapview is not None:
-                mapview.update(result)
-            return
-
-        if not result.is_gap:
-            # A real code sitting in the wrong place, or one that belongs to
-            # a different row: never tolerated, whatever the budget says —
-            # this is the one fault the whole system exists to catch.
-            stop_machine(result.summary())
-            if mapview is not None:
-                mapview.update(result, result.summary())
-            return
-
-        # A pure vision-side miss: the row was never detected, or nothing on
-        # it read. Log it and keep running, up to the budget.
-        gap_streak += 1
-        gap_recent.append(True)
-        window_misses = sum(gap_recent)
-        if gap_streak > args.gap_tolerance:
-            stop_machine(f"{gap_streak} consecutive rows missed by the camera "
-                        f"({result.summary()})")
-        elif window_misses > args.gap_window_max:
-            stop_machine(f"{window_misses} of the last {len(gap_recent)} rows "
-                        f"missed by the camera ({result.summary()})")
-        else:
-            print(f"[validate] tolerating a miss ({gap_streak} in a row, "
-                  f"{window_misses} in the last {len(gap_recent)}) "
-                  f"— {result.summary()}")
-        if mapview is not None:
-            mapview.update(result)
-
-    def on_group(texts):
-        """Row mode: hold one group of labels to one open window row.
-
-        Same verdict as the sequence path — every payload checked against the
-        column its position claims — but the row it is checked against is
-        whichever one in the window the group turns out to belong to, not the
-        one that happens to come next.
-        """
-        status, result = window.offer_group(texts, order=args.label_order,
-                                            near=resume_hint[0])
-
-        if status == RollingWindow.REPEAT:
-            # A row behind the head coming past again. Normal while the coil
-            # is being wound back for a re-inspection, and harmless otherwise.
-            return
-
-        if status == RollingWindow.UNREAD:
-            # A whole group went by and not one label on it read. There is no
-            # row to attribute it to, so it cannot be re-inspected by row —
-            # but it is still an unvalidated group, so the line stops.
-            print("\n[row] a group went by and NOTHING on it read")
-            _hold_for_recheck(None, "a group went by unread")
-            return
-
-        if status == RollingWindow.UNKNOWN:
-            reads = [t for t in texts if t]
-            where = sheet.find(reads[0]) if reads else None
-            belongs = (f"sheet row {sheet.rows[where[0]].number} "
-                       f"QR DATA{where[1] + 1}" if where else
-                       "nothing in the sheet")
-            head = sheet.rows[window.start].number if (
-                window.start is not None and not window.exhausted) else "?"
-            print(f"\n[row] UNEXPECTED group: {reads}")
-            print(f"[row]   belongs to {belongs}; window starts at row {head}")
-            window.note_unexpected(reads[0] if reads else "", belongs)
-            _hold_for_recheck(None, f"group outside the window ({belongs})")
-            return
-
-        row_idx = window.start + (window.group_slot(result.row) or 0)
-        validator.report(result)
-        if results is not None:
-            results.write(result)
-        if mapview is not None:
-            mapview.update(result, None if result.ok else result.summary())
-
-        # ── the row read clean ────────────────────────────────────────────
-        if result.ok:
-            if recheck["row"] == result.row:
-                print(f"[recheck] row {result.row} PASSED on re-inspection "
-                      f"— the labels are good, press START to carry on")
-                recheck["row"] = None
-                recheck["attempt"] = 0
-            record_batch(result)
-            _slide(result.row)
-            return
-
-        # ── it did not ────────────────────────────────────────────────────
-        if recheck["row"] == result.row:
-            # Second look at the same row, and it still will not validate.
-            recheck["attempt"] += 1
-            _report_defect(result)
-            record_batch(result, status="DEFECT")
-            defects.add(result.row)
-            accept_on_start[0] = row_idx
-            recheck["row"] = None
-            recheck["attempt"] = 0
-            _hold_for_recheck(None, f"LABEL ISSUE on row {result.row}",
-                              announce=False)
-            return
-
-        record_batch(result)
-        recheck["row"] = result.row
-        recheck["attempt"] = 1
-        print(f"\n[recheck] row {result.row} did not validate: "
-              f"{result.summary()}")
-        for entry in result.failures:
-            print(f"[recheck]   {entry.describe()}")
-        print(f"[recheck] STOPPED — wind the coil back so row {result.row} "
-              f"passes the camera again; it will be re-checked automatically.")
-        _allow_rejudge(result)
-        _hold_for_recheck(result.row, result.summary(), announce=False)
-
-    def _report_defect(result):
-        """The verdict after a re-inspection has already failed once."""
-        print(f"\n[recheck] row {result.row} FAILED AGAIN on re-inspection")
-        print(f"[defect]  LABEL HAS ISSUE — sheet row {result.row}")
-        for entry in result.failures:
-            want = entry.expected or "(nothing)"
-            got = entry.text or "nothing"
-            print(f"[defect]    {entry.column}: expected {want}")
-            print(f"[defect]    {' ' * len(entry.column)}  read     {got}")
-        print(f"[defect]  press START to accept this row and carry on")
-
-    def _hold_for_recheck(row_no, why, announce=True):
-        """Stop the line. Nothing here is tolerated — every group has to
-        validate cleanly, and anything short of that is held for a human."""
-        if args.no_stop_on_fail:
-            return
-        if announce and row_no is not None:
-            print(f"[recheck] STOPPED — wind row {row_no} back past the "
-                  f"camera to re-check it")
-        stop_machine(why)
-
-    def _allow_rejudge(result):
-        """Let the decoder judge this group again when it comes back round.
-
-        A group is remembered by the identity of the codes it read, so that a
-        column re-tracked after it was judged is not judged twice. That is
-        exactly what has to be undone for a re-inspection: the same physical
-        labels are deliberately being shown to the camera a second time.
-        """
-        if decoder is None:
-            return
-        keys = {validator.identify(e.text) for e in result.entries if e.text}
-        keys.discard(None)
-        if keys:
-            for key in keys:
-                decoder.judged_keys.pop(key, None)
-        else:
-            decoder.judged_keys.clear()
-        decoder.reset()
-
-    def _slide(row_no):
-        """Retire whatever the head has finished, and evict a head the web has
-        already run a whole window past."""
-        slot = window.group_slot(row_no)
-        if slot is not None and slot >= window.size - 1:
-            stale = window.evict_head()
-            if stale is not None and sheet.rows[stale].number != row_no:
-                _retire_missed(stale)
-        window.advance()
-
-    def _retire_missed(row_idx):
-        """A head row evicted without its group ever being judged.
-
-        A row whose group *was* judged is already recorded, verdict and all,
-        even if that verdict was a failure — evicting it later is just the
-        window moving on, not a second fault to report.
-        """
-        row_no = sheet.rows[row_idx].number
-        if row_no in verified:
-            return
-        per_row = len(sheet.rows[row_idx].texts)
-        required = window.required(row_idx)
-        seen = window.seen.get(row_idx, set())
-        marks = ["not checked" if c not in required
-                 else "OK" if c in seen else "NOT DECODED"
-                 for c in range(per_row)]
-        verified[row_no] = (marks, "INCOMPLETE")
-        if journal[0] is not None:
-            journal[0].write(f"{row_no},INCOMPLETE," + ",".join(marks) + "\n")
-        print(f"\n[row] row {row_no} was never judged — the web moved a whole "
-              f"window past it")
-        _hold_for_recheck(row_no, f"row {row_no} never judged")
 
     xlsx_path = args.out_xlsx or os.path.join(
         args.result_dir, run_name, f"checked_{run_name}.xlsx")
@@ -1054,7 +670,6 @@ def main():
     # failing again makes it a confirmed defect.
     recheck = {"row": None, "attempt": 0}   # sheet row awaiting re-inspection
     defects = set()                         # rows confirmed bad on re-check
-    accept_on_start = [None]                # row the next START moves past
 
     def _open_journal():
         """A one-line-per-row append log, flushed as it goes.
@@ -1151,35 +766,6 @@ def main():
         verified[number] = (marks, status)
         if journal[0] is not None:
             journal[0].write(f"{number},{status}," + ",".join(marks) + "\n")
-
-    def record_batch(result, status=None):
-        """Fold one row-wise verdict into the record kept for the sheet.
-
-        The window-mode twin of this is record_row, which works from the set
-        of cells ticked off. Here the verdict already knows what happened to
-        every position, so the per-column mark is the entry status itself —
-        OK, SWAPPED, WRONG-ROW, NO-READ — which says more than window mode
-        can, because it knows where the label was sitting.
-        """
-        if result is None or not result.anchored or result.row is None:
-            return
-        marks = []
-        for entry in result.entries:
-            marks.append("not checked" if entry.status == SKIPPED
-                         else "NOT DECODED" if entry.status == NODECODE
-                         else entry.status)
-        status = status or ("OK" if result.ok else "INCOMPLETE")
-        # A row verified on an earlier pass is not un-verified by a later one
-        # that happened to read it badly — but a confirmed defect always wins,
-        # because it was judged twice on purpose.
-        if (verified.get(result.row, (None, None))[1] == "OK"
-                and status not in ("OK", "DEFECT")):
-            return
-        verified[result.row] = (marks, status)
-        if journal[0] is not None:
-            journal[0].write(f"{result.row},{status}," + ",".join(marks) + "\n")
-        if args.xlsx_every and len(verified) % args.xlsx_every == 0:
-            write_annotated_xlsx(background=True)
 
     def write_annotated_xlsx(background=False):
         """Copy the source sheet and add, per row, which codes were decoded.
@@ -1359,17 +945,17 @@ def main():
                     BG_BAD, 0.5)
         return img
 
-    if window is not None:
-        _load_previous()      # an .xlsx from an older run, if there is one
-        _load_journal()       # then the journal, which wins where they differ
-        _open_journal()
-        if verified:
-            last = max(verified)
-            by_number = {r.number: i for i, r in enumerate(sheet.rows)}
-            resume_hint[0] = by_number.get(last)
-            done = sum(1 for _, st in verified.values() if st == "OK")
-            print(f"[{args.mode}] resuming from row {last} — {done} rows "
-                  f"already verified ({len(verified)} recorded)")
+    # ── what an earlier run already got through ──────────────────────────
+    _load_previous()      # an .xlsx from an older run, if there is one
+    _load_journal()       # then the journal, which wins where they differ
+    _open_journal()
+    if verified:
+        last = max(verified)
+        by_number = {r.number: i for i, r in enumerate(sheet.rows)}
+        resume_hint[0] = by_number.get(last)
+        done = sum(1 for _, st in verified.values() if st == "OK")
+        print(f"[window] resuming from row {last} — {done} rows "
+              f"already verified ({len(verified)} recorded)")
 
     def draw_window(frame, compact=False):
         """One status line on the video, since the detail now lives in its own
@@ -1416,8 +1002,7 @@ def main():
         window. No trigger line: a label is read on whichever frame it happens
         to be legible in, and the window decides whether it belongs here.
         """
-        nonlocal gap_streak
-        if window is None or label_cls is None:
+        if label_cls is None:
             return
 
         qr_dets = [d for d in dets if int(d[5]) == qr_cls]
@@ -1541,8 +1126,16 @@ def main():
               f"the camera again; its codes will be picked up automatically.")
         print(f"[recheck] then press START: if it read clean the run carries "
               f"on, if not the row is recorded as a label defect.")
-        if not args.no_stop_on_fail:
-            stop_machine(f"row {row_no} short of {cols} — held for re-check")
+        if args.no_stop_on_fail:
+            # Nothing is going to come and look at this row, so writing it off
+            # is the only way the window can keep moving.
+            recheck["row"] = None
+            recheck["attempt"] = 0
+            stale = window.evict_head()
+            if stale is not None:
+                retire_row(stale, complete=False)
+            return
+        stop_machine(f"row {row_no} short of {cols} — held for re-check")
 
     def _adjudicate_recheck():
         """Called when the operator presses START with a row held open.
@@ -1587,17 +1180,20 @@ def main():
         print(f"[defect]  accepted — window moves on to row {head}")
 
     def retire_row(row_idx, complete):
-        """A sheet row has left the window — record it and, if it left short,
-        count it against the miss budget."""
-        nonlocal gap_streak
+        """A sheet row has left the window. Record it and log the verdict.
+
+        A row that came up short normally never reaches here — it is held open
+        by _hold_head_for_recheck and settled by _adjudicate_recheck when the
+        operator presses START. The short path below is only reached under
+        --no-stop-on-fail, the one setting that lets a row be written off
+        without a human looking at it.
+        """
         row_no = sheet.rows[row_idx].number
         missing = sorted(window.missing(row_idx))
         record_row(row_idx, complete)
         if args.xlsx_every and len(verified) % args.xlsx_every == 0:
             write_annotated_xlsx(background=True)   # off unless asked for
         if complete and not missing:
-            gap_streak = 0
-            gap_recent.append(False)
             print(f"[window] PASS row {row_no}: all "
                   f"{len(window.required(row_idx))} codes read")
             if results is not None:
@@ -1608,20 +1204,6 @@ def main():
         print(f"[window] FAIL row {row_no}: never read {cols}")
         if results is not None:
             results.write(_window_result(row_idx, False))
-        if args.no_stop_on_fail:
-            return
-        gap_streak += 1
-        gap_recent.append(True)
-        window_misses = sum(gap_recent)
-        if gap_streak > args.gap_tolerance:
-            stop_machine(f"{gap_streak} consecutive rows short "
-                        f"(row {row_no} missing {cols})")
-        elif window_misses > args.gap_window_max:
-            stop_machine(f"{window_misses} of the last {len(gap_recent)} rows "
-                        f"short (row {row_no})")
-        else:
-            print(f"[window] tolerating it ({gap_streak} in a row, "
-                  f"{window_misses} in the last {len(gap_recent)})")
 
     class _WindowResult:
         """Shaped like a BatchResult so the existing CSV writer can take it."""
@@ -1655,50 +1237,6 @@ def main():
                                         expected, status))
         return _WindowResult(row.number, entries, ok)
 
-    decoder = None
-    if not args.no_qr and args.mode == "row":
-        decoder = RowGroupDecoder(
-            label_cls=label_cls,
-            qr_cls=qr_cls,
-            margin=args.qr_margin,
-            min_px=args.qr_margin_min,
-            on_decode=on_decode,
-            on_batch=on_batch,
-            on_label=(lambda f, box, text: saver.save(f, box, text))
-                     if saver is not None else None,
-            dump_dir=args.dump_crops,
-            column_gap=args.column_gap or None,
-            source=args.decode_source,
-            expect=validator.per_row if validator is not None else args.labels_per_row,
-            identify=validator.identify if validator is not None else None,
-            check=validator.check if validator is not None else None,
-        )
-        print(f"[row] grouping {args.label_class}s into rows by x-centre "
-              f"across the whole frame; each group matched to any open "
-              f"window row, positions held to QR DATA1..N")
-    elif not args.no_qr and args.mode == "line":
-        decoder = CenterLineQRDecoder(
-            line_x=int(disp_w * args.line_pos),
-            label_cls=label_cls,
-            qr_cls=qr_cls,
-            margin=args.qr_margin,
-            min_px=args.qr_margin_min,
-            on_decode=on_decode,
-            on_batch=on_batch,
-            on_label=(lambda f, box, text: saver.save(f, box, text))
-                     if saver is not None else None,
-            dump_dir=args.dump_crops,
-            half_width=args.line_width,
-            zone=max(args.zone, args.line_width) or None,
-            column_gap=args.column_gap or None,
-            source=args.decode_source,
-            expect=validator.per_row if validator is not None else args.labels_per_row,
-            identify=validator.identify if validator is not None else None,
-            check=validator.check if validator is not None else None,
-        )
-        print(f"[qr] trigger line at x={decoder.line_x} "
-              f"({args.label_class} crossing -> decode {args.qr_class})")
-
     writer = None
     if args.save:
         writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"),
@@ -1723,15 +1261,10 @@ def main():
             return cv2.resize(frame, None, fx=scale, fy=scale,
                               interpolation=cv2.INTER_NEAREST)
 
-        if mapview is not None:
-            cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(MAP_WINDOW, mapview.WIDTH,
-                             mapview.render().shape[0])
-        if window is not None:
-            view = render_window_view()
-            cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(WINDOW_VIEW, view.shape[1], view.shape[0])
-            print(f"[window] comparison panel in the '{WINDOW_VIEW}' window")
+        view = render_window_view()
+        cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_VIEW, view.shape[1], view.shape[0])
+        print(f"[window] comparison panel in the '{WINDOW_VIEW}' window")
 
         panel = ControlPanel(disp_w, disp_h,
                              on_start=lambda: start_machine("start button"),
@@ -1747,9 +1280,11 @@ def main():
         print("[ui] START/STOP buttons in the window (keys: s = start, x = stop)")
 
     try:
-        # The machine starts once everything above is ready, so the very first
-        # labels off the winder are already being watched.
-        # start_machine("startup")
+        # Deliberately not started here. Nothing is decoded and nothing is
+        # held against the sheet until the operator presses START, which is
+        # what makes the read-in below mean something: it validates the coil
+        # at the position it is actually standing in.
+        print("[ui] idle — press START (or 's') to validate and run")
 
         prev_t = time.time()
         fps = 0.0
@@ -1768,22 +1303,28 @@ def main():
             dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres,
                                conf_per_class)
 
-            # ── center-line QR decode ────────────────────────────────────
-            # Every label crossing the line is decoded once — labels are kept
-            # apart by the y-centre of their box, and the set is cleared when
-            # the line goes clear again (no tracker involved).
-            if decoder is not None:
-                decoder.update(frame, dets)
-            if per_code:
+            # ── decode and validate ──────────────────────────────────────
+            # Only while the machine is running, or in the read-in after START
+            # was pressed. Stopped, the detector still draws boxes but nothing
+            # is decoded or held against the sheet — the operator is handling
+            # the coil, and whatever drifts past the lens is not a verdict.
+            if validating():
                 scan_frame(frame, dets)
+                if (starting_at[0] is not None
+                        and time.time() - starting_at[0] >= args.start_delay):
+                    _finish_start()
 
             frame = draw_detections(frame, dets, class_names)
-            if decoder is not None:
-                decoder.draw(frame)
-            if window is not None:
-                draw_window(frame, compact=True)
-            elif validator is not None:
-                validator.draw(frame)
+            draw_window(frame, compact=True)
+            if starting_at[0] is not None:
+                left = max(args.start_delay - (time.time() - starting_at[0]), 0)
+                cv2.putText(frame, f"READING LABELS… {left:.1f}s",
+                            (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                            (0, 200, 255), 2, cv2.LINE_AA)
+            elif not machine_running:
+                cv2.putText(frame, "IDLE — press START to validate and run",
+                            (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (150, 150, 150), 2, cv2.LINE_AA)
             if panel is not None:
                 panel.draw(frame, machine_running)
 
@@ -1798,28 +1339,22 @@ def main():
                 fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
             if args.no_display:
-                qr_status = (f"  qr={decoder.count}"
-                             f"  web={decoder.step:.0f}px/f"
-                             f"  zone={decoder.frames_in_zone:.1f}f"
-                             if decoder is not None else "")
-                if window is not None:
-                    passed = sum(1 for _, ok in window.done if ok)
-                    val_status = (f"  pass={passed} short={len(window.done)-passed}"
-                                  f"  reads={window.reads}")
-                else:
-                    val_status = (f"  ok={validator.batches_ok} "
-                                  f"fail={validator.batches_bad}"
-                                  if validator is not None else "")
+                passed = sum(1 for _, ok in window.done if ok)
+                held = f"  HELD row {recheck['row']}" if recheck["row"] else ""
+                if starting_at[0] is not None:
+                    left = args.start_delay - (time.time() - starting_at[0])
+                    held += f"  READ-IN {max(left, 0):.1f}s"
+                elif not machine_running:
+                    held += "  IDLE"
                 print(f"[camera] frame {frame.shape}  fps={fps:.1f}  "
-                      f"dets={len(dets)}{qr_status}{val_status}   ", end="\r")
+                      f"dets={len(dets)}  pass={passed} "
+                      f"short={len(window.done) - passed}  "
+                      f"reads={window.reads}{held}   ", end="\r")
             else:
                 cv2.putText(frame, f"FPS: {fps:.1f}  dets: {len(dets)}", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow(win_name, display_frame(frame))
-                if mapview is not None:
-                    cv2.imshow(MAP_WINDOW, mapview.render())
-                if window is not None:
-                    cv2.imshow(WINDOW_VIEW, render_window_view())
+                cv2.imshow(WINDOW_VIEW, render_window_view())
 
             if writer:
                 writer.write(frame)
@@ -1856,12 +1391,10 @@ def main():
             print(f"[defect] {len(defects)} row(s) failed twice and were "
                   f"recorded as LABEL ISSUE: "
                   + ", ".join(str(r) for r in sorted(defects)))
-        if decoder is not None and decoder.duplicates:
-            print(f"[qr] {decoder.duplicates} re-tracked columns suppressed")
-        if validator is not None:
-            print(f"[validate] done: {validator.batches_ok} rows passed, "
-                  f"{validator.batches_bad} failed "
-                  f"({validator.labels_ok} codes ok, {validator.labels_bad} bad)")
+        passed = sum(1 for _, ok in window.done if ok)
+        print(f"[validate] done: {passed} rows passed, "
+              f"{len(window.done) - passed} short, "
+              f"{window.reads} codes read")
 
 
 if __name__ == "__main__":

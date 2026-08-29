@@ -1,0 +1,3 @@
+label
+qr_code
+logo
