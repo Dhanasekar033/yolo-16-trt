@@ -420,7 +420,12 @@ def main():
     ap.add_argument("--qr-margin-min", type=int, default=8,
                      help="minimum quiet zone in pixels.")
     ap.add_argument("--dump-crops", default=None,
-                     help="directory to save qr crops that failed to decode.")
+                     help="directory to save what the camera saw whenever a "
+                          "label was detected but would not decode: the label "
+                          "crop, the tighter qr crop, and the whole frame at "
+                          "the moment a row is held. Files touching the frame "
+                          "edge are named -CLIPPED. This is the tool for "
+                          "answering why a row came up short.")
     # label crop args
     ap.add_argument("--result-dir", default=DEFAULT_RESULT_DIR,
                      help="root for saved label crops: "
@@ -661,6 +666,7 @@ def main():
     # its copy in the very first block and the whole run starts again.
     resume_hint = [None]
     handled = [[]]           # boxes whose code was accepted on the last frame
+    last_frame = [None]      # most recent frame, for the diagnostic dump
     verified = {}          # excel row number -> (per-column marks, status)
 
     # ── re-inspection state (row mode) ───────────────────────────────────
@@ -997,6 +1003,51 @@ def main():
                         (x, y + 32 + i * 30), font, 0.6, colour, 2, cv2.LINE_AA)
         return frame
 
+    dump_n = [0]
+    DUMP_CAP = 500
+
+    def _dump_miss(frame, label_box, qr_box):
+        """A label was detected but would not decode. Save what the camera saw.
+
+        Both crops go down: the label crop that was tried first, and the
+        tighter qr_code crop that was tried as a fallback. Between them they
+        answer the only question that matters when a row comes up short — was
+        the code clipped, soft, or simply not there.
+        """
+        if not args.dump_crops or dump_n[0] >= DUMP_CAP:
+            return
+        os.makedirs(args.dump_crops, exist_ok=True)
+        stamp = time.strftime("%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
+        h, w = frame.shape[:2]
+        for tag, b in (("label", label_box), ("qr", qr_box)):
+            if b is None:
+                continue
+            x1, y1, x2, y2 = (max(int(b[0]), 0), max(int(b[1]), 0),
+                              min(int(b[2]), w), min(int(b[3]), h))
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            edge = ""
+            if x1 <= 2 or y1 <= 2 or x2 >= w - 2 or y2 >= h - 2:
+                edge = "-CLIPPED"
+            cv2.imwrite(os.path.join(args.dump_crops,
+                                     f"miss-{stamp}-{tag}{edge}.jpg"),
+                        frame[y1:y2, x1:x2])
+        dump_n[0] += 1
+        if dump_n[0] == DUMP_CAP:
+            print(f"\n[dump] {DUMP_CAP} failed crops saved to "
+                  f"{args.dump_crops}/ — not saving any more")
+
+    def _dump_frame(tag):
+        """The whole frame, for the moment a row is held. Context the crops
+        cannot give: where the row was, and what else was in view."""
+        if not args.dump_crops or last_frame[0] is None:
+            return
+        os.makedirs(args.dump_crops, exist_ok=True)
+        path = os.path.join(args.dump_crops,
+                            f"frame-{time.strftime('%H%M%S')}-{tag}.jpg")
+        cv2.imwrite(path, last_frame[0])
+        print(f"[dump] frame at the moment of the hold: {path}")
+
     def scan_frame(frame, dets):
         """Decode every label in the frame and offer each payload to the
         window. No trigger line: a label is read on whichever frame it happens
@@ -1034,6 +1085,7 @@ def main():
                 text, box = decode_qr(frame, qr[:4], args.qr_margin,
                                       args.qr_margin_min)
             if not text:
+                _dump_miss(frame, det[:4], qr)
                 continue
 
             # The first payload the sheet recognises decides where the window
@@ -1126,6 +1178,7 @@ def main():
               f"the camera again; its codes will be picked up automatically.")
         print(f"[recheck] then press START: if it read clean the run carries "
               f"on, if not the row is recorded as a label defect.")
+        _dump_frame(f"row{row_no}-short")
         if args.no_stop_on_fail:
             # Nothing is going to come and look at this row, so writing it off
             # is the only way the window can keep moving.
@@ -1309,6 +1362,7 @@ def main():
             # is decoded or held against the sheet — the operator is handling
             # the coil, and whatever drifts past the lens is not a verdict.
             if validating():
+                last_frame[0] = frame
                 scan_frame(frame, dets)
                 if (starting_at[0] is not None
                         and time.time() - starting_at[0] >= args.start_delay):
