@@ -249,6 +249,13 @@ class SequenceValidator:
         # of them; anything left out is neither read nor held against the row.
         self.check = None if check is None else set(check)
         self.cursor = None
+        # Where a previous run got to, used only as the lookup hint until the
+        # sequence anchors itself. A repeating sheet holds each payload many
+        # times over, so without this the first code the camera sees resolves
+        # to its copy in the very first block and the run starts again from
+        # the top. Unlike setting the cursor outright, it does not make the
+        # first crossing look out of sequence.
+        self.resume_near = None
 
         self.batches = 0
         self.batches_ok = 0
@@ -258,12 +265,18 @@ class SequenceValidator:
         self.last = None
         self.exhausted = False
 
+    @property
+    def _near(self):
+        """Which row to resolve a repeated payload against: where the sequence
+        is now, or where the last run left off before it has anchored."""
+        return self.cursor if self.cursor is not None else self.resume_near
+
     # ── live, per label: pure lookup, so decode order cannot mislead it ────
     def identify(self, text):
         """Row index this payload belongs to, or None — the decoder's notion
         of a column's identity. Two labels resolving to the same index are the
         same physical row, whatever the position tracker thinks."""
-        hit = self.sheet.find(text, near=self.cursor)
+        hit = self.sheet.find(text, near=self._near)
         return None if hit is None else hit[0]
 
     def reanchor(self):
@@ -290,7 +303,7 @@ class SequenceValidator:
 
     def peek(self, text):
         """Where this payload lives in the sheet: (row_number, col_no) or None."""
-        hit = self.sheet.find(text, near=self.cursor)
+        hit = self.sheet.find(text, near=self._near)
         if hit is None:
             return None
         row_idx, col = hit
@@ -306,7 +319,7 @@ class SequenceValidator:
         if self.order == BOTTOM_UP:
             texts = list(reversed(texts))
 
-        hits = [self.sheet.find(t, near=self.cursor) if t else None
+        hits = [self.sheet.find(t, near=self._near) if t else None
                 for t in texts]
         seen = [row_idx for row_idx, _ in (h for h in hits if h)]
 
