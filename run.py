@@ -81,8 +81,24 @@ ROTATE_MAP = {
 }
 
 
+# videoflip's equivalent of ROTATE_MAP, so the rotation can be done inside
+# GStreamer instead of on the capture loop. cv2.rotate on a full 2592x1944
+# BGR frame costs ~3.1ms of the ~21ms frame budget; videoflip does the same
+# work on the GStreamer thread and the camera still delivers its full 60fps,
+# so those 3.1ms come straight off the loop.
+VIDEOFLIP_MAP = {
+    0:   None,
+    90:  "clockwise",
+    180: "rotate-180",
+    270: "counterclockwise",
+}
+
+
 def rotate_frame(frame, degrees):
-    """Rotate a frame by a fixed angle (0/90/180/270). No-op for 0."""
+    """Rotate a frame by a fixed angle (0/90/180/270). No-op for 0.
+
+    Only used when the rotation could not be pushed into the pipeline; the
+    normal path has videoflip deliver frames already rotated."""
     code = ROTATE_MAP[degrees]
     return frame if code is None else cv2.rotate(frame, code)
 
@@ -119,10 +135,16 @@ def find_camera_index(name_substring=GS_CAMERA_NAME, default=DEFAULT_CAM_INDEX):
 
 
 def gstreamer_pipeline(cam_index=DEFAULT_CAM_INDEX, width=DEFAULT_WIDTH,
-                        height=DEFAULT_HEIGHT, fps=DEFAULT_FPS, format=DEFAULT_FORMAT):
-    """Build a GStreamer pipeline string for v4l2src (MJPG or YUYV)."""
+                        height=DEFAULT_HEIGHT, fps=DEFAULT_FPS, format=DEFAULT_FORMAT,
+                        rotate=0):
+    """Build a GStreamer pipeline string for v4l2src (MJPG or YUYV).
+
+    `rotate` (0/90/180/270) is applied by videoflip inside the pipeline, so
+    frames arrive already rotated and the loop never touches them."""
     QUEUE = "queue leaky=downstream max-size-buffers=1"
-    SINK  = ("videoconvert ! video/x-raw, format=BGR ! "
+    method = VIDEOFLIP_MAP.get(rotate)
+    FLIP  = f"videoflip method={method} ! " if method else ""
+    SINK  = (f"{FLIP}videoconvert ! video/x-raw, format=BGR ! "
              "appsink drop=true max-buffers=1 sync=false")
 
     if format.upper() == "MJPG":
@@ -583,11 +605,22 @@ def main():
     panel = None
 
     cam_index = args.index if args.index is not None else find_camera_index()
-    pipeline = gstreamer_pipeline(cam_index, args.width, args.height, args.fps, args.format)
     print(f"[camera] using /dev/video{cam_index}")
-    print(f"[camera] pipeline: {pipeline}")
 
+    # Preferred path: videoflip rotates inside the pipeline, off the loop. If
+    # that pipeline won't open (no videoflip element, say), fall back to
+    # rotating each frame in the loop as before.
+    pipeline = gstreamer_pipeline(cam_index, args.width, args.height, args.fps,
+                                  args.format, rotate=args.rotate)
+    print(f"[camera] pipeline: {pipeline}")
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    rotate_in_loop = 0
+    if not cap.isOpened() and args.rotate:
+        print("[camera] videoflip pipeline would not open — rotating in the loop")
+        pipeline = gstreamer_pipeline(cam_index, args.width, args.height,
+                                      args.fps, args.format)
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        rotate_in_loop = args.rotate
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera via GStreamer pipeline")
 
@@ -852,9 +885,29 @@ def main():
                 with xlsx_lock:
                     xlsx_busy[0] = False
 
+    # The panel costs ~2.9ms of the ~21ms frame budget to draw — it is ~50
+    # putText calls — but its content only moves when the window does. Cache
+    # it against the window state it reads, so a frame that changed nothing
+    # reuses the last image instead of redrawing it.
+    view_cache = [None, None]        # [state key, rendered image]
+
+    def _window_view_key():
+        return (window.start, window.reads, len(window.done), window.last_hit,
+                len(window.unexpected))
+
     def render_window_view():
         """The rolling window as its own panel: what the sheet expects against
-        what has actually been read, plus the state of every open row."""
+        what has actually been read, plus the state of every open row.
+
+        Redrawn only when the window state behind it has changed."""
+        key = _window_view_key()
+        if view_cache[0] == key and view_cache[1] is not None:
+            return view_cache[1]
+        img = _draw_window_view()
+        view_cache[0], view_cache[1] = key, img
+        return img
+
+    def _draw_window_view():
         import numpy as np
         font = cv2.FONT_HERSHEY_SIMPLEX
         W = 1120
@@ -1211,6 +1264,15 @@ def main():
         scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
         cv2.resizeWindow(win_name, int(disp_w * scale), int(disp_h * scale))
 
+        # The window is capped to DISPLAY_MAX_* anyway, so pushing the full
+        # 5MP frame through imshow just makes the GUI thread scale it down
+        # every frame. Do it here instead, with a cheap interpolation.
+        def display_frame(frame):
+            if scale >= 1.0:
+                return frame
+            return cv2.resize(frame, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_NEAREST)
+
         if mapview is not None:
             cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(MAP_WINDOW, mapview.WIDTH,
@@ -1224,7 +1286,14 @@ def main():
         panel = ControlPanel(disp_w, disp_h,
                              on_start=lambda: start_machine("start button"),
                              on_stop=lambda: stop_machine("stop button"))
-        cv2.setMouseCallback(win_name, panel.on_mouse)
+        # display_frame shrinks the frame by `scale` before imshow, and GTK
+        # reports clicks in the coordinates of the image it was handed — so
+        # scale them back up before hit-testing the buttons, which are laid
+        # out against the full-resolution frame.
+        def on_mouse(event, x, y, flags, param):
+            panel.on_mouse(event, int(x / scale), int(y / scale), flags, param)
+
+        cv2.setMouseCallback(win_name, on_mouse)
         print("[ui] START/STOP buttons in the window (keys: s = start, x = stop)")
 
     try:
@@ -1240,7 +1309,8 @@ def main():
                 print("[camera] frame grab failed, retrying...")
                 continue
 
-            frame = rotate_frame(frame, args.rotate)
+            if rotate_in_loop:
+                frame = rotate_frame(frame, rotate_in_loop)
 
             # ── inference ────────────────────────────────────────────────
             inp, ratio, pad = preprocess(frame, model.input_size)
@@ -1295,7 +1365,7 @@ def main():
             else:
                 cv2.putText(frame, f"FPS: {fps:.1f}  dets: {len(dets)}", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.imshow(win_name, frame)
+                cv2.imshow(win_name, display_frame(frame))
                 if mapview is not None:
                     cv2.imshow(MAP_WINDOW, mapview.render())
                 if window is not None:
