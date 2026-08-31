@@ -55,15 +55,6 @@ machine idle, because each opens a new record and closes the old one. The
 counters, the window's check status and the decoder tally are diagnostics and
 only appear with --debug, or when 'd' is pressed.
 
-That console is Qt (utils/qt_ui.py): the chrome is widgets and the overlay is
-painted at display resolution, which is both quicker than burning it into a
-5MP frame sixty times a second and far easier to read. Qt owns the main
-thread, so the capture loop runs on a worker and posts a snapshot of drawing
-instructions across; the console sends back nothing but named commands, which
-the loop picks up at the top of its next pass. That way all the machine's
-state stays on one thread. --ui opencv selects the older console drawn onto
-the video, which is unchanged and still works.
-
 Usage:
     python3 run.py                                  # defaults
     python3 run.py --xlsx validation.xlsx
@@ -94,7 +85,6 @@ espeak is the fallback for one that has not. --no-voice runs it silent.
 
 import argparse
 import os
-import queue
 import threading
 import time
 import cv2
@@ -443,12 +433,6 @@ def main():
     ap.add_argument("--format", default=DEFAULT_FORMAT, choices=["MJPG", "YUYV"])
     ap.add_argument("--rotate", type=int, default=DEFAULT_ROTATE, choices=[0, 90, 180, 270],
                      help="Rotate every frame by a fixed angle (clockwise).")
-    ap.add_argument("--ui", default="qt", choices=["qt", "opencv"],
-                     help="which console. 'qt' is a real window: the chrome "
-                          "is widgets rather than pixels burnt into the "
-                          "frame, which is both quicker and far easier to "
-                          "read. 'opencv' is the older console drawn onto "
-                          "the video, kept as a fallback.")
     ap.add_argument("--no-display", action="store_true",
                      help="Just print FPS/detections instead of opening a window (headless).")
     ap.add_argument("--debug", action="store_true",
@@ -701,7 +685,8 @@ def main():
                   f"{_tail(fault['text'], 30)} — it will not stop the line "
                   f"again this run")
             voice.say("Wrong label accepted.", key="accepted")
-        _note[0] = f"Reading the labels ({args.start_delay:.0f}s)"
+        if panel is not None:
+            panel.note = f"reading labels… ({args.start_delay:.0f}s)"
         held = (f", re-checking row {recheck['row']}"
                 if recheck["row"] is not None else "")
         print(f"\n[relay] START pressed ({reason}) — reading the labels in "
@@ -732,7 +717,8 @@ def main():
         relay.on(args.start_relay)
         _aux(args.run_relay, True)
         machine_running = True
-        _note[0] = None
+        if panel is not None:
+            panel.note = None
         print(f"[relay] winding machine STARTED ({start_reason[0]}) "
               f"— relay {args.start_relay} ON"
               + (f", run relay {args.run_relay} ON"
@@ -748,7 +734,8 @@ def main():
         relay.off(args.start_relay)
         _aux(args.run_relay, False)
         machine_running = False
-        _note[0] = reason
+        if panel is not None:
+            panel.note = reason
         what = "start ABORTED" if aborted and not machine_running else "STOPPED"
         print(f"\n[relay] winding machine {what} ({reason}) "
               f"— relay {args.start_relay} OFF")
@@ -1539,17 +1526,23 @@ def main():
                         FAULT_GREEN if got else FAULT_WANT)
         return None
 
-    def _fault_report():
-        """The headline and the detail lines for the live fault.
+    def draw_fault(frame):
+        """Everything the operator needs while winding the coil back."""
+        if fault["kind"] is None:
+            return frame
 
-        What the operator is told while winding the coil back, worked out
-        once here and rendered by whichever console is running -- OpenCV
-        burns it into the frame, Qt paints it as text. Hershey has no glyph
-        for anything outside ASCII, so every string stays plain ASCII: a dash
-        or an ellipsis comes out of it as "???".
-        """
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        h, w = frame.shape[:2]
+        # A red border round the picture: a screen stopped on a fault must not
+        # read as an idle one at a glance from across the machine. It frames
+        # the picture only, so the console chrome stays legible.
+        cv2.rectangle(frame, (0, _band_top()),
+                      (_band_right(w), h - _band_bottom()), FAULT_RED, 14)
+
+        # Hershey has no glyph for anything outside ASCII, so every string
+        # drawn here is plain ASCII: a dash or an ellipsis comes out as "???".
         banner = ""
-        lines = []                    # (text, colour, relative size)
+        lines = []                    # (text, colour, scale)
         if fault["kind"] == "short":
             idx = fault["row_idx"]
             req = sorted(window.required(idx))
@@ -1567,7 +1560,7 @@ def main():
                           "- then it starts itself", FAULT_TEXT, 0.7))
             lines.append((f"or press START to record row {fault['row']} as a "
                           f"label defect", FAULT_TEXT, 0.7))
-        elif fault["kind"] is not None:
+        else:
             gone = time.time() - fault["seen"]
             banner = f"REWIND: UNEXPECTED CODE {_tail(fault['text'] or '', 16)}"
             lines.append((f"read     {_tail(fault['text'] or '', 26)}",
@@ -1583,22 +1576,6 @@ def main():
                 left = max(args.rewind_clear - gone, 0.0)
                 lines.append((f"out of frame - restarting in {left:.1f}s",
                               FAULT_GREEN, 0.8))
-        return banner, lines
-
-    def draw_fault(frame):
-        """Everything the operator needs while winding the coil back."""
-        if fault["kind"] is None:
-            return frame
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        h, w = frame.shape[:2]
-        # A red border round the picture: a screen stopped on a fault must not
-        # read as an idle one at a glance from across the machine. It frames
-        # the picture only, so the console chrome stays legible.
-        cv2.rectangle(frame, (0, _band_top()),
-                      (_band_right(w), h - _band_bottom()), FAULT_RED, 14)
-
-        banner, lines = _fault_report()
 
         # The headline goes in a bar right under the header, where nothing
         # else is drawn and it cannot be missed from a few feet away.
@@ -2077,36 +2054,34 @@ def main():
         finally:
             root.destroy()
 
-    _note = [None]        # what the status bar is saying, for either console
-
     def _configurable():
         """Both pickers repoint the whole record, so they are only live when
         nothing is part-way through being checked."""
         return not validating() and fault["kind"] is None
 
-    # Choosing a file and acting on the choice are separate, because under Qt
-    # they happen on different threads: the dialog has to run on the GUI
-    # thread, and everything it leads to has to run on the one that owns the
-    # machine's state.
-    def _apply_sheet(path):
+    def _pick_sheet():
         if not _configurable():
             print("[ui] stop the machine before loading a different sheet")
             return
+        path = _ask("sheet")
         if not path or os.path.abspath(path) == os.path.abspath(args.xlsx):
             return
         try:
             ValidationSheet(path, args.sheet)     # prove it before committing
         except Exception as exc:
             print(f"[ui] {path} is not a validation sheet: {exc}")
-            _note[0] = f"Not a validation sheet: {exc}"
+            if panel is not None:
+                panel.note = f"Not a validation sheet: {exc}"
             return
         _bind_run(new_xlsx=path)
-        _note[0] = None
+        if panel is not None:
+            panel.note = None
 
-    def _apply_output(path):
+    def _pick_output():
         if not _configurable():
             print("[ui] stop the machine before changing the output folder")
             return
+        path = _ask("folder")
         if not path or (os.path.abspath(path)
                         == os.path.abspath(args.result_dir)):
             return
@@ -2114,46 +2089,12 @@ def main():
             os.makedirs(path, exist_ok=True)
         except OSError as exc:
             print(f"[ui] cannot write to {path}: {exc}")
-            _note[0] = f"Cannot write to that folder: {exc}"
+            if panel is not None:
+                panel.note = f"Cannot write to that folder: {exc}"
             return
         _bind_run(new_result_dir=path)
-        _note[0] = None
-
-    def _pick_sheet():
-        if _configurable():
-            _apply_sheet(_ask("sheet"))
-
-    def _pick_output():
-        if _configurable():
-            _apply_output(_ask("folder"))
-
-    # Commands from the Qt console. It never touches the machine's state; it
-    # posts a name here and the capture loop picks it up at the top of its
-    # next pass, which is what keeps that state single-threaded and keeps a
-    # 150ms relay write off the GUI thread.
-    commands = queue.Queue()
-    quitting = threading.Event()
-
-    def _run_commands():
-        while True:
-            try:
-                name, arg = commands.get_nowait()
-            except queue.Empty:
-                return
-            if name == "start":
-                start_machine("start button")
-            elif name == "stop":
-                stop_machine("stop button")
-            elif name == "sheet":
-                _apply_sheet(arg)
-            elif name == "outdir":
-                _apply_output(arg)
-            elif name == "debug":
-                show_debug[0] = not show_debug[0]
-                print(f"[ui] diagnostics "
-                      f"{'on' if show_debug[0] else 'off'}")
-            elif name == "quit":
-                quitting.set()
+        if panel is not None:
+            panel.note = None
 
     def ui_state():
         """What the console's status pill is showing."""
@@ -2168,51 +2109,24 @@ def main():
     # screen unless they are asked for. 'd' toggles them mid-run.
     show_debug = [args.debug]
 
-    # Qt owns the main thread, so under it the capture loop is the worker and
-    # the console is what the main thread runs. `scale` is how far the frame
-    # is shrunk on its way to the screen, and both consoles need it.
-    qt_app = qt_window = None
-    scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
-
-    def display_frame(frame):
-        """The frame at the size it will actually be shown.
-
-        The window is capped either way, so pushing the full 5MP frame
-        through the toolkit just makes it scale down again on the GUI thread.
-        """
-        if scale >= 1.0:
-            return frame
-        return cv2.resize(frame, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_NEAREST)
-
-    if not args.no_display and args.ui == "qt":
-        try:
-            from utils.qt_ui import InspectorWindow
-            from PyQt5 import QtWidgets
-        except ImportError as exc:
-            print(f"[ui] PyQt5 is not available ({exc}) - falling back to the "
-                  f"OpenCV console. pip install PyQt5 for the faster one.")
-            args.ui = "opencv"
-        else:
-            qt_app = QtWidgets.QApplication.instance() \
-                or QtWidgets.QApplication([])
-            qt_window = InspectorWindow()
-            qt_window.command.connect(lambda name, arg:
-                                      commands.put((name, arg)))
-            qt_window.resize(int(disp_w * scale) + 230,
-                             int(disp_h * scale) + 120)
-            qt_window.show()
-            print("[ui] Qt console (keys: s = start, x = stop, o = load "
-                  "sheet, f = output folder, d = diagnostics, q = quit)")
-
-    if not args.no_display and args.ui == "opencv":
+    if not args.no_display:
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
         # at the frame's native resolution which overflows most screens. We
         # set an initial on-screen size, capped to DISPLAY_MAX_*, while the
         # capture/inference itself still runs at full resolution.
         win_name = "Global Shutter Camera - YOLO26 TRT"
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
         cv2.resizeWindow(win_name, int(disp_w * scale), int(disp_h * scale))
+
+        # The window is capped to DISPLAY_MAX_* anyway, so pushing the full
+        # 5MP frame through imshow just makes the GUI thread scale it down
+        # every frame. Do it here instead, with a cheap interpolation.
+        def display_frame(frame):
+            if scale >= 1.0:
+                return frame
+            return cv2.resize(frame, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_NEAREST)
 
         if show_debug[0]:
             view = render_window_view()
@@ -2220,8 +2134,9 @@ def main():
             cv2.resizeWindow(WINDOW_VIEW, view.shape[1], view.shape[0])
             print(f"[window] comparison panel in the '{WINDOW_VIEW}' window")
 
-        # The console needs `scale` so its type is sized for what the
-        # operator actually sees rather than for the captured pixels.
+        # `scale` is how far the frame is shrunk on its way to the screen;
+        # the console needs it so its type is sized for what the operator
+        # actually sees rather than for the captured pixels.
         panel = ControlPanel(disp_w, disp_h,
                              on_start=lambda: start_machine("start button"),
                              on_stop=lambda: stop_machine("stop button"),
@@ -2240,193 +2155,123 @@ def main():
               "x = stop, o = load sheet, f = output folder, d = debug "
               "readout, q = quit)")
 
+    try:
+        # Deliberately not started here. Nothing is decoded and nothing is
+        # held against the sheet until the operator presses START, which is
+        # what makes the read-in below mean something: it validates the coil
+        # at the position it is actually standing in.
+        print("[ui] idle — press START (or 's') to validate and run")
 
-    # ── one pass of the machine ──────────────────────────────────────────
-    # Capture, infer, decode, validate. Everything the app does per frame
-    # except deciding how to show it, so that both consoles drive exactly the
-    # same code and the Qt one can drive it from a worker thread.
-    fps_state = [time.time(), 0.0]
-
-    def process_frame():
-        """Returns (frame, dets), or None when the grab failed."""
-        ok, frame = cap.read()
-        if not ok:
-            print("[camera] frame grab failed, retrying...")
-            return None
-
-        if rotate_in_loop:
-            frame = rotate_frame(frame, rotate_in_loop)
-
-        # ── inference ────────────────────────────────────────────────────
-        inp, ratio, pad = preprocess(frame, model.input_size)
-        raw = model.infer(inp)
-        dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres,
-                           conf_per_class)
-
-        # ── decode and validate ──────────────────────────────────────────
-        # Only while the machine is running, or in the read-in after START
-        # was pressed. Stopped, the detector still draws boxes but nothing is
-        # decoded or held against the sheet — the operator is handling the
-        # coil, and whatever drifts past the lens is not a verdict.
-        # Cleared before the scan and set again by it, so it means "the
-        # offending code decoded on this frame", not "recently".
-        fault["in_frame"] = False
-        if scanning():
-            last_frame[0] = frame
-            scan_frame(frame, dets)
-            if (starting_at[0] is not None
-                    and time.time() - starting_at[0] >= args.start_delay):
-                _finish_start()
-        else:
-            marks[0] = []        # stopped: no verdicts, so no stale colours
-
-        # Rewinding after an unexpected code. There is no "it read clean"
-        # moment for this fault the way there is for a short row — the code
-        # is simply wrong — so what clears it is the offending label being
-        # wound out of shot and staying out.
-        if fault["kind"] == "unexpected" and not validating():
-            gone = time.time() - fault["seen"]
-            if not fault["in_frame"] and gone >= args.rewind_clear:
-                key = normalize(fault["text"])
-                if key in bounced:
-                    # It has already been let off once and come straight
-                    # back. Restarting again would just bounce the line
-                    # between stop and start with nobody in the loop.
-                    if not fault["warned"]:
-                        fault["warned"] = True
-                        print(f"\n[rewind] {_tail(fault['text'], 30)} has "
-                              f"stopped the line twice — not restarting on "
-                              f"its own. Press START to accept it, or take "
-                              f"that label off the web.")
-                        voice.alert("The same wrong label again. Press start "
-                                    "to accept it, or take it off the coil.",
-                                    key="bounced")
-                else:
-                    bounced.add(key)
-                    _clear_fault(f"the unexpected code has been out of frame "
-                                 f"for {gone:.1f}s")
-
-        # Running FPS: time between consecutive frames, smoothed with an
-        # exponential moving average so the readout doesn't jitter.
-        now = time.time()
-        dt = now - fps_state[0]
-        fps_state[0] = now
-        if dt > 0:
-            inst = 1.0 / dt
-            fps_state[1] = inst if fps_state[1] == 0.0 \
-                else (0.9 * fps_state[1] + 0.1 * inst)
-        return frame, dets
-
-    def _live_note():
-        """What the status bar should be saying right now."""
-        if starting_at[0] is not None:
-            left = max(args.start_delay - (time.time() - starting_at[0]), 0)
-            return f"Reading labels - {left:.1f}s to relay on"
-        if fault["kind"] is not None:
-            return "STOPPED: " + _fault_headline()
-        return _note[0]
-
-    def _status_line():
-        passed = sum(1 for _, ok in window.done if ok)
-        head = (sheet.rows[window.start].number
-                if window.start is not None and not window.exhausted else "-")
-        return (f"{passed} pass / {len(window.done) - passed} short\n"
-                f"{window.reads} codes read\nhead row {head}")
-
-    def _headless_line(frame, dets):
-        passed = sum(1 for _, ok in window.done if ok)
-        held = f"  HELD row {recheck['row']}" if recheck["row"] else ""
-        if fault["kind"] is not None:
-            held += f"  REWIND[{_fault_headline()}]"
-        if starting_at[0] is not None:
-            left = args.start_delay - (time.time() - starting_at[0])
-            held += f"  READ-IN {max(left, 0):.1f}s"
-        elif not machine_running:
-            held += "  IDLE"
-        print(f"[camera] frame {frame.shape}  fps={fps_state[1]:.1f}  "
-              f"dets={len(dets)}  pass={passed} "
-              f"short={len(window.done) - passed}  "
-              f"reads={window.reads}{held}   ", end="\r")
-
-    # ── the Qt console's view of a frame ─────────────────────────────────
-    def _rgb(bgr):
-        return (bgr[2], bgr[1], bgr[0])
-
-    def _snapshot(frame, dets):
-        """Drawing instructions in the coordinates of the displayed image.
-
-        The Qt side knows nothing about sheets, windows or faults, so every
-        decision about what to show is made here and handed over as a box, a
-        colour and a caption.
-        """
-        def at(box):
-            return tuple(v * scale for v in box)
-
-        boxes = []
-        for box, who, text in marks[0]:
-            x1, y1, x2, y2 = at(box)
-            boxes.append((x1, y1, x2, y2,
-                          _rgb(DECODER_COLOUR.get(who,
-                                                  DECODER_COLOUR["fail"])),
-                          _tail(text, 14) if text else "NO READ"))
-
-        tags = []
-        banner = None
-        lines = []
-        if fault["kind"] is not None:
-            for box, _who, text in marks[0]:
-                tag = _fault_tag(text)
-                if tag is None:
-                    continue
-                caption, colour = tag
-                x1, y1, x2, y2 = at(box)
-                tags.append((x1, y1, x2, y2, _rgb(colour), caption))
-            banner, detail = _fault_report()
-            lines = [(t, _rgb(c)) for t, c, _s in detail]
-
-        return {
-            "image": display_frame(frame),
-            "boxes": boxes, "tags": tags, "banner": banner, "lines": lines,
-            "state": ui_state(), "note": _live_note(),
-            "sheet": os.path.basename(args.xlsx),
-            "sheet_dir": os.path.dirname(os.path.abspath(args.xlsx)),
-            "outdir": args.result_dir,
-            "configurable": _configurable(),
-            "debug": show_debug[0],
-            "fps": fps_state[1], "dets": len(dets),
-            "status": _status_line(),
-            "window_view": render_window_view() if show_debug[0] else None,
-        }
-
-    # ── the two consoles ─────────────────────────────────────────────────
-    def _loop_opencv():
-        """The original: chrome drawn onto the frame, shown with imshow."""
+        prev_t = time.time()
+        fps = 0.0
         while True:
-            got = process_frame()
-            if got is None:
+            ok, frame = cap.read()
+            if not ok:
+                print("[camera] frame grab failed, retrying...")
                 continue
-            frame, dets = got
 
+            if rotate_in_loop:
+                frame = rotate_frame(frame, rotate_in_loop)
+
+            # ── inference ────────────────────────────────────────────────
+            inp, ratio, pad = preprocess(frame, model.input_size)
+            raw = model.infer(inp)
+            dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres,
+                               conf_per_class)
+
+            # ── decode and validate ──────────────────────────────────────
+            # Only while the machine is running, or in the read-in after START
+            # was pressed. Stopped, the detector still draws boxes but nothing
+            # is decoded or held against the sheet — the operator is handling
+            # the coil, and whatever drifts past the lens is not a verdict.
+            # Cleared before the scan and set again by it, so it means
+            # "the offending code decoded on this frame", not "recently".
+            fault["in_frame"] = False
+            if scanning():
+                last_frame[0] = frame
+                scan_frame(frame, dets)
+                if (starting_at[0] is not None
+                        and time.time() - starting_at[0] >= args.start_delay):
+                    _finish_start()
+
+            # Rewinding after an unexpected code. There is no "it read clean"
+            # moment for this fault the way there is for a short row — the
+            # code is simply wrong — so what clears it is the offending label
+            # being wound out of shot and staying out.
+            if fault["kind"] == "unexpected" and not validating():
+                gone = time.time() - fault["seen"]
+                if not fault["in_frame"] and gone >= args.rewind_clear:
+                    key = normalize(fault["text"])
+                    if key in bounced:
+                        # It has already been let off once and come straight
+                        # back. Restarting again would just bounce the line
+                        # between stop and start with nobody in the loop.
+                        if not fault["warned"]:
+                            fault["warned"] = True
+                            print(f"\n[rewind] {_tail(fault['text'], 30)} has "
+                                  f"stopped the line twice — not restarting "
+                                  f"on its own. Press START to accept it, or "
+                                  f"take that label off the web.")
+                            voice.alert("The same wrong label again. Press "
+                                        "start to accept it, or take it off "
+                                        "the coil.", key="bounced")
+                    else:
+                        bounced.add(key)
+                        _clear_fault(f"the unexpected code has been out of "
+                                     f"frame for {gone:.1f}s")
+
+            # What the operator needs is the picture, the boxes, what each
+            # one read, and — when something is wrong — the fault. The
+            # counters and the window's check status are for whoever is
+            # debugging the line, and stay off unless asked for.
             frame = draw_detections(frame, dets, class_names)
             if scanning():
                 draw_decoders(frame, legend=show_debug[0])
+            else:
+                marks[0] = []      # stopped: no verdicts, so no stale colours
             draw_fault(frame)
             if show_debug[0]:
                 draw_window(frame, compact=True)
+
+            # Simple running FPS: time between consecutive frames, smoothed
+            # with an exponential moving average so the readout doesn't
+            # jitter frame-to-frame.
+            now = time.time()
+            dt = now - prev_t
+            prev_t = now
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
             if panel is not None:
                 panel.sheet_name = os.path.basename(args.xlsx)
                 panel.output_dir = args.result_dir
                 panel.configurable = _configurable()
-                panel.note = _live_note()
+                if starting_at[0] is not None:
+                    left = max(args.start_delay
+                               - (time.time() - starting_at[0]), 0)
+                    panel.note = f"Reading labels - {left:.1f}s to relay on"
+                elif fault["kind"] is not None:
+                    panel.note = "STOPPED: " + _fault_headline()
                 panel.draw(frame, ui_state())
 
             if args.no_display:
-                _headless_line(frame, dets)
+                passed = sum(1 for _, ok in window.done if ok)
+                held = f"  HELD row {recheck['row']}" if recheck["row"] else ""
+                if fault["kind"] is not None:
+                    held += f"  REWIND[{_fault_headline()}]"
+                if starting_at[0] is not None:
+                    left = args.start_delay - (time.time() - starting_at[0])
+                    held += f"  READ-IN {max(left, 0):.1f}s"
+                elif not machine_running:
+                    held += "  IDLE"
+                print(f"[camera] frame {frame.shape}  fps={fps:.1f}  "
+                      f"dets={len(dets)}  pass={passed} "
+                      f"short={len(window.done) - passed}  "
+                      f"reads={window.reads}{held}   ", end="\r")
             else:
                 if show_debug[0]:
-                    cv2.putText(frame,
-                                f"FPS {fps_state[1]:.1f}   DETS {len(dets)}",
+                    cv2.putText(frame, f"FPS {fps:.1f}   DETS {len(dets)}",
                                 (20, _band_top() + int(30 * _tk())),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55 * _tk(),
                                 (120, 220, 120), 2, cv2.LINE_AA)
@@ -2437,73 +2282,23 @@ def main():
             if writer:
                 writer.write(frame)
 
-            if args.no_display:
-                continue
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("d"):
-                show_debug[0] = not show_debug[0]
-                if show_debug[0]:
-                    view = render_window_view()
-                    cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow(WINDOW_VIEW, view.shape[1],
-                                     view.shape[0])
-                else:
-                    cv2.destroyWindow(WINDOW_VIEW)
-                print(f"[ui] debug readout "
-                      f"{'on' if show_debug[0] else 'off'}")
-            elif panel is not None:
-                panel.on_key(key)
-
-    def _loop_qt():
-        """Capture on a worker thread, console on the main one.
-
-        The worker never touches a widget: it posts a snapshot and reads the
-        command queue. The main thread never touches the machine: it turns
-        clicks and keys into commands. That division is what makes it safe to
-        run the two at once.
-        """
-        def work():
-            try:
-                while not quitting.is_set():
-                    _run_commands()
-                    got = process_frame()
-                    if got is None:
-                        continue
-                    frame, dets = got
-                    qt_window.post(_snapshot(frame, dets))
-                    if writer:
-                        writer.write(frame)
-            except (SystemExit, KeyboardInterrupt):
-                pass                              # an ordinary way out
-            except BaseException as exc:          # never die in silence
-                import traceback
-                traceback.print_exc()
-                print(f"[camera] capture thread stopped: {exc}")
-            finally:
-                quitting.set()
-                QtCore.QMetaObject.invokeMethod(qt_app, "quit",
-                                                QtCore.Qt.QueuedConnection)
-
-        from PyQt5 import QtCore
-        worker = threading.Thread(target=work, name="capture", daemon=True)
-        worker.start()
-        qt_app.exec_()
-        quitting.set()
-        worker.join(timeout=5.0)
-
-    try:
-        # Deliberately not started here. Nothing is decoded and nothing is
-        # held against the sheet until the operator presses START, which is
-        # what makes the read-in mean something: it validates the coil at the
-        # position it is actually standing in.
-        print("[ui] idle — press START (or 's') to validate and run")
-        if qt_window is not None:
-            _loop_qt()
-        else:
-            _loop_opencv()
-
+            if not args.no_display:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("d"):
+                    show_debug[0] = not show_debug[0]
+                    if show_debug[0]:
+                        view = render_window_view()
+                        cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
+                        cv2.resizeWindow(WINDOW_VIEW, view.shape[1],
+                                         view.shape[0])
+                    else:
+                        cv2.destroyWindow(WINDOW_VIEW)
+                    print(f"[ui] debug readout "
+                          f"{'on' if show_debug[0] else 'off'}")
+                elif panel is not None:
+                    panel.on_key(key)
     except KeyboardInterrupt:
         # Ctrl+C is how the line is stopped from the terminal, so it is an
         # ordinary way out, not a crash: swallow it here and let the shutdown
