@@ -58,19 +58,18 @@ STATES = {
 }
 
 
-def _short_path(path, keep=2):
-    """The tail of a path, which is the part that says which run this is.
+def _wrap_path(path):
+    """A path the panel can show whole, however deep it is.
 
-    An output folder can be a dozen components deep and the panel is 320px
-    wide; the full path is on the tooltip for anyone who wants it.
+    The operator has to be able to read the folder off the screen and go and
+    find it, so it is shown in full rather than shortened. A path has no
+    spaces to break at, and a label only wraps at one, so a zero-width space
+    goes after each separator: it draws as nothing and gives the line
+    somewhere to break -- at a folder boundary, which is where a path reads
+    best anyway.
     """
     path = (path or "").rstrip(os.sep)
-    if not path:
-        return ""
-    parts = path.split(os.sep)
-    if len(parts) <= keep:
-        return path
-    return ".." + os.sep + os.sep.join(parts[-keep:])
+    return path.replace(os.sep, os.sep + "\u200b")
 
 
 def to_pixmap(image):
@@ -264,6 +263,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._meta = None
         self._sheet_dir = ""
         self._out_dir = ""
+        self._recent = []
         self._running = False
         self._fault_text = None
         # Set False to let the window close on a single click, the way an
@@ -317,6 +317,10 @@ class InspectorWindow(QtWidgets.QMainWindow):
             QPushButton#secondary {{ font-size: {int(12 * k)}px; font-weight: 600;
                                      color: {ACCENT};
                                      padding: {int(10 * k)}px {int(8 * k)}px; }}
+            /* An id selector outranks :disabled, so without this the three
+               greyed-out buttons keep their blue lettering and still read as
+               something you can press. */
+            QPushButton#secondary:disabled {{ color: #6d757d; }}
             QGroupBox {{ border: 1px solid {LINE}; border-radius: {int(6 * k)}px;
                          margin-top: {int(10 * k)}px;
                          font-size: {int(11 * k)}px; color: {MUTED}; }}
@@ -423,11 +427,16 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.stop_btn = QtWidgets.QPushButton("STOP", objectName="stop")
         self.sheet_btn = QtWidgets.QPushButton("LOAD SHEET",
                                                objectName="secondary")
-        self.out_btn = QtWidgets.QPushButton("OUTPUT FOLDER",
+        # The same sheet is loaded morning after morning, and hunting it down
+        # in a file dialog every time is a job the console can do instead.
+        self.recent_btn = QtWidgets.QPushButton("OPEN RECENT SHEET",
+                                                objectName="secondary")
+        self.out_btn = QtWidgets.QPushButton("LABEL FOLDER",
                                              objectName="secondary")
         self.start_btn.clicked.connect(lambda: self.command.emit("start", None))
         self.stop_btn.clicked.connect(lambda: self.command.emit("stop", None))
         self.sheet_btn.clicked.connect(self._choose_sheet)
+        self.recent_btn.clicked.connect(self._open_recent)
         self.out_btn.clicked.connect(self._choose_output)
         for b in (self.start_btn, self.stop_btn):
             b.setFixedHeight(int(58 * self._k))
@@ -437,6 +446,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.addWidget(self._rule())
         col.addSpacing(6)
         col.addWidget(self.sheet_btn)
+        col.addWidget(self.recent_btn)
         col.addWidget(self.out_btn)
 
         self.run_box = QtWidgets.QGroupBox("RUN")
@@ -448,7 +458,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.sheet_label.setWordWrap(True)
         run_col.addWidget(self.sheet_label)
         run_col.addSpacing(8)
-        run_col.addWidget(QtWidgets.QLabel("OUTPUT FOLDER",
+        run_col.addWidget(QtWidgets.QLabel("LABEL FOLDER",
                                            objectName="caption"))
         self.out_label = QtWidgets.QLabel("", objectName="value")
         self.out_label.setWordWrap(True)
@@ -492,9 +502,31 @@ class InspectorWindow(QtWidgets.QMainWindow):
 
     def _choose_output(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Choose the folder to save results in", self._out_dir)
+            self, "Choose the folder for the label crops", self._out_dir)
         if path:
-            self.command.emit("outdir", path)
+            self.command.emit("labeldir", path)
+
+    def _open_recent(self):
+        """The sheets loaded before, as a menu under the button.
+
+        Built fresh on each click rather than kept in step with the snapshot:
+        it is opened by hand a few times a shift, and a menu that is only
+        ever right at the moment it is shown cannot go stale.
+        """
+        menu = self._recent_menu()
+        menu.exec_(self.recent_btn.mapToGlobal(
+            QtCore.QPoint(0, self.recent_btn.height())))
+
+    def _recent_menu(self):
+        menu = QtWidgets.QMenu(self)
+        for path in self._recent:
+            act = menu.addAction(os.path.basename(path))
+            act.setToolTip(path)
+            act.triggered.connect(
+                lambda _checked=False, p=path: self.command.emit("sheet", p))
+        if menu.isEmpty():
+            menu.addAction("No other sheets loaded yet").setEnabled(False)
+        return menu
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self.isFullScreen():
@@ -602,21 +634,24 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.start_btn.setEnabled(state in ("idle", "rewind"))
             self.stop_btn.setEnabled(self._running)
 
+        self._recent = list(snap.get("recent") or ())
         configurable = bool(snap.get("configurable", True))
         if configurable != self._configurable:
             self._configurable = configurable
             self.sheet_btn.setEnabled(configurable)
+            self.recent_btn.setEnabled(configurable)
             self.out_btn.setEnabled(configurable)
 
         self._sheet_dir = snap.get("sheet_dir", "")
-        self._out_dir = snap.get("outdir", "")
+        self._out_dir = snap.get("labeldir", "")
         meta = (snap.get("sheet", ""), self._out_dir)
         if meta != self._meta:
             self._meta = meta
             self.sheet_label.setText(meta[0])
             self.sheet_label.setToolTip(os.path.join(self._sheet_dir, meta[0]))
-            self.out_label.setText(_short_path(meta[1]))
-            self.out_label.setToolTip(os.path.abspath(meta[1] or "."))
+            full = os.path.abspath(meta[1] or ".")
+            self.out_label.setText(_wrap_path(full))
+            self.out_label.setToolTip(full)
 
         self._show_fault(snap)
 

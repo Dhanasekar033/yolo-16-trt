@@ -48,10 +48,13 @@ label grouping, and so no check of *where* a label sat. Four correct codes in
 the wrong four positions tick four correct cells and the row passes. Use
 run.py --mode row if position matters.
 
-The window itself is the operator console: a header with the sheet and the
-output folder, START and STOP, and buttons to load a different sheet or point
-the crops and the record somewhere else. Those two are only live with the
-machine idle, because each opens a new record and closes the old one. The
+The window itself is the operator console: START and STOP, the sheet and the
+folders down the right, and buttons to load a sheet, reopen one that was
+loaded before, or point the label crops somewhere else. Those three are only
+live with the machine idle, because each opens a new record and closes the
+old one. The crop folder and the recently loaded sheets are remembered
+between runs (utils/settings.py); the record itself — the checked .xlsx, the
+progress journal and the run log — always stays inside the project. The
 counters, the window's check status and the decoder tally are diagnostics and
 only appear with --debug, or when 'd' is pressed.
 
@@ -103,6 +106,7 @@ from utils.crops import LabelSaver
 from utils.qr import decode_qr, decode_qr_pyzbar, pick_qr_for_label
 from utils.relay import RelayController
 from utils.results import ResultLog
+from utils.settings import Settings
 from utils.trt_engine import YOLO26TRT
 from utils.ui import ControlPanel
 from utils.utils import preprocess, postprocess, draw_detections
@@ -132,13 +136,23 @@ DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
 DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 
 # ── Validation / machine config ──────────────────────────────────────────────
-DEFAULT_XLSX        = "validation_x300.xlsx"   # expected QR sequence
+# Where this app lives. The record it writes is part of the project, not
+# of whatever directory the app happened to be launched from, so both the
+# default sheet and the record root are anchored here.
+APP_DIR             = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_XLSX        = os.path.join(APP_DIR, "validation_x300.xlsx")
 DEFAULT_START_RELAY = 0                   # relay 0 = winding machine start
 DEFAULT_RUN_RELAY   = 1                   # relay 1 = ON while the motor runs
 DEFAULT_FAULT_RELAY = 2                   # relay 2 = ON while a fault is live
 DEFAULT_START_DELAY = 2.0                 # seconds of reading after START is
                                           # pressed, before the relay goes on
-DEFAULT_RESULT_DIR  = "result"            # <result>/<xlsx name>/labels/
+# Two roots, because the two things a run writes belong in different
+# places. The record -- the checked .xlsx, progress.csv and the run logs
+# -- is the project's own paperwork and stays inside the project. The
+# label crops are bulk image data that fills a disk, so they go wherever
+# the operator points them, and that choice is remembered between runs.
+DEFAULT_RESULT_DIR  = os.path.join(APP_DIR, "result")
+DEFAULT_LABEL_DIR   = os.path.join(APP_DIR, "labels")
 
 ROTATE_MAP = {
     0:   None,
@@ -525,8 +539,17 @@ def main():
                           "answering why a row came up short.")
     # label crop args
     ap.add_argument("--result-dir", default=DEFAULT_RESULT_DIR,
-                     help="root for saved label crops: "
-                          "<result-dir>/<xlsx name>/labels/.")
+                     help="root for the record this run writes: "
+                          "<result-dir>/<xlsx name>/ holds the checked .xlsx, "
+                          "progress.csv and the run logs. Kept inside the "
+                          "project, and a relative path is taken as relative "
+                          "to it rather than to the working directory.")
+    ap.add_argument("--label-dir", default=None,
+                     help="root for the saved label crops, and nothing else: "
+                          "<label-dir>/<xlsx name>/. This is the one the "
+                          "operator sets from the console, and the last "
+                          "choice is remembered between runs. "
+                          f"Default: {DEFAULT_LABEL_DIR}.")
     ap.add_argument("--no-save-labels", action="store_true",
                      help="don't save a crop of each decoded label.")
     ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
@@ -652,6 +675,20 @@ def main():
     if args.window_grace is None:
         args.window_grace = args.window_size
 
+    # ── what the console remembered from last time ───────────────────────
+    # The command line always wins; the settings file only fills in what was
+    # left out, which is the usual case because the operator starts this from
+    # a desktop icon and sets everything from the screen.
+    prefs = Settings()
+    args.result_dir = os.path.join(APP_DIR, args.result_dir)
+    if args.label_dir is None:
+        args.label_dir = prefs.label_dir or DEFAULT_LABEL_DIR
+    else:
+        prefs.remember_label_dir(args.label_dir)
+    if args.xlsx == DEFAULT_XLSX and prefs.sheet:
+        args.xlsx = prefs.sheet     # reopen the sheet that was last loaded
+        print(f"[settings] reopening the last sheet: {args.xlsx}")
+
     # ── the expected sheet, and the window over it ───────────────────────
     # Loaded through a function rather than inline, because the operator can
     # load a different sheet from the console without restarting the app.
@@ -684,6 +721,8 @@ def main():
                       f"using {max(1, room)} instead")
                 size = max(1, room)
         window = RollingWindow(sheet, size=size, check=checked, grace=grace)
+        # Only once it has parsed: the recent list is for sheets that worked.
+        prefs.remember_sheet(args.xlsx)
         print(f"[window] rolling window of {window.size} sheet rows "
               f"(+{window.grace} kept behind for re-reads); every QR in frame "
               f"is matched on its own, order does not matter")
@@ -1254,10 +1293,14 @@ def main():
         return img
 
     # ── the record that goes with the sheet ──────────────────────────────
-    # Every file this run writes is named after the .xlsx and rooted at the
-    # output folder, so those two together define a record. The operator can
-    # change either from the console, which means closing one record and
-    # opening another — _bind_run is the only place that happens.
+    # Everything a run writes is named after the .xlsx it was checking, so the
+    # sheet is what defines a record. It is written to two roots: the
+    # paperwork — the checked .xlsx, progress.csv and the run log — into the
+    # project under --result-dir, and the label crops on their own into
+    # --label-dir/<xlsx name>/, which is the folder the operator sets and
+    # which holds nothing but images. Changing either the sheet or that folder
+    # closes one record and opens another — _bind_run is the only place that
+    # happens.
 
     def _start_record():
         """Open the books for the sheet and output folder now in `args`."""
@@ -1269,9 +1312,9 @@ def main():
 
         saver = None
         if not args.no_save_labels:
-            saver = LabelSaver(root=args.result_dir, name=run_name,
-                               ext=args.label_format, pad=args.label_pad,
-                               min_pad=args.label_pad_px)
+            saver = LabelSaver(root=args.label_dir, name=run_name,
+                               subdir=None, ext=args.label_format,
+                               pad=args.label_pad, min_pad=args.label_pad_px)
         results = None
         if not args.no_result_log:
             results = ResultLog(root=args.result_dir, name=run_name,
@@ -1311,8 +1354,8 @@ def main():
             print(f"[crops] saved {saver.count} label crops to {saver.dir}/")
             saver = None
 
-    def _bind_run(new_xlsx=None, new_result_dir=None):
-        """Point the app at a different sheet and/or output folder.
+    def _bind_run(new_xlsx=None, new_label_dir=None):
+        """Point the app at a different sheet and/or label folder.
 
         Only ever called with the machine idle. Everything a run accumulates
         belongs to the sheet it was checking, so it is all closed off and
@@ -1324,9 +1367,10 @@ def main():
         _close_record()
         if new_xlsx:
             args.xlsx = new_xlsx
-        if new_result_dir:
-            args.result_dir = new_result_dir
-            args.out_xlsx = None      # it was named after the old folder
+            args.out_xlsx = None      # it was named after the old sheet
+        if new_label_dir:
+            args.label_dir = new_label_dir
+            prefs.remember_label_dir(new_label_dir)
 
         verified.clear()
         resume_hint[0] = None
@@ -1346,7 +1390,8 @@ def main():
 
         _open_sheet()
         _start_record()
-        print(f"[run] now checking {args.xlsx} into {args.result_dir}/")
+        print(f"[run] now checking {args.xlsx} — record in "
+              f"{args.result_dir}/, crops in {args.label_dir}/")
 
     _start_record()
 
@@ -2234,7 +2279,7 @@ def main():
             from tkinter import filedialog
         except ImportError:
             print("[ui] tkinter is not installed - apt install python3-tk to "
-                  "use the LOAD SHEET and OUTPUT FOLDER buttons")
+                  "use the LOAD SHEET and LABEL FOLDER buttons")
             return None
         root = tkinter.Tk()
         root.withdraw()
@@ -2247,8 +2292,8 @@ def main():
                     filetypes=[("Excel workbook", "*.xlsx *.xlsm"),
                                ("All files", "*.*")]) or None
             return filedialog.askdirectory(
-                parent=root, title="Choose the folder to save results in",
-                initialdir=os.path.abspath(args.result_dir),
+                parent=root, title="Choose the folder for the label crops",
+                initialdir=os.path.abspath(args.label_dir),
                 mustexist=False) or None
         finally:
             root.destroy()
@@ -2279,12 +2324,12 @@ def main():
         _bind_run(new_xlsx=path)
         _note[0] = None
 
-    def _apply_output(path):
+    def _apply_label_dir(path):
         if not _configurable():
-            print("[ui] stop the machine before changing the output folder")
+            print("[ui] stop the machine before changing the label folder")
             return
         if not path or (os.path.abspath(path)
-                        == os.path.abspath(args.result_dir)):
+                        == os.path.abspath(args.label_dir)):
             return
         try:
             os.makedirs(path, exist_ok=True)
@@ -2292,7 +2337,7 @@ def main():
             print(f"[ui] cannot write to {path}: {exc}")
             _note[0] = f"Cannot write to that folder: {exc}"
             return
-        _bind_run(new_result_dir=path)
+        _bind_run(new_label_dir=path)
         _note[0] = None
 
     def _pick_sheet():
@@ -2301,7 +2346,7 @@ def main():
 
     def _pick_output():
         if _configurable():
-            _apply_output(_ask("folder"))
+            _apply_label_dir(_ask("folder"))
 
     # Commands from the Qt console. It never touches the machine's state; it
     # posts a name here and the capture loop picks it up at the top of its
@@ -2322,8 +2367,8 @@ def main():
                 stop_machine("stop button")
             elif name == "sheet":
                 _apply_sheet(arg)
-            elif name == "outdir":
-                _apply_output(arg)
+            elif name == "labeldir":
+                _apply_label_dir(arg)
             elif name == "debug":
                 show_debug[0] = not show_debug[0]
                 print(f"[ui] diagnostics "
@@ -2384,9 +2429,9 @@ def main():
                 qt_window.showFullScreen()
             else:
                 qt_window.showMaximized()
-            print("[ui] Qt console - START, STOP, LOAD SHEET and OUTPUT "
-                  "FOLDER are buttons. The only keys are d (diagnostics) "
-                  "and F11 (full screen).")
+            print("[ui] Qt console - START, STOP, LOAD SHEET, OPEN "
+                  "RECENT SHEET and LABEL FOLDER are buttons. The only keys "
+                  "are d (diagnostics) and F11 (full screen).")
 
     if not args.no_display and args.ui == "opencv":
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
@@ -2576,7 +2621,9 @@ def main():
             "state": ui_state(), "note": _live_note(),
             "sheet": os.path.basename(args.xlsx),
             "sheet_dir": os.path.dirname(os.path.abspath(args.xlsx)),
-            "outdir": args.result_dir,
+            "labeldir": args.label_dir,
+            "recent": [p for p in prefs.recent
+                       if os.path.abspath(p) != os.path.abspath(args.xlsx)],
             "configurable": _configurable(),
             "debug": show_debug[0],
             "fps": fps_state[1], "dets": len(dets),
@@ -2602,7 +2649,7 @@ def main():
 
             if panel is not None:
                 panel.sheet_name = os.path.basename(args.xlsx)
-                panel.output_dir = args.result_dir
+                panel.output_dir = args.label_dir
                 panel.configurable = _configurable()
                 panel.note = _live_note()
                 panel.draw(frame, ui_state())

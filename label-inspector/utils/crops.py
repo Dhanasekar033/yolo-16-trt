@@ -2,11 +2,13 @@
 
 Files land in
 
-    <root>/<xlsx name>/labels/<decoded payload>_<timestamp>.jpg
+    <root>/<xlsx name>/<decoded payload>_<timestamp>.jpg
 
-so a run against validation.xlsx fills result/validation/labels/. The payload
-is slugified — a QR carries a URL, and '/' and ':' can't go in a filename —
-but stays readable enough to match a file back to the code it holds.
+so a run against validation.xlsx fills labels/validation/. `root` is the
+folder the operator chose from the console and holds nothing but crops — the
+record that goes with them is written into the project instead. The payload is
+slugified — a QR carries a URL, and '/' and ':' can't go in a filename — but
+stays readable enough to match a file back to the code it holds.
 """
 
 import os
@@ -37,16 +39,20 @@ def timestamp():
 class LabelSaver:
     """Writes one image per decoded label into a per-sheet folder."""
 
-    def __init__(self, root="result", name="run", subdir="labels", ext="jpg",
+    def __init__(self, root="labels", name="run", subdir=None, ext="jpg",
                  pad=0.0, min_pad=0, quality=95):
-        self.dir = os.path.join(root, name, subdir)
+        self.dir = os.path.join(root, name, subdir) if subdir \
+            else os.path.join(root, name)
         self.ext = ext.lstrip(".")
         self.pad = pad
         self.min_pad = min_pad
         self.params = ([cv2.IMWRITE_JPEG_QUALITY, quality]
                        if self.ext in ("jpg", "jpeg") else [])
         self.count = 0
-        os.makedirs(self.dir, exist_ok=True)
+        # Made on the first write, not here: loading a sheet and then pointing
+        # the crops somewhere else is two operations, and the folder for the
+        # in-between combination should not be left behind empty.
+        self._made = False
         print(f"[crops] saving label crops to {self.dir}/")
 
     def _box(self, box, shape):
@@ -63,6 +69,10 @@ class LabelSaver:
         x1, y1, x2, y2 = self._box(box, frame.shape)
         if x2 - x1 < 2 or y2 - y1 < 2:
             return None
+
+        if not self._made:
+            os.makedirs(self.dir, exist_ok=True)
+            self._made = True
 
         name = f"{slugify(text)}_{timestamp()}.{self.ext}"
         path = os.path.join(self.dir, name)

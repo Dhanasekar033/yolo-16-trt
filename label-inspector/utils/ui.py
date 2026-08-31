@@ -202,7 +202,7 @@ class ControlPanel:
                        primary=False, hint="SHEET"))
         if on_output_dir is not None:
             self.config_buttons.append(
-                Button("OUTPUT FOLDER", on_output_dir, ACCENT, key="f",
+                Button("LABEL FOLDER", on_output_dir, ACCENT, key="f",
                        primary=False, hint="FOLDER"))
         self.buttons += self.config_buttons
         self._layout()

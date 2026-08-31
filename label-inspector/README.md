@@ -51,7 +51,7 @@ code is not written off — the line stops and the row is held open:
 
 ## What it writes
 
-Everything lands under `result/<sheet name>/`:
+The paperwork stays in the project, under `result/<sheet name>/`:
 
     progress.csv                 the journal. One line per row, appended and
                                  flushed as it happens. This is the durable
@@ -59,8 +59,18 @@ Everything lands under `result/<sheet name>/`:
     checked_<sheet>.xlsx         the deliverable: the source sheet with READ
                                  D1..N, ROW STATUS and CHECKED AT appended.
                                  Written at exit, or every --xlsx-every rows.
-    labels/                      one JPEG per decoded label.
     runs/run_<stamp>.csv         per-row verdicts.
+
+The label crops go somewhere of their own, because they are bulk image data
+and they fill a disk: `--label-dir`, `labels/` by default, one folder per
+sheet and nothing in it but pictures:
+
+    <label-dir>/<sheet name>/    one JPEG per decoded label.
+
+The LABEL FOLDER button on the console repoints that, and the choice is
+remembered between runs (in `~/.config/label-inspector/settings.json`, along
+with the sheets that have been loaded — OPEN RECENT SHEET lists them, and the
+last one is reopened at startup when no `--xlsx` is given).
 
 The source `--xlsx` is never modified.
 
