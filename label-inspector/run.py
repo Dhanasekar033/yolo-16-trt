@@ -134,7 +134,7 @@ DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/2
 
 # ── Inference config ─────────────────────────────────────────────────────────
 DEFAULT_IMGSZ      = 640
-DEFAULT_CONF_THRES = 0.75   # applies to any class without its own threshold
+DEFAULT_CONF_THRES = 0.45   # applies to any class without its own threshold
 DEFAULT_CONF_LABEL = None   # None -> fall back to DEFAULT_CONF_THRES
 DEFAULT_CONF_QR    = None
 
@@ -569,6 +569,17 @@ def main():
                           "motion smear puts the edge of the label outside "
                           "it, so a crop with no margin comes out clipped. "
                           "0 = the box exactly as detected.")
+    ap.add_argument("--label-aspect", type=float, default=1.2,
+                     help="least height/width a detection must have to be "
+                          "treated as a label. The labels come past the "
+                          "camera portrait; the tamper strip printed across "
+                          "each one is landscape, and the detector finds "
+                          "those too. They carry no QR, so they arrive as a "
+                          "NO READ that looks exactly like a real label the "
+                          "reader could not read -- and one of those is the "
+                          "sort of thing that stops a line for nothing. "
+                          "0 turns the test off (use it if the camera is not "
+                          "mounted so labels stand upright).")
     ap.add_argument("--label-pad-px", type=int, default=24,
                      help="least padding around a saved crop, in pixels, "
                           "whatever --label-pad works out to. Small boxes "
@@ -1907,6 +1918,8 @@ def main():
         for det in dets:
             if int(det[5]) != label_cls:
                 continue
+            if not _upright(det[:4]):
+                continue      # not a label: see _upright
 
             # A label sits in view for many frames and would otherwise be
             # decoded on every one of them. Once its code has been accepted
@@ -2167,6 +2180,22 @@ def main():
     DECODER_COLOUR = {"zxing": (80, 220, 80),      # green
                       "zbar":  (60, 200, 255),     # amber
                       "fail":  (60, 60, 235)}      # red
+
+    def _upright(box):
+        """Is this detection shaped like a label standing on the web?
+
+        Everything this app decides -- a row short, a code from nowhere, a
+        roll that is not the sheet's -- rests on a box being a label. A
+        detection wider than it is tall is not one: on this machine that is
+        the tamper strip across the top of each label, which never decodes
+        and so cannot be told apart, once it is on screen, from a real label
+        that would not read.
+        """
+        if args.label_aspect <= 0:
+            return True
+        wide = max(float(box[2]) - float(box[0]), 1e-6)
+        tall = float(box[3]) - float(box[1])
+        return tall / wide >= args.label_aspect
 
     def _at_edge(box, frame):
         h, w = frame.shape[:2]

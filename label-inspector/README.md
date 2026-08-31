@@ -47,6 +47,11 @@ starts a fresh record and the run carries on normally.
     --window-size 8        how many sheet rows a code can still be recognised
                            from. Bigger tolerates more out-of-order arrival;
                            it no longer decides how long a short row runs on.
+    --label-aspect 1.2     least height/width for a detection to count as a
+                           label. Labels come past upright; the tamper strip
+                           across each one is landscape and the detector finds
+                           it too, so without this it shows up as a NO READ
+                           beside the real labels — or stops the line. 0 off.
     --start-delay 2.0      seconds of reading after START before the relay
                            goes on. 0 = energise immediately.
     --xlsx validation.xlsx which sheet holds the expected QR DATA1..N codes.
