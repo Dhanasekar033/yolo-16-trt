@@ -778,6 +778,7 @@ def main():
         """Record why the line stopped, which puts it into rewind mode."""
         fault.update(_NO_FAULT)
         fault.update(kind=kind, since=time.time(), **kw)
+        _row_cache.clear()
         _aux(args.fault_relay, True)
 
     def _clear_fault(why, restart=True):
@@ -792,6 +793,7 @@ def main():
             return
         was = fault["kind"]
         fault.update(_NO_FAULT)
+        _row_cache.clear()
         _aux(args.fault_relay, False)
         print(f"\n[rewind] fault cleared — {why}")
         if not restart:
@@ -1315,6 +1317,8 @@ def main():
         defects = set()
         forgiven.clear()
         bounced.clear()
+        credited.clear()
+        rewound[0] = 0
         recheck["row"] = None
         recheck["attempt"] = 0
         fault.update(_NO_FAULT)
@@ -1506,7 +1510,58 @@ def main():
     FAULT_RED = (60, 60, 235)
     FAULT_GREEN = (80, 220, 80)
     FAULT_WANT = (255, 200, 0)       # a position of the held row not read yet
+    FAULT_OVER = (60, 160, 255)      # a row the coil has been wound past
     FAULT_TEXT = (240, 240, 240)
+
+    # Payload -> sheet row, for the rewind guidance. A repeating sheet holds
+    # each payload hundreds of times over, so resolving one means a scan of
+    # every copy; the answer cannot change while a fault stands, so it is
+    # worked out once per code and thrown away when the fault does.
+    _row_cache = {}
+
+    def _row_of(text):
+        """Which sheet row a payload belongs to, nearest the held row."""
+        key = normalize(text)
+        if key not in _row_cache:
+            near = (fault["row_idx"] if fault["row_idx"] is not None
+                    else window.start)
+            hit = sheet.find(text, near=near)
+            _row_cache[key] = hit[0] if hit else None
+        return _row_cache[key]
+
+    def _rows_in_frame():
+        """Sheet rows of the labels standing in front of the camera."""
+        rows = []
+        for _box, _who, text in marks[0]:
+            if not text:
+                continue
+            idx = _row_of(text)
+            if idx is not None:
+                rows.append(idx)
+        return rows
+
+    def _rewind_guidance():
+        """How far, and which way, the coil still has to go.
+
+        The operator cannot see the sheet, so left to themselves they wind
+        back until the line starts again -- which is how the coil ends up
+        wound past the row being re-checked and the camera starts reading
+        labels that were signed off long ago. This is the marker that stops
+        that: it names the gap, in rows, and which way to close it.
+        """
+        target = fault["row_idx"]
+        rows = _rows_in_frame()
+        if target is None or not rows:
+            return None
+        lo, hi = min(rows), max(rows)
+        if target > hi:
+            return (f">> WOUND TOO FAR - wind forward {target - hi} row(s) "
+                    f"to row {fault['row']}", FAULT_OVER)
+        if target < lo:
+            return (f">> KEEP WINDING BACK - {lo - target} more row(s) to "
+                    f"row {fault['row']}", FAULT_WANT)
+        return (f">> ROW {fault['row']} IS IN FRAME - wind slowly",
+                FAULT_GREEN)
 
     def _fault_headline():
         """One line saying what is wrong, for the headless status line."""
@@ -1545,7 +1600,16 @@ def main():
                 return (f"ROW {fault['row']} D{col + 1} "
                         + ("READ" if got else "NEEDED"),
                         FAULT_GREEN if got else FAULT_WANT)
-        return None
+
+        # Not the held row. Say which row it is and how far it lies from the
+        # one being re-checked, so the operator can read the coil's position
+        # off the screen instead of guessing at it.
+        here = _row_of(text)
+        if here is None or here == idx:
+            return None
+        delta = here - idx
+        return (f"ROW {sheet.rows[here].number}  {delta:+d}",
+                FAULT_WANT if delta > 0 else FAULT_OVER)
 
     def _fault_report():
         """The headline and the detail lines for the live fault.
@@ -1571,6 +1635,9 @@ def main():
                 lines.append((f"D{col + 1}  {_tail(want, 20):<22}"
                               f"{'READ' if got else 'NOT READ YET'}",
                               FAULT_GREEN if got else FAULT_RED, 0.8))
+            guide = _rewind_guidance()
+            if guide is not None:
+                lines.append((guide[0], guide[1], 0.85))
             lines.append(("rotate the coil back until every position reads "
                           "- then it starts itself", FAULT_TEXT, 0.7))
             lines.append((f"or press START to record row {fault['row']} as a "
@@ -1774,6 +1841,26 @@ def main():
                     fault["in_frame"] = True
                     continue
 
+                if key in credited:
+                    # This exact payload was matched to a cell and signed off
+                    # earlier in this run, and it has now fallen out of the
+                    # window's memory behind the head. That is the coil
+                    # having been wound back further than it needed to be --
+                    # not a wrong label. The row it belongs to was checked
+                    # and recorded, so let it go past.
+                    #
+                    # It has to be `credited` and not merely `ever_read`: a
+                    # genuinely wrong label decodes too, and would otherwise
+                    # excuse itself on the second frame it was seen.
+                    rewound[0] += 1
+                    if rewound[0] == 1 or rewound[0] % 200 == 0:
+                        print(f"\n[rewind] {_tail(text, 30)} was already "
+                              f"read and signed off earlier in this run - "
+                              f"the coil has been wound back past it. Not a "
+                              f"fault ({rewound[0]} so far).")
+                    handled[0].append(tuple(float(v) for v in det[:4]))
+                    continue
+
                 if fault["kind"] is not None:
                     # Already stopped and being wound back. Winding the coil
                     # in reverse walks rows that finished long ago past the
@@ -1813,6 +1900,7 @@ def main():
 
             if status == RollingWindow.MATCH:
                 handled[0].append(tuple(float(v) for v in det[:4]))
+                credited.add(normalize(text))
                 row_no = sheet.rows[row_idx].number
 
                 # Mid-rewind, call each position as it comes in. The operator
@@ -1851,6 +1939,8 @@ def main():
                         continue
                     retire_row(done_idx, complete=True)
 
+    credited = set()         # payloads matched to a cell and signed off
+    rewound = [0]            # times an already-signed-off code came past again
     zb_reads = [0]           # labels rescued by the zbar fallback
     # [(box, who, text)] for the frame being drawn: who is 'zxing', 'zbar'
     # or 'fail'. A label skipped by the overlap carry-forward keeps both the
