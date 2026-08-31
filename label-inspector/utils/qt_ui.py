@@ -96,16 +96,18 @@ class VideoView(QtWidgets.QWidget):
     into whatever size the window happens to be.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scale=1.0):
         super().__init__(parent)
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                            QtWidgets.QSizePolicy.Expanding)
         self._pixmap = None
         self._snap = {}
-        self._caption_font = QtGui.QFont("DejaVu Sans", 8, QtGui.QFont.Bold)
-        self._banner_font = QtGui.QFont("DejaVu Sans", 15, QtGui.QFont.Bold)
-        self._line_font = QtGui.QFont("DejaVu Sans", 10)
+        pt = lambda n: max(6.0, n * scale)
+        self._caption_font = QtGui.QFont("DejaVu Sans", 0, QtGui.QFont.Bold)
+        self._caption_font.setPointSizeF(pt(8))
+        self._tag_font = QtGui.QFont("DejaVu Sans", 0, QtGui.QFont.Bold)
+        self._tag_font.setPointSizeF(pt(10))
 
     def set_snapshot(self, snap):
         self._snap = snap
@@ -148,13 +150,6 @@ class VideoView(QtWidgets.QWidget):
         self._draw_fault(p)
         p.restore()
 
-    def _text_rect(self, p, font, text, x, y, pad=4):
-        p.setFont(font)
-        m = QtGui.QFontMetrics(font)
-        w = m.horizontalAdvance(text) * self._inv + 2 * pad
-        h = m.height() * self._inv + pad
-        return QtCore.QRectF(x, y, w, h)
-
     def _scaled(self, font):
         """A font that comes out the requested size on screen whatever the
         picture has been scaled to."""
@@ -192,7 +187,7 @@ class VideoView(QtWidgets.QWidget):
     def _draw_tags(self, p):
         """The heavier outline and the caption on a label the fault is about
         -- which is the answer to 'where is it' while the coil is wound back."""
-        font = self._scaled(QtGui.QFont("DejaVu Sans", 10, QtGui.QFont.Bold))
+        font = self._scaled(self._tag_font)
         m = QtGui.QFontMetrics(font)
         for x1, y1, x2, y2, rgb, caption in self._snap.get("tags", ()):
             colour = QtGui.QColor(*rgb)
@@ -201,6 +196,8 @@ class VideoView(QtWidgets.QWidget):
             p.drawRect(QtCore.QRectF(x1 - 3 * self._inv, y1 - 3 * self._inv,
                                      x2 - x1 + 6 * self._inv,
                                      y2 - y1 + 6 * self._inv))
+            if not caption:
+                continue          # outlined only: the colour is the message
             pad = 5 * self._inv
             w = m.horizontalAdvance(caption) + 2 * pad
             box = QtCore.QRectF(x1, y1, w, m.height() + pad)
@@ -234,13 +231,30 @@ class InspectorWindow(QtWidgets.QMainWindow):
     command = QtCore.pyqtSignal(str, object)
     _incoming = QtCore.pyqtSignal(object)
 
-    KEYS = {Qt.Key_S: "start", Qt.Key_X: "stop", Qt.Key_O: "sheet",
-            Qt.Key_F: "outdir", Qt.Key_D: "debug", Qt.Key_Q: "quit"}
+    # Only the diagnostics toggle. Everything that moves the machine or
+    # repoints the run is a button you have to look at and click: a stray
+    # keypress on a console standing next to a winder must not be able to
+    # stop the line, and must not be able to pop a file dialog over it
+    # either. F11 is here because it is how you get out of full screen.
+    KEYS = {Qt.Key_D: "debug", Qt.Key_F11: "fullscreen"}
 
     def __init__(self, title="VIKBOT Label Inspect"):
         super().__init__()
         self.setWindowTitle(title)
-        self.resize(1180, 900)
+
+        # Sized from the screen it is actually on, not from a number written
+        # here: the same build runs on the machine's panel PC and on a
+        # desk, and neither should get a window laid out for the other.
+        screen = QtGui.QGuiApplication.primaryScreen()
+        area = (screen.availableGeometry() if screen
+                else QtCore.QRect(0, 0, 1280, 800))
+        self._area = area
+        # Type and padding grow with the screen so a 4K panel does not end up
+        # with 11px captions, held between sane limits either way.
+        self._k = max(0.85, min(area.height() / 900.0, 2.2))
+        self._left_w = int(max(280, min(area.width() * 0.20, 460)))
+        self._side_w = int(max(210, min(area.width() * 0.16, 380)))
+        self.resize(int(area.width() * 0.9), int(area.height() * 0.9))
         # None rather than a real value, so the first snapshot always applies
         # itself: the buttons start in whatever state the constructor left
         # them, and it is the first update that puts them right.
@@ -262,29 +276,34 @@ class InspectorWindow(QtWidgets.QMainWindow):
 
     # -- construction -----------------------------------------------------
     def _build(self, title):
+        k = self._k          # every size below is in screen-scaled pixels
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background: {INK}; color: {TEXT};
                                     font-family: 'DejaVu Sans'; }}
-            QLabel#title {{ font-size: 21px; font-weight: 600;
+            QLabel#title {{ font-size: {int(21 * k)}px; font-weight: 600;
                             letter-spacing: 1px; }}
-            QLabel#meta  {{ color: {MUTED}; font-size: 11px; }}
-            QLabel#pill  {{ font-size: 13px; font-weight: 700;
-                            padding: 6px 18px; border-radius: 13px; }}
-            QLabel#status{{ color: {MUTED}; font-size: 12px; }}
-            QLabel#caption {{ color: #7d858d; font-size: 10px;
+            QLabel#meta  {{ color: {MUTED}; font-size: {int(11 * k)}px; }}
+            QLabel#pill  {{ font-size: {int(13 * k)}px; font-weight: 700;
+                            padding: {int(6 * k)}px {int(18 * k)}px;
+                            border-radius: {int(13 * k)}px; }}
+            QLabel#status{{ color: {MUTED}; font-size: {int(12 * k)}px; }}
+            QLabel#caption {{ color: #7d858d; font-size: {int(10 * k)}px;
                               font-weight: 700; letter-spacing: 1px; }}
-            QLabel#value {{ color: {TEXT}; font-size: 12px; }}
+            QLabel#value {{ color: {TEXT}; font-size: {int(12 * k)}px; }}
             QLabel#faulthead {{ background: {BAD}; color: #2a0505;
-                                font-size: 15px; font-weight: 700;
-                                padding: 12px 12px; border-radius: 6px; }}
-            QLabel#faultbody {{ font-size: 12px; padding: 12px 2px;
+                                font-size: {int(15 * k)}px; font-weight: 700;
+                                padding: {int(12 * k)}px;
+                                border-radius: {int(6 * k)}px; }}
+            QLabel#faultbody {{ font-size: {int(12 * k)}px;
+                                padding: {int(12 * k)}px 2px;
                                 font-family: 'DejaVu Sans Mono', monospace; }}
-            QLabel#hint  {{ color: #6d757d; font-size: 11px; }}
+            QLabel#hint  {{ color: #6d757d; font-size: {int(11 * k)}px; }}
             QFrame#rule  {{ background: {LINE}; max-height: 1px;
                             border: none; }}
             QFrame#header, QFrame#footer {{ background: {INK}; }}
-            QPushButton {{ font-size: 15px; font-weight: 600;
-                           border-radius: 6px; padding: 14px 8px;
+            QPushButton {{ font-size: {int(15 * k)}px; font-weight: 600;
+                           border-radius: {int(6 * k)}px;
+                           padding: {int(14 * k)}px {int(8 * k)}px;
                            border: 1px solid {LINE}; background: {PANEL};
                            color: {TEXT}; }}
             QPushButton:disabled {{ color: #6d757d; background: #262019;
@@ -295,10 +314,12 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                  color: #2a0505; }}
             QPushButton#start:disabled, QPushButton#stop:disabled {{
                 background: #3a423c; color: #79817a; }}
-            QPushButton#secondary {{ font-size: 12px; font-weight: 600;
-                                     color: {ACCENT}; padding: 10px 8px; }}
-            QGroupBox {{ border: 1px solid {LINE}; border-radius: 6px;
-                         margin-top: 10px; font-size: 11px; color: {MUTED}; }}
+            QPushButton#secondary {{ font-size: {int(12 * k)}px; font-weight: 600;
+                                     color: {ACCENT};
+                                     padding: {int(10 * k)}px {int(8 * k)}px; }}
+            QGroupBox {{ border: 1px solid {LINE}; border-radius: {int(6 * k)}px;
+                         margin-top: {int(10 * k)}px;
+                         font-size: {int(11 * k)}px; color: {MUTED}; }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 10px;
                                 padding: 0 4px; }}
         """)
@@ -314,7 +335,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         middle.setContentsMargins(0, 0, 0, 0)
         middle.setSpacing(0)
         middle.addWidget(self._fault_panel())
-        self.video = VideoView()
+        self.video = VideoView(scale=self._k)
         middle.addWidget(self.video, 1)
         middle.addWidget(self._sidebar())
         outer.addLayout(middle, 1)
@@ -374,7 +395,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         picture stays a picture. The panel only exists while a fault does.
         """
         self.left = QtWidgets.QWidget()
-        self.left.setFixedWidth(320)
+        self.left.setFixedWidth(self._left_w)
         col = QtWidgets.QVBoxLayout(self.left)
         col.setContentsMargins(14, 14, 14, 14)
         col.setSpacing(0)
@@ -393,7 +414,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
 
     def _sidebar(self):
         side = QtWidgets.QWidget()
-        side.setFixedWidth(230)
+        side.setFixedWidth(self._side_w)
         col = QtWidgets.QVBoxLayout(side)
         col.setContentsMargins(14, 14, 14, 14)
         col.setSpacing(8)
@@ -409,7 +430,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.sheet_btn.clicked.connect(self._choose_sheet)
         self.out_btn.clicked.connect(self._choose_output)
         for b in (self.start_btn, self.stop_btn):
-            b.setFixedHeight(58)
+            b.setFixedHeight(int(58 * self._k))
         col.addWidget(self.start_btn)
         col.addWidget(self.stop_btn)
         col.addSpacing(6)
@@ -458,8 +479,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         row.addWidget(self.status)
         row.addStretch(1)
         row.addWidget(QtWidgets.QLabel(
-            "[S] START   [X] STOP   [O] SHEET   [F] FOLDER   "
-            "[D] DIAGNOSTICS   [Q] QUIT", objectName="hint"))
+            "[D] DIAGNOSTICS   [F11] FULL SCREEN", objectName="hint"))
         return bar
 
     # -- input ------------------------------------------------------------
@@ -477,17 +497,15 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.command.emit("outdir", path)
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.showMaximized()     # never trap anyone in full screen
+            return
         name = self.KEYS.get(event.key())
         if name is None:
             return super().keyPressEvent(event)
-        if name == "sheet":
-            if self._configurable:
-                self._choose_sheet()
-        elif name == "outdir":
-            if self._configurable:
-                self._choose_output()
-        elif name == "quit":
-            self.close()             # the same road out as the X button
+        if name == "fullscreen":
+            self.showMaximized() if self.isFullScreen() \
+                else self.showFullScreen()
         else:
             self.command.emit(name, None)
 

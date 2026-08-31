@@ -400,25 +400,40 @@ def sheet_period(sheet, limit=400):
 
 
 def parse_check(spec, per_row):
-    """Turn "D2,D3" (or "2 3", or "d2;d4") into the 0-based positions to check.
-    None means every position."""
+    """Turn "UP2,UP3" into the 0-based ups to check. None means all of them.
+
+    "D2,D3" and a bare "2 3" are taken too: the ups were called D1..DN
+    before, and a command line written then should still run.
+    """
     if not spec:
         return None
     wanted = set()
     for part in spec.replace(";", ",").replace(" ", ",").split(","):
-        part = part.strip().upper().lstrip("D")
+        part = part.strip().upper()
+        part = part[2:] if part.startswith("UP") else part.lstrip("D")
         if not part:
             continue
         if not part.isdigit():
-            raise SystemExit(f"--check: '{part}' is not a QR DATA number")
+            raise SystemExit(f"--check: '{part}' is not an up number")
         n = int(part)
         if not 1 <= n <= per_row:
-            raise SystemExit(f"--check: QR DATA{n} is out of range — the sheet "
+            raise SystemExit(f"--check: {up(n - 1)} is out of range — the sheet "
                              f"has {per_row} code columns")
         wanted.add(n - 1)
     if not wanted:
         return None
     return wanted
+
+
+def up(col):
+    """What a position across the web is called on the machine.
+
+    The sheet's columns are headed QR DATA1..N and the code has always used
+    D1..DN internally, but on the floor they are the ups -- UP1 is the first
+    label across the web. One word for one thing, so the screen, the console
+    and the spoken prompts all say what the operator says.
+    """
+    return f"UP{col + 1}"
 
 
 def class_index(class_names, name, fallback):
@@ -449,6 +464,12 @@ def main():
                           "frame, which is both quicker and far easier to "
                           "read. 'opencv' is the older console drawn onto "
                           "the video, kept as a fallback.")
+    ap.add_argument("--fullscreen", action="store_true",
+                     help="open borderless, filling the whole screen, with "
+                          "no title bar. Without it the window opens "
+                          "maximised, which fills the screen just the same "
+                          "but keeps the title bar. F11 switches between "
+                          "them, and Escape leaves full screen.")
     ap.add_argument("--unlock-window", action="store_true",
                      help="let the window close on a single click of its X, "
                           "the way an ordinary application does. By default "
@@ -528,12 +549,13 @@ def main():
     ap.add_argument("--sheet", default=None,
                      help="worksheet name inside --xlsx (default: the first one).")
     ap.add_argument("--labels-per-row", type=int, default=None,
-                     help="labels per crossing (default: the number of QR DATA "
+                     help="ups across the web (default: the number of QR DATA "
                           "columns found in the sheet).")
     ap.add_argument("--check", default=None,
-                     help="which label positions to validate, top to bottom, "
-                          "e.g. 'D2,D3' or '2,3'. The rest are neither decoded "
-                          "nor held against the row. Default: all of them.")
+                     help="which ups to validate, across the web, e.g. "
+                          "'UP2,UP3' or '2,3' (D2,D3 still works). The rest "
+                          "are neither decoded nor held against the row. "
+                          "Default: all of them.")
     ap.add_argument("--no-stop-on-fail", action="store_true",
                      help="keep the machine running when a row fails "
                           "validation (default: stop it).")
@@ -644,8 +666,8 @@ def main():
         if checked is None:
             print(f"[validate] checking all {per_row} positions")
         else:
-            on = ", ".join(f"QR DATA{i + 1}" for i in sorted(checked))
-            off = ", ".join(f"QR DATA{i + 1}" for i in range(per_row)
+            on = ", ".join(up(i) for i in sorted(checked))
+            off = ", ".join(up(i) for i in range(per_row)
                             if i not in checked)
             print(f"[validate] checking {on}"
                   + (f" (ignoring {off})" if off else ""))
@@ -778,7 +800,6 @@ def main():
         """Record why the line stopped, which puts it into rewind mode."""
         fault.update(_NO_FAULT)
         fault.update(kind=kind, since=time.time(), **kw)
-        _row_cache.clear()
         _aux(args.fault_relay, True)
 
     def _clear_fault(why, restart=True):
@@ -793,7 +814,6 @@ def main():
             return
         was = fault["kind"]
         fault.update(_NO_FAULT)
-        _row_cache.clear()
         _aux(args.fault_relay, False)
         print(f"\n[rewind] fault cleared — {why}")
         if not restart:
@@ -837,7 +857,7 @@ def main():
               "Fault cleared. Press start.",
               "Wrong label accepted.",
               "Label defect."] + \
-             [f"Position {i} found." for i in range(1, per_row + 1)]
+             [f"Up {i} found." for i in range(1, per_row + 1)]
 
     voice = Voice(enabled=not args.no_voice, engine=args.voice_engine,
                   name=args.voice_name, rate=args.voice_rate,
@@ -954,7 +974,7 @@ def main():
     #          own — the second time it stops, a human has to press START.
     _NO_FAULT = {"kind": None, "row": None, "row_idx": None, "text": None,
                  "belongs": None, "seen": 0.0, "since": 0.0, "warned": False,
-                 "in_frame": False}
+                 "in_frame": False, "box": None}
     fault = dict(_NO_FAULT)
     forgiven = set()      # unexpected payloads the operator has waved through
     bounced = set()       # unexpected payloads already given one free auto-restart
@@ -1188,7 +1208,7 @@ def main():
                     res, colour = "OK", BG_OK
                 else:
                     got, res, colour = "(waiting)", "..", AMBER
-                put(f"D{col + 1}", 24, y2, HEAD, 0.55)
+                put(up(col), 24, y2, HEAD, 0.55)
                 put(tail(expected) or "-", 96, y2, DIM, 0.5)
                 put(got, 450, y2, colour, 0.5)
                 put(res, 810, y2, colour, 0.5)
@@ -1216,11 +1236,11 @@ def main():
                     mark, c = "OK", BG_OK
                 else:
                     mark, c = "..", AMBER
-                put(f"D{col + 1}:{mark}", x, y2, c, 0.55)
+                put(f"{up(col)}:{mark}", x, y2, c, 0.55)
                 x += 92
             still = sorted(required - seen)
             if still:
-                put("needs " + ", ".join(f"D{c + 1}" for c in still),
+                put("needs " + ", ".join(up(c) for c in still),
                     x + 20, y2, AMBER, 0.5)
         y += (len(open_rows) + 1) * 28
 
@@ -1388,7 +1408,7 @@ def main():
             colour = ((0, 255, 0) if required and required <= seen
                       else (255, 255, 255) if i else (0, 255, 255))
             cv2.putText(frame, f"{head} row {row_no:<5} "
-                               + "  ".join(f"D{c+1}:{m}" for c, m in enumerate(marks)),
+                               + "  ".join(f"{up(c)}:{m}" for c, m in enumerate(marks)),
                         (x, y + 32 + i * 30), font, 0.6, colour, 2, cv2.LINE_AA)
         return frame
 
@@ -1454,14 +1474,17 @@ def main():
         font = cv2.FONT_HERSHEY_SIMPLEX
         for box, who, text in marks[0]:
             x1, y1, x2, y2 = (int(v) for v in box)
-            colour = DECODER_COLOUR.get(who, DECODER_COLOUR["fail"])
+            bad = _bad_label(box)
+            colour = (DECODER_COLOUR["fail"] if bad
+                      else DECODER_COLOUR.get(who, DECODER_COLOUR["fail"]))
             cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 4)
 
             # The payload under the box, on a filled strip in the decoder's
             # colour. Only the tail is shown: every code on this reel shares
             # the same prefix and differs only at the end, and the shorter it
             # is the larger it can be set without swamping the label.
-            caption = _tail(text, 14) if text else "NO READ"
+            caption = ("WRONG LABEL" if bad else
+                       _tail(text, 14) if text else "NO READ")
             cs = 0.55 * _tk()
             # A caption a little wider than its label is readable; one three
             # times as wide just covers the neighbours, so it gives up size.
@@ -1513,55 +1536,54 @@ def main():
     FAULT_OVER = (60, 160, 255)      # a row the coil has been wound past
     FAULT_TEXT = (240, 240, 240)
 
-    # Payload -> sheet row, for the rewind guidance. A repeating sheet holds
-    # each payload hundreds of times over, so resolving one means a scan of
-    # every copy; the answer cannot change while a fault stands, so it is
-    # worked out once per code and thrown away when the fault does.
-    _row_cache = {}
-
-    def _row_of(text):
-        """Which sheet row a payload belongs to, nearest the held row."""
-        key = normalize(text)
-        if key not in _row_cache:
-            near = (fault["row_idx"] if fault["row_idx"] is not None
-                    else window.start)
-            hit = sheet.find(text, near=near)
-            _row_cache[key] = hit[0] if hit else None
-        return _row_cache[key]
-
-    def _rows_in_frame():
-        """Sheet rows of the labels standing in front of the camera."""
-        rows = []
-        for _box, _who, text in marks[0]:
-            if not text:
-                continue
-            idx = _row_of(text)
-            if idx is not None:
-                rows.append(idx)
-        return rows
-
     def _rewind_guidance():
         """How far, and which way, the coil still has to go.
 
         The operator cannot see the sheet, so left to themselves they wind
         back until the line starts again -- which is how the coil ends up
         wound past the row being re-checked and the camera starts reading
-        labels that were signed off long ago. This is the marker that stops
-        that: it names the gap, in rows, and which way to close it.
+        labels signed off long ago. This is the marker that stops that.
+
+        Everything it says has to hold on a sheet that repeats every few
+        rows, which rules out reading a row number off a label. Two things
+        do hold: whether one of the held row's own payloads is in frame, and
+        whether the labels in frame are ones this run has already signed off.
+        Between them they give the direction, and on a sheet that does not
+        repeat there is a distance to go with it.
         """
         target = fault["row_idx"]
-        rows = _rows_in_frame()
-        if target is None or not rows:
+        if target is None:
             return None
-        lo, hi = min(rows), max(rows)
-        if target > hi:
-            return (f">> WOUND TOO FAR - wind forward {target - hi} row(s) "
-                    f"to row {fault['row']}", FAULT_OVER)
-        if target < lo:
-            return (f">> KEEP WINDING BACK - {lo - target} more row(s) to "
-                    f"row {fault['row']}", FAULT_WANT)
-        return (f">> ROW {fault['row']} IS IN FRAME - wind slowly",
-                FAULT_GREEN)
+        here = [normalize(t) for _b, _w, t in marks[0] if t]
+        if not here:
+            return (">> nothing is decoding - wind slowly", FAULT_TEXT)
+
+        # Exact, whatever the sheet does: these are the row's own codes.
+        wanted = {normalize(t) for t in sheet.rows[target].texts if t}
+        if wanted & set(here):
+            return (f">> ROW {fault['row']} IS IN FRAME - wind slowly",
+                    FAULT_GREEN)
+
+        # Where the labels in frame were checked, relative to the row being
+        # re-checked. A label this run has never credited is one the web has
+        # not reached yet, which puts it ahead like the rest.
+        rows = [credited[t] for t in here if t in credited]
+        # A label this run has never credited is one the web has not reached
+        # yet, so it lies ahead -- but by how far is not known, and that is
+        # what decides whether a distance can honestly be quoted.
+        unknown = len(here) - len(rows)
+        behind = [r for r in rows if r < target]
+        ahead = [r for r in rows if r > target]
+
+        if behind and not ahead and not unknown:
+            return (f">> WOUND TOO FAR - wind forward {target - max(behind)} "
+                    f"row(s), until row {fault['row']} shows", FAULT_OVER)
+        if not behind:
+            gap = (f" - {min(ahead) - target} more row(s)"
+                   if ahead and not unknown else "")
+            return (f">> KEEP WINDING BACK{gap}, until row {fault['row']} "
+                    f"shows", FAULT_WANT)
+        return (f">> ROW {fault['row']} IS CLOSE - wind slowly", FAULT_WANT)
 
     def _fault_headline():
         """One line saying what is wrong, for the headless status line."""
@@ -1569,13 +1591,26 @@ def main():
             idx = fault["row_idx"]
             miss = sorted(window.missing(idx)) if idx is not None else []
             return (f"row {fault['row']} needs "
-                    + (", ".join(f"D{c + 1}" for c in miss) if miss
+                    + (", ".join(up(c) for c in miss) if miss
                        else "nothing"))
         if fault["kind"] == "unexpected":
             return f"unexpected {_tail(fault['text'], 20)}"
         return ""
 
-    def _fault_tag(text):
+    def _bad_label(box):
+        """Is this the physical label that stopped the line?
+
+        Matched by where it is rather than by what it decodes. A label with a
+        wrong one stuck over the printed one carries two codes, and the
+        reader returns whichever it happens to find first -- so keyed off the
+        payload the culprit flickers in and out of being the culprit, and on
+        the frames the printed code wins it goes green like all the rest.
+        Its position is steady even when its reading is not.
+        """
+        bad = fault.get("box")
+        return bad is not None and _overlap(box, bad) > 0.25
+
+    def _fault_tag(box, text):
         """What this label is, in terms of the live fault.
 
         Returns (caption, colour) for a label worth pointing at during the
@@ -1584,12 +1619,14 @@ def main():
         label on screen instead of the operator having to work out which of
         the codes on the coil the console was talking about.
         """
-        if fault["kind"] is None or not text:
+        if fault["kind"] is None:
             return None
-        key = normalize(text)
+        key = normalize(text or "")
+        if not key and not _bad_label(box):
+            return None
         if fault["kind"] == "unexpected":
-            if key == normalize(fault["text"] or ""):
-                return "UNEXPECTED - WIND THIS OUT", FAULT_RED
+            if key == normalize(fault["text"] or "") or _bad_label(box):
+                return "WRONG LABEL - WIND THIS OUT", FAULT_RED
             return None
         idx = fault["row_idx"]
         if idx is None:
@@ -1597,19 +1634,18 @@ def main():
         for col, want in enumerate(sheet.rows[idx].texts):
             if normalize(want) == key:
                 got = col in window.seen.get(idx, set())
-                return (f"ROW {fault['row']} D{col + 1} "
+                return (f"ROW {fault['row']} {up(col)} "
                         + ("READ" if got else "NEEDED"),
                         FAULT_GREEN if got else FAULT_WANT)
 
-        # Not the held row. Say which row it is and how far it lies from the
-        # one being re-checked, so the operator can read the coil's position
-        # off the screen instead of guessing at it.
-        here = _row_of(text)
-        if here is None or here == idx:
-            return None
-        delta = here - idx
-        return (f"ROW {sheet.rows[here].number}  {delta:+d}",
-                FAULT_WANT if delta > 0 else FAULT_OVER)
+        # Not the held row: outlined, but not captioned. The number it used
+        # to carry was picked from three hundred identical copies of the same
+        # payload and meant nothing. Which side of the target it falls on
+        # does mean something, and that is what the colour says -- orange for
+        # a row already checked and so behind, cyan for one still to come.
+        where = credited.get(key)
+        return "", (FAULT_OVER if where is not None and where < idx
+                    else FAULT_WANT)
 
     def _fault_report():
         """The headline and the detail lines for the live fault.
@@ -1628,11 +1664,11 @@ def main():
             seen = window.seen.get(idx, set())
             missing = [c for c in req if c not in seen]
             banner = (f"REWIND: ROW {fault['row']} NEEDS "
-                      + ", ".join(f"D{c + 1}" for c in missing))
+                      + ", ".join(up(c) for c in missing))
             for col in req:
                 got = col in seen
                 want = sheet.rows[idx].texts[col]
-                lines.append((f"D{col + 1}  {_tail(want, 20):<22}"
+                lines.append((f"{up(col):<5}{_tail(want, 20):<22}"
                               f"{'READ' if got else 'NOT READ YET'}",
                               FAULT_GREEN if got else FAULT_RED, 0.8))
             guide = _rewind_guidance()
@@ -1709,12 +1745,14 @@ def main():
         # And on the labels themselves, so the console text and the coil in
         # front of the operator are talking about the same thing.
         for box, _who, text in marks[0]:
-            tag = _fault_tag(text)
+            tag = _fault_tag(box, text)
             if tag is None:
                 continue
             caption, colour = tag
             x1, y1, x2, y2 = (int(v) for v in box)
             cv2.rectangle(frame, (x1 - 7, y1 - 7), (x2 + 7, y2 + 7), colour, 7)
+            if not caption:
+                continue
             # Inside the top of the box, not above it: above would land on
             # the payload strip draw_decoders hangs under the box before it.
             cs = 0.62 * _tk()
@@ -1744,12 +1782,26 @@ def main():
         handled[0] = []
         marks[0] = []
 
+        claimed = set()
+
         def carry(box):
-            """What this label read, and which decoder got it, last time."""
-            for prev, who, text in was:
-                if _overlap(box, prev) > 0.45:
-                    return who, text
-            return "zxing", None
+            """What this label read, and which decoder got it, last time.
+
+            The best overlap, and each of last frame's labels claimed only
+            once. First-match-wins let two boxes inherit the same reading,
+            which put one payload under two different labels on screen.
+            """
+            best, score = None, 0.45
+            for i, (prev, _who, _text) in enumerate(was):
+                if i in claimed:
+                    continue
+                overlap = _overlap(box, prev)
+                if overlap > score:
+                    best, score = i, overlap
+            if best is None:
+                return "zxing", None
+            claimed.add(best)
+            return was[best][1], was[best][2]
         budget = args.max_decodes or None
 
         for det in dets:
@@ -1816,7 +1868,7 @@ def main():
             # Keep what was decoded and where it landed, so a row that comes
             # up short can be explained rather than just reported.
             ever_read.add(normalize(text))
-            where = (f"row {sheet.rows[row_idx].number} QR DATA{col + 1}"
+            where = (f"row {sheet.rows[row_idx].number} {up(col)}"
                      if row_idx is not None else "no row in the window")
             recent.append((text, f"{status} -> {where}"))
             del recent[:-40]
@@ -1839,6 +1891,7 @@ def main():
                     # there — so it is deliberately NOT carried forward.
                     fault["seen"] = time.time()
                     fault["in_frame"] = True
+                    fault["box"] = tuple(float(v) for v in det[:4])
                     continue
 
                 if key in credited:
@@ -1875,7 +1928,7 @@ def main():
                 # far behind. Either way it is not something to tolerate.
                 where = sheet.find(text)
                 belongs = (f"sheet row {sheet.rows[where[0]].number} "
-                           f"QR DATA{where[1] + 1}" if where else
+                           f"{up(where[1])}" if where else
                            "nothing in the sheet")
                 head = sheet.rows[window.start].number if not window.exhausted else "?"
                 print(f"\n[window] UNEXPECTED code: {text}")
@@ -1884,7 +1937,8 @@ def main():
                 if saver is not None:
                     saver.save(frame, det[:4], text)
                 _raise_fault("unexpected", text=text, belongs=belongs,
-                             seen=time.time())
+                             seen=time.time(),
+                             box=tuple(float(v) for v in det[:4]))
                 voice.alert("Rotate the coil back and take it off.",
                             lead="Stopped. Wrong label on the coil.",
                             key=f"bad-{key}")
@@ -1900,17 +1954,17 @@ def main():
 
             if status == RollingWindow.MATCH:
                 handled[0].append(tuple(float(v) for v in det[:4]))
-                credited.add(normalize(text))
+                credited[normalize(text)] = row_idx
                 row_no = sheet.rows[row_idx].number
 
                 # Mid-rewind, call each position as it comes in. The operator
                 # is watching the coil, not the screen, and this is how they
                 # know winding back is working before it finishes.
                 if fault["kind"] == "short" and row_idx == fault["row_idx"]:
-                    voice.say(f"Position {col + 1} found.",
+                    voice.say(f"Up {col + 1} found.",
                               key=f"found-{row_no}-{col}")
                 if args.debug:
-                    print(f"[window] row {row_no} QR DATA{col + 1} ok "
+                    print(f"[window] row {row_no} {up(col)} ok "
                           f"(slot {slot})")
                 if saver is not None:
                     saver.save(frame, det[:4], text)
@@ -1939,8 +1993,32 @@ def main():
                         continue
                     retire_row(done_idx, complete=True)
 
-    credited = set()         # payloads matched to a cell and signed off
+    # payload -> the sheet row it was matched to. A set would say only "this
+    # has been checked", which cannot tell the rows standing ahead of a held
+    # row at the moment it stops from the rows behind it after an over-wind;
+    # both are checked. The row index says which side of the target it is on,
+    # and it is a recorded fact rather than a lookup, so it survives a sheet
+    # that repeats every few rows.
+    credited = {}
     rewound = [0]            # times an already-signed-off code came past again
+    def _track_bad_label():
+        """Follow the offending label from frame to frame.
+
+        Its box is re-anchored to whichever label it now overlaps most, so a
+        coil being wound by hand does not shake it off -- and so it stays
+        marked on the frames where it reads as the printed code underneath,
+        or does not read at all.
+        """
+        if fault["kind"] != "unexpected" or fault["box"] is None:
+            return
+        best, score = None, 0.20
+        for box, _who, _text in marks[0]:
+            overlap = _overlap(box, fault["box"])
+            if overlap > score:
+                best, score = box, overlap
+        if best is not None:
+            fault["box"] = best
+
     zb_reads = [0]           # labels rescued by the zbar fallback
     # [(box, who, text)] for the frame being drawn: who is 'zxing', 'zbar'
     # or 'fail'. A label skipped by the overlap carry-forward keeps both the
@@ -1971,7 +2049,7 @@ def main():
         """
         row_no = sheet.rows[row_idx].number
         missing = sorted(window.missing(row_idx))
-        cols = ", ".join(f"QR DATA{c + 1}" for c in missing)
+        cols = ", ".join(up(c) for c in missing)
         recheck["row"] = row_no
         recheck["attempt"] = 1
         print(f"\n[recheck] row {row_no} did not validate: never read {cols}")
@@ -1991,7 +2069,7 @@ def main():
                 got, res = window.texts.get((row_idx, col), want), "OK"
             else:
                 got, res = "*** NOTHING DECODED ***", "MISSING"
-            print(f"[recheck]   D{col + 1:<4}{_tail(want, 46):<48}"
+            print(f"[recheck]   {up(col):<5}{_tail(want, 46):<48}"
                   f"{_tail(got, 46):<48}{res}")
 
         # Was the missing code read anywhere at all? If it was, the label is
@@ -2000,11 +2078,11 @@ def main():
         for col in missing:
             want = sheet.rows[row_idx].texts[col]
             if normalize(want) in ever_read:
-                print(f"[recheck]   note: QR DATA{col + 1}'s code HAS been "
+                print(f"[recheck]   note: {up(col)}'s code HAS been "
                       f"decoded earlier in this run — it was read somewhere, "
                       f"just not credited to row {row_no}")
             else:
-                print(f"[recheck]   note: QR DATA{col + 1}'s code has NEVER "
+                print(f"[recheck]   note: {up(col)}'s code has NEVER "
                       f"decoded in this run — that label is not being read "
                       f"at all")
 
@@ -2031,7 +2109,7 @@ def main():
                 retire_row(stale, complete=False)
             return
         _raise_fault("short", row=row_no, row_idx=row_idx)
-        spoken = " and ".join(f"position {c + 1}" for c in missing)
+        spoken = " and ".join(f"up {c + 1}" for c in missing)
         voice.alert(f"Row {row_no} did not read {spoken}.",
                     lead="Stopped. Rotate the coil back.",
                     key=f"short-{row_no}")
@@ -2066,7 +2144,7 @@ def main():
         voice.alert(f"Row {row_no}. Recorded.", lead="Label defect.",
                     key=f"defect-{row_no}")
         for col in missing:
-            print(f"[defect]    QR DATA{col + 1}: expected "
+            print(f"[defect]    {up(col)}: expected "
                   f"'{sheet.rows[row_idx].texts[col]}'")
             print(f"[defect]    {' ' * 9}  read     nothing")
         defects.add(row_no)
@@ -2103,7 +2181,7 @@ def main():
                 results.write(_window_result(row_idx, True))
             return
 
-        cols = ", ".join(f"QR DATA{c + 1}" for c in missing)
+        cols = ", ".join(up(c) for c in missing)
         print(f"[window] FAIL row {row_no}: never read {cols}")
         if results is not None:
             results.write(_window_result(row_idx, False))
@@ -2122,7 +2200,7 @@ def main():
             self.pos, self.text, self.expected, self.status = pos, text, expected, status
         @property
         def column(self):
-            return f"QR DATA{self.pos + 1}"
+            return up(self.pos)
 
     def _window_result(row_idx, ok):
         row = sheet.rows[row_idx]
@@ -2298,11 +2376,17 @@ def main():
             qt_window.locked = not args.unlock_window
             qt_window.command.connect(lambda name, arg:
                                       commands.put((name, arg)))
-            qt_window.resize(int(disp_w * scale) + 230,
-                             int(disp_h * scale) + 120)
-            qt_window.show()
-            print("[ui] Qt console (keys: s = start, x = stop, o = load "
-                  "sheet, f = output folder, d = diagnostics, q = quit)")
+            # It fills the screen it is on -- the console is the only thing
+            # on that machine and there is nothing to share the glass with.
+            # Sizes inside it come from the same screen, so the panel PC and
+            # a desk both get a layout meant for them.
+            if args.fullscreen:
+                qt_window.showFullScreen()
+            else:
+                qt_window.showMaximized()
+            print("[ui] Qt console - START, STOP, LOAD SHEET and OUTPUT "
+                  "FOLDER are buttons. The only keys are d (diagnostics) "
+                  "and F11 (full screen).")
 
     if not args.no_display and args.ui == "opencv":
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
@@ -2378,6 +2462,7 @@ def main():
                 _finish_start()
         else:
             marks[0] = []        # stopped: no verdicts, so no stale colours
+        _track_bad_label()
 
         # Rewinding after an unexpected code. There is no "it read clean"
         # moment for this fault the way there is for a short row — the code
@@ -2464,9 +2549,11 @@ def main():
         boxes = []
         for box, who, text in marks[0]:
             x1, y1, x2, y2 = at(box)
-            boxes.append((x1, y1, x2, y2,
-                          _rgb(DECODER_COLOUR.get(who,
-                                                  DECODER_COLOUR["fail"])),
+            bad = _bad_label(box)
+            colour = (DECODER_COLOUR["fail"] if bad
+                      else DECODER_COLOUR.get(who, DECODER_COLOUR["fail"]))
+            boxes.append((x1, y1, x2, y2, _rgb(colour),
+                          "WRONG LABEL" if bad else
                           _tail(text, 14) if text else "NO READ"))
 
         tags = []
@@ -2474,7 +2561,7 @@ def main():
         lines = []
         if fault["kind"] is not None:
             for box, _who, text in marks[0]:
-                tag = _fault_tag(text)
+                tag = _fault_tag(box, text)
                 if tag is None:
                     continue
                 caption, colour = tag
