@@ -30,6 +30,9 @@ worker picks up at the top of its next pass, which is what keeps the state
 single-threaded and keeps a 150ms relay write off the GUI thread.
 """
 
+import html
+import os
+
 import numpy as np
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -53,6 +56,21 @@ STATES = {
     "rewind": ("REWIND", BAD),
     "idle": ("IDLE", MUTED),
 }
+
+
+def _short_path(path, keep=2):
+    """The tail of a path, which is the part that says which run this is.
+
+    An output folder can be a dozen components deep and the panel is 320px
+    wide; the full path is on the tooltip for anyone who wants it.
+    """
+    path = (path or "").rstrip(os.sep)
+    if not path:
+        return ""
+    parts = path.split(os.sep)
+    if len(parts) <= keep:
+        return path
+    return ".." + os.sep + os.sep.join(parts[-keep:])
 
 
 def to_pixmap(image):
@@ -195,51 +213,19 @@ class VideoView(QtWidgets.QWidget):
                        Qt.AlignVCenter | Qt.AlignLeft, caption)
 
     def _draw_fault(self, p):
-        """A red border round the picture, the headline in a bar across the
-        top, and the detail stacked at the bottom."""
-        snap = self._snap
-        banner = snap.get("banner")
-        lines = snap.get("lines") or ()
-        if not banner and not lines:
-            return
+        """A red border round the picture, and nothing else.
 
-        w = self._pixmap.width()
-        h = self._pixmap.height()
-        red = QtGui.QColor(BAD)
-        p.setPen(QtGui.QPen(red, 6 * self._inv))
+        The headline and the detail used to be written across the video,
+        over the very labels they were about. They live in the panel down the
+        left now; all the picture carries is the border, which is what makes
+        a stopped screen unmistakable from across the machine.
+        """
+        if not self._snap.get("banner") and not self._snap.get("lines"):
+            return
+        w, h = self._pixmap.width(), self._pixmap.height()
+        p.setPen(QtGui.QPen(QtGui.QColor(BAD), 6 * self._inv))
         p.setBrush(Qt.NoBrush)
         p.drawRect(QtCore.QRectF(2, 2, w - 4, h - 4))
-
-        if banner:
-            font = self._scaled(self._banner_font)
-            m = QtGui.QFontMetrics(font)
-            bar = QtCore.QRectF(0, 8 * self._inv, w,
-                                m.height() + 14 * self._inv)
-            p.setPen(Qt.NoPen)
-            p.setBrush(red)
-            p.drawRect(bar)
-            p.setPen(QtGui.QColor("#000000"))
-            p.setFont(font)
-            p.drawText(bar, Qt.AlignCenter, banner)
-
-        if not lines:
-            return
-        font = self._scaled(self._line_font)
-        m = QtGui.QFontMetrics(font)
-        pad = 6 * self._inv
-        step = m.height() + pad
-        y = h - 10 * self._inv - step * len(lines)
-        for text, rgb in lines:
-            width = m.horizontalAdvance(text) + 2 * pad
-            box = QtCore.QRectF(10 * self._inv, y, width, step)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QtGui.QColor(0, 0, 0, 210))
-            p.drawRect(box)
-            p.setPen(QtGui.QColor(*rgb))
-            p.setFont(font)
-            p.drawText(box.adjusted(pad, 0, 0, 0),
-                       Qt.AlignVCenter | Qt.AlignLeft, text)
-            y += step
 
 
 class InspectorWindow(QtWidgets.QMainWindow):
@@ -251,16 +237,24 @@ class InspectorWindow(QtWidgets.QMainWindow):
     KEYS = {Qt.Key_S: "start", Qt.Key_X: "stop", Qt.Key_O: "sheet",
             Qt.Key_F: "outdir", Qt.Key_D: "debug", Qt.Key_Q: "quit"}
 
-    def __init__(self, title="LABEL INSPECTOR"):
+    def __init__(self, title="VIKBOT Label Inspect"):
         super().__init__()
-        self.setWindowTitle("Label Inspector")
+        self.setWindowTitle(title)
         self.resize(1180, 900)
-        self._debug = False
-        self._configurable = True
-        self._state = "idle"
+        # None rather than a real value, so the first snapshot always applies
+        # itself: the buttons start in whatever state the constructor left
+        # them, and it is the first update that puts them right.
+        self._debug = None
+        self._configurable = None
+        self._state = None
         self._meta = None
         self._sheet_dir = ""
         self._out_dir = ""
+        self._running = False
+        self._fault_text = None
+        # Set False to let the window close on a single click, the way an
+        # ordinary application does.
+        self.locked = True
         self._build(title)
         # Queued by default across threads, so the worker can post a snapshot
         # without touching a widget.
@@ -277,6 +271,14 @@ class InspectorWindow(QtWidgets.QMainWindow):
             QLabel#pill  {{ font-size: 13px; font-weight: 700;
                             padding: 6px 18px; border-radius: 13px; }}
             QLabel#status{{ color: {MUTED}; font-size: 12px; }}
+            QLabel#caption {{ color: #7d858d; font-size: 10px;
+                              font-weight: 700; letter-spacing: 1px; }}
+            QLabel#value {{ color: {TEXT}; font-size: 12px; }}
+            QLabel#faulthead {{ background: {BAD}; color: #2a0505;
+                                font-size: 15px; font-weight: 700;
+                                padding: 12px 12px; border-radius: 6px; }}
+            QLabel#faultbody {{ font-size: 12px; padding: 12px 2px;
+                                font-family: 'DejaVu Sans Mono', monospace; }}
             QLabel#hint  {{ color: #6d757d; font-size: 11px; }}
             QFrame#rule  {{ background: {LINE}; max-height: 1px;
                             border: none; }}
@@ -311,6 +313,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         middle = QtWidgets.QHBoxLayout()
         middle.setContentsMargins(0, 0, 0, 0)
         middle.setSpacing(0)
+        middle.addWidget(self._fault_panel())
         self.video = VideoView()
         middle.addWidget(self.video, 1)
         middle.addWidget(self._sidebar())
@@ -349,19 +352,44 @@ class InspectorWindow(QtWidgets.QMainWindow):
         mark.setStyleSheet(f"background: {ACCENT}; border-radius: 2px;")
         row.addWidget(mark)
 
-        stack = QtWidgets.QVBoxLayout()
-        stack.setSpacing(2)
         self.title_label = QtWidgets.QLabel(title, objectName="title")
-        self.meta_label = QtWidgets.QLabel("", objectName="meta")
-        stack.addWidget(self.title_label)
-        stack.addWidget(self.meta_label)
-        row.addLayout(stack)
+        row.addWidget(self.title_label)
         row.addStretch(1)
 
+        # "STATUS" beside it, because a lone coloured lozenge reads as a
+        # button you are meant to press rather than as a state you are being
+        # told about.
+        row.addWidget(QtWidgets.QLabel("MACHINE STATUS", objectName="caption"))
         self.pill = QtWidgets.QLabel("IDLE", objectName="pill")
         self._set_pill("idle")
         row.addWidget(self.pill)
         return bar
+
+    def _fault_panel(self):
+        """What is wrong, down the left, instead of written over the picture.
+
+        Burning it into the video meant the operator had to read text laid
+        over the very labels the text was about. Out here it has room, it is
+        set at a readable size whatever the camera resolution, and the
+        picture stays a picture. The panel only exists while a fault does.
+        """
+        self.left = QtWidgets.QWidget()
+        self.left.setFixedWidth(320)
+        col = QtWidgets.QVBoxLayout(self.left)
+        col.setContentsMargins(14, 14, 14, 14)
+        col.setSpacing(0)
+
+        self.fault_head = QtWidgets.QLabel("", objectName="faulthead")
+        self.fault_head.setWordWrap(True)
+        self.fault_body = QtWidgets.QLabel("", objectName="faultbody")
+        self.fault_body.setWordWrap(True)
+        self.fault_body.setTextFormat(Qt.RichText)
+        self.fault_body.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        col.addWidget(self.fault_head)
+        col.addWidget(self.fault_body)
+        col.addStretch(1)
+        self.left.hide()
+        return self.left
 
     def _sidebar(self):
         side = QtWidgets.QWidget()
@@ -389,6 +417,23 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.addSpacing(6)
         col.addWidget(self.sheet_btn)
         col.addWidget(self.out_btn)
+
+        self.run_box = QtWidgets.QGroupBox("RUN")
+        run_col = QtWidgets.QVBoxLayout(self.run_box)
+        run_col.setContentsMargins(10, 6, 10, 10)
+        run_col.setSpacing(2)
+        run_col.addWidget(QtWidgets.QLabel("SHEET", objectName="caption"))
+        self.sheet_label = QtWidgets.QLabel("", objectName="value")
+        self.sheet_label.setWordWrap(True)
+        run_col.addWidget(self.sheet_label)
+        run_col.addSpacing(8)
+        run_col.addWidget(QtWidgets.QLabel("OUTPUT FOLDER",
+                                           objectName="caption"))
+        self.out_label = QtWidgets.QLabel("", objectName="value")
+        self.out_label.setWordWrap(True)
+        run_col.addWidget(self.out_label)
+        col.addSpacing(12)
+        col.addWidget(self.run_box)
 
         self.debug_box = QtWidgets.QGroupBox("DIAGNOSTICS")
         inner = QtWidgets.QVBoxLayout(self.debug_box)
@@ -441,10 +486,49 @@ class InspectorWindow(QtWidgets.QMainWindow):
         elif name == "outdir":
             if self._configurable:
                 self._choose_output()
+        elif name == "quit":
+            self.close()             # the same road out as the X button
         else:
             self.command.emit(name, None)
 
+    # -- closing ----------------------------------------------------------
+    def _may_close(self):
+        """Whether the operator really meant to shut the inspection down.
+
+        The window sits on a machine that is winding a coil, and the close
+        button is a few pixels from nothing in particular. Closing it stops
+        the line and shuts the run's books, so a stray click must not do it:
+        while the machine is running or held on a fault the answer is simply
+        no, and even idle it has to be confirmed.
+        """
+        if self._running:
+            QtWidgets.QMessageBox.warning(
+                self, "Label Inspector",
+                "The machine is running.\n\n"
+                "Press STOP first, then close.",
+                QtWidgets.QMessageBox.Ok)
+            return False
+        if self._state == "rewind":
+            QtWidgets.QMessageBox.warning(
+                self, "Label Inspector",
+                "A row is still held for re-inspection.\n\n"
+                "Wind the coil back until it reads, or press START to record "
+                "it as a defect, before closing.",
+                QtWidgets.QMessageBox.Ok)
+            return False
+        answer = QtWidgets.QMessageBox.question(
+            self, "Label Inspector",
+            "Close Label Inspector?\n\n"
+            "The workbook is written out on the way, so nothing already "
+            "checked is lost.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        return answer == QtWidgets.QMessageBox.Yes
+
     def closeEvent(self, event):
+        if self.locked and not self._may_close():
+            event.ignore()
+            return
         self.command.emit("quit", None)
         event.accept()
 
@@ -463,16 +547,42 @@ class InspectorWindow(QtWidgets.QMainWindow):
         else:
             self.pill.setStyleSheet(f"color: {INK}; background: {colour};")
 
+    def _show_fault(self, snap):
+        """The fault panel: the headline in a red block, the detail under it.
+
+        Built as one rich-text block rather than a stack of labels because
+        the lines change shape between the two kinds of fault, and rebuilding
+        a layout sixty times a second would be silly.
+        """
+        banner = snap.get("banner") or ""
+        lines = snap.get("lines") or ()
+        if not banner and not lines:
+            if self.left.isVisible():
+                self.left.hide()
+            self._fault_text = None
+            return
+
+        body = "<br>".join(
+            f'<span style="color:#{r:02x}{g:02x}{b:02x}">'
+            f'{html.escape(text)}</span>' for text, (r, g, b) in lines)
+        if (banner, body) == self._fault_text:
+            return
+        self._fault_text = (banner, body)
+        self.fault_head.setText(banner)
+        self.fault_body.setText(body)
+        if not self.left.isVisible():
+            self.left.show()
+
     def _apply(self, snap):
         self.video.set_snapshot(snap)
 
         state = snap.get("state", "idle")
+        self._running = state in ("running", "reading")
         if state != self._state:
             self._state = state
             self._set_pill(state)
-            running = state in ("running", "reading")
             self.start_btn.setEnabled(state in ("idle", "rewind"))
-            self.stop_btn.setEnabled(running)
+            self.stop_btn.setEnabled(self._running)
 
         configurable = bool(snap.get("configurable", True))
         if configurable != self._configurable:
@@ -482,16 +592,15 @@ class InspectorWindow(QtWidgets.QMainWindow):
 
         self._sheet_dir = snap.get("sheet_dir", "")
         self._out_dir = snap.get("outdir", "")
-        meta = f"SHEET  {snap.get('sheet', '')}     OUT  {self._out_dir}"
+        meta = (snap.get("sheet", ""), self._out_dir)
         if meta != self._meta:
-            # An output path can be longer than the header, and the sheet
-            # name is the half that identifies the run, so the middle of the
-            # path is what gives way.
             self._meta = meta
-            room = max(self.meta_label.width(), 320)
-            m = QtGui.QFontMetrics(self.meta_label.font())
-            self.meta_label.setText(m.elidedText(meta, Qt.ElideMiddle, room))
-            self.meta_label.setToolTip(meta)
+            self.sheet_label.setText(meta[0])
+            self.sheet_label.setToolTip(os.path.join(self._sheet_dir, meta[0]))
+            self.out_label.setText(_short_path(meta[1]))
+            self.out_label.setToolTip(os.path.abspath(meta[1] or "."))
+
+        self._show_fault(snap)
 
         note = snap.get("note") or "Press START to read the labels and run."
         if self.status.text() != note:

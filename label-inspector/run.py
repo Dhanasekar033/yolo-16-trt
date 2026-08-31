@@ -449,6 +449,14 @@ def main():
                           "frame, which is both quicker and far easier to "
                           "read. 'opencv' is the older console drawn onto "
                           "the video, kept as a fallback.")
+    ap.add_argument("--unlock-window", action="store_true",
+                     help="let the window close on a single click of its X, "
+                          "the way an ordinary application does. By default "
+                          "it will not close while the machine is running or "
+                          "a row is held, and asks first even when idle -- "
+                          "the close button sits a few pixels from nothing "
+                          "in particular, and a stray click on it would stop "
+                          "the line.")
     ap.add_argument("--no-display", action="store_true",
                      help="Just print FPS/detections instead of opening a window (headless).")
     ap.add_argument("--debug", action="store_true",
@@ -2197,6 +2205,7 @@ def main():
             qt_app = QtWidgets.QApplication.instance() \
                 or QtWidgets.QApplication([])
             qt_window = InspectorWindow()
+            qt_window.locked = not args.unlock_window
             qt_window.command.connect(lambda name, arg:
                                       commands.put((name, arg)))
             qt_window.resize(int(disp_w * scale) + 230,
@@ -2441,6 +2450,14 @@ def main():
                 continue
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
+                # Same rule as the Qt console: quitting stops the line and
+                # shuts the run's books, so it waits until the machine is not
+                # in the middle of something.
+                if not args.unlock_window and (validating()
+                                               or fault["kind"] is not None):
+                    print("[ui] press STOP before quitting (or Ctrl-C to "
+                          "force it)")
+                    continue
                 break
             if key == ord("d"):
                 show_debug[0] = not show_debug[0]
