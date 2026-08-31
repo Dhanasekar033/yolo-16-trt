@@ -5,13 +5,34 @@ zone (blank margin) around it to be decodable, so every crop is expanded by a
 margin before it is handed to zxing.
 """
 
+import atexit
 import bisect
 
 import cv2
 import numpy as np
 import zxingcpp
 
-QR_FORMATS = zxingcpp.BarcodeFormat.QRCode | zxingcpp.BarcodeFormat.MicroQRCode
+# The formats mask is a zxing-cpp (nanobind) object. One still alive when the
+# interpreter finalizes trips zxing's leak checker, which prints "nanobind:
+# leaked 1 instances!" and a list of the type's methods over the top of the
+# run's closing output. Nothing is actually leaking — the mask is simply a
+# module global — so build it on first use and drop it before shutdown.
+_QR_FORMATS = None
+
+
+def qr_formats():
+    """The QRCode|MicroQRCode mask handed to zxingcpp.read_barcode."""
+    global _QR_FORMATS
+    if _QR_FORMATS is None:
+        _QR_FORMATS = (zxingcpp.BarcodeFormat.QRCode
+                       | zxingcpp.BarcodeFormat.MicroQRCode)
+    return _QR_FORMATS
+
+
+@atexit.register
+def _release_qr_formats():
+    global _QR_FORMATS
+    _QR_FORMATS = None
 
 LABEL = "label"    # hand zxing the whole label crop
 QR    = "qr"       # hand zxing just the detected qr box, plus a quiet zone
@@ -29,7 +50,7 @@ def expand_box(box, frame_shape, margin=0.15, min_px=8):
 
 
 def _read(img):
-    res = zxingcpp.read_barcode(img, formats=QR_FORMATS, try_rotate=True,
+    res = zxingcpp.read_barcode(img, formats=qr_formats(), try_rotate=True,
                                 try_downscale=True, try_invert=True)
     if res is None or not res.valid or not res.text:
         return None

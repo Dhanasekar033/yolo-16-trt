@@ -48,17 +48,39 @@ label grouping, and so no check of *where* a label sat. Four correct codes in
 the wrong four positions tick four correct cells and the row passes. Use
 run.py --mode row if position matters.
 
-Usage:
-    python3 run_window.py                                  # defaults
-    python3 run_window.py --xlsx validation.xlsx
-    python3 run_window.py --window-size 4                  # shorter rewind
-    python3 run_window.py --no-display                     # headless
-    python3 run_window.py --no-relay                       # vision only
-    python3 run_window.py --dump-crops bad/                # save failed crops
-    python3 run_window.py --debug                          # print every read
+The window itself is the operator console: a header with the sheet and the
+output folder, START and STOP, and buttons to load a different sheet or point
+the crops and the record somewhere else. Those two are only live with the
+machine idle, because each opens a new record and closes the old one. The
+counters, the window's check status and the decoder tally are diagnostics and
+only appear with --debug, or when 'd' is pressed.
 
-On start-up relay 0 is switched ON to run the winding machine, and it is
-switched OFF whenever a row will not validate.
+Usage:
+    python3 run.py                                  # defaults
+    python3 run.py --xlsx validation.xlsx
+    python3 run.py --window-size 4                  # shorter rewind
+    python3 run.py --no-display                     # headless
+    python3 run.py --no-relay                       # vision only
+    python3 run.py --debug                          # the diagnostic readout
+    python3 run.py --label-pad 0.25                 # wider saved crops
+
+Relays. 0 starts the winding machine and is the only one with any authority;
+the other two are followers, so a lamp, a beacon or a downstream interlock can
+be wired to either without this file knowing what is on the end of it:
+
+    --start-relay 0    the motor
+    --run-relay   1    ON for as long as the motor is running
+    --fault-relay 2    ON for as long as a fault is live
+
+Sound. The operator's hands are on the coil and the screen is across the
+machine, so the console says out loud what happened and what to do about it --
+a tone and then the instruction on a fault, each position called as it comes
+back in on the rewind, and the restart announced when the fault clears. The
+voice is Microsoft's en-IN neural voice through edge-tts, female by default
+(--voice-name male for Prabhat). Every phrase is rendered to a .wav the first
+time it is used and replayed from disk after, so it costs nothing to say twice
+and a machine that has run once keeps its voice with the network unplugged;
+espeak is the fallback for one that has not. --no-voice runs it silent.
 """
 
 import argparse
@@ -74,6 +96,7 @@ from utils.results import ResultLog
 from utils.trt_engine import YOLO26TRT
 from utils.ui import ControlPanel
 from utils.utils import preprocess, postprocess, draw_detections
+from utils.voice import Voice
 from utils.validation import ValidationSheet, normalize
 
 # ── Stream config (same defaults as cam_view.py) ────────────────────────────
@@ -101,6 +124,8 @@ DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 # ── Validation / machine config ──────────────────────────────────────────────
 DEFAULT_XLSX        = "validation_x300.xlsx"   # expected QR sequence
 DEFAULT_START_RELAY = 0                   # relay 0 = winding machine start
+DEFAULT_RUN_RELAY   = 1                   # relay 1 = ON while the motor runs
+DEFAULT_FAULT_RELAY = 2                   # relay 2 = ON while a fault is live
 DEFAULT_START_DELAY = 2.0                 # seconds of reading after START is
                                           # pressed, before the relay goes on
 DEFAULT_RESULT_DIR  = "result"            # <result>/<xlsx name>/labels/
@@ -461,9 +486,18 @@ def main():
                      help="don't save a crop of each decoded label.")
     ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
                      help="image format for the saved label crops.")
-    ap.add_argument("--label-pad", type=float, default=0.0,
+    ap.add_argument("--label-pad", type=float, default=0.18,
                      help="padding around the saved label crop, as a fraction "
-                          "of the box size.")
+                          "of the box size. The detector draws a box that is "
+                          "tight on the label, and at web speed a little "
+                          "motion smear puts the edge of the label outside "
+                          "it, so a crop with no margin comes out clipped. "
+                          "0 = the box exactly as detected.")
+    ap.add_argument("--label-pad-px", type=int, default=24,
+                     help="least padding around a saved crop, in pixels, "
+                          "whatever --label-pad works out to. Small boxes "
+                          "need the margin most and get the least from a "
+                          "fraction.")
     # validation args
     ap.add_argument("--xlsx", default=DEFAULT_XLSX,
                      help="xlsx holding the expected QR DATA1..N sequence.")
@@ -526,8 +560,39 @@ def main():
                           "energise immediately.")
     ap.add_argument("--start-relay", type=int, default=DEFAULT_START_RELAY,
                      help="relay that starts the winding machine.")
+    ap.add_argument("--run-relay", type=int, default=DEFAULT_RUN_RELAY,
+                     help="relay held ON for as long as the motor is "
+                          "running, for a running lamp or a downstream "
+                          "interlock. It follows the motor exactly, including "
+                          "through a fault stop. -1 to leave it alone.")
+    ap.add_argument("--fault-relay", type=int, default=DEFAULT_FAULT_RELAY,
+                     help="relay held ON for as long as a fault is live, for "
+                          "a beacon or a hooter. It goes on the moment the "
+                          "line stops on a fault and off when the fault "
+                          "clears -- on the rewind, or when the operator "
+                          "overrules it with START. -1 to leave it alone.")
     ap.add_argument("--relay-verbose", action="store_true",
                      help="print every modbus frame sent to the relay board.")
+    ap.add_argument("--no-voice", action="store_true",
+                     help="do not speak. By default the console says what "
+                          "happened and what to do about it, because the "
+                          "operator is at the coil rather than at the screen.")
+    ap.add_argument("--voice-engine", default="auto",
+                     choices=["auto", "edge", "espeak"],
+                     help="how the prompts are spoken. 'edge' is Microsoft's "
+                          "en-IN neural voice, which sounds like a person; "
+                          "'espeak' is the offline formant synthesiser, which "
+                          "does not. 'auto' uses edge when it can be reached "
+                          "or has been cached, and espeak when it cannot.")
+    ap.add_argument("--voice-name", default=None,
+                     help="which voice: female (Neerja), male (Prabhat), "
+                          "expressive, or any edge-tts voice name in full.")
+    ap.add_argument("--voice-rate", type=int, default=10,
+                     help="speaking rate as a percentage off normal, e.g. 15 "
+                          "for a little quicker, -10 for slower.")
+    ap.add_argument("--no-tone", action="store_true",
+                     help="do not sound the alert tone before a fault is "
+                          "announced.")
     ap.add_argument("--no-auto-restart", action="store_true",
                      help="after a fault, wait for START even once the fault "
                           "has cleared on the rewind. By default the machine "
@@ -542,32 +607,42 @@ def main():
         args.window_grace = args.window_size
 
     # ── the expected sheet, and the window over it ───────────────────────
-    sheet = ValidationSheet(args.xlsx, args.sheet)
-    per_row = args.labels_per_row or sheet.per_row
-    checked = parse_check(args.check, per_row)
-    if checked is None:
-        print(f"[validate] checking all {per_row} positions")
-    else:
-        on = ", ".join(f"QR DATA{i + 1}" for i in sorted(checked))
-        off = ", ".join(f"QR DATA{i + 1}" for i in range(per_row)
-                        if i not in checked)
-        print(f"[validate] checking {on}" + (f" (ignoring {off})" if off else ""))
+    # Loaded through a function rather than inline, because the operator can
+    # load a different sheet from the console without restarting the app.
+    sheet = window = per_row = checked = None
 
-    size, grace = args.window_size, args.window_grace
-    period = sheet_period(sheet)
-    if period:
-        # A window that spans the sheet's repeat would hold the same payload
-        # twice over, and a code could tick off either copy.
-        room = period - grace - 1
-        if size > room:
-            print(f"[window] the sheet repeats every {period} rows, so a "
-                  f"window of {size} would see each code twice — "
-                  f"using {max(1, room)} instead")
-            size = max(1, room)
-    window = RollingWindow(sheet, size=size, check=checked, grace=grace)
-    print(f"[window] rolling window of {window.size} sheet rows "
-          f"(+{window.grace} kept behind for re-reads); every QR in frame "
-          f"is matched on its own, order does not matter")
+    def _open_sheet():
+        """Read args.xlsx and build the rolling window over it."""
+        nonlocal sheet, per_row, checked, window
+        sheet = ValidationSheet(args.xlsx, args.sheet)
+        per_row = args.labels_per_row or sheet.per_row
+        checked = parse_check(args.check, per_row)
+        if checked is None:
+            print(f"[validate] checking all {per_row} positions")
+        else:
+            on = ", ".join(f"QR DATA{i + 1}" for i in sorted(checked))
+            off = ", ".join(f"QR DATA{i + 1}" for i in range(per_row)
+                            if i not in checked)
+            print(f"[validate] checking {on}"
+                  + (f" (ignoring {off})" if off else ""))
+
+        size, grace = args.window_size, args.window_grace
+        period = sheet_period(sheet)
+        if period:
+            # A window that spans the sheet's repeat would hold the same
+            # payload twice over, and a code could tick off either copy.
+            room = period - grace - 1
+            if size > room:
+                print(f"[window] the sheet repeats every {period} rows, so a "
+                      f"window of {size} would see each code twice — "
+                      f"using {max(1, room)} instead")
+                size = max(1, room)
+        window = RollingWindow(sheet, size=size, check=checked, grace=grace)
+        print(f"[window] rolling window of {window.size} sheet rows "
+              f"(+{window.grace} kept behind for re-reads); every QR in frame "
+              f"is matched on its own, order does not matter")
+
+    _open_sheet()
     print(f"[window] a row that comes up short stops the line and is held "
           f"open — wind the coil back and the screen shows what is still "
           f"missing; fill it and the machine starts itself")
@@ -609,6 +684,7 @@ def main():
             print(f"[rewind] operator accepted the unexpected code "
                   f"{_tail(fault['text'], 30)} — it will not stop the line "
                   f"again this run")
+            voice.say("Wrong label accepted.", key="accepted")
         if panel is not None:
             panel.note = f"reading labels… ({args.start_delay:.0f}s)"
         held = (f", re-checking row {recheck['row']}"
@@ -616,6 +692,7 @@ def main():
         print(f"\n[relay] START pressed ({reason}) — reading the labels in "
               f"frame for {args.start_delay:.1f}s before the relay goes on"
               f"{held}")
+        voice.say("Reading the labels. Stand clear.", key="reading")
 
     def _finish_start():
         """The read-in has run its course: settle up and let the web go."""
@@ -636,12 +713,17 @@ def main():
         if fault["kind"] is not None:
             fault.update(_NO_FAULT)
 
+        _aux(args.fault_relay, False)     # settled above, either way
         relay.on(args.start_relay)
+        _aux(args.run_relay, True)
         machine_running = True
         if panel is not None:
             panel.note = None
         print(f"[relay] winding machine STARTED ({start_reason[0]}) "
-              f"— relay {args.start_relay} ON")
+              f"— relay {args.start_relay} ON"
+              + (f", run relay {args.run_relay} ON"
+                 if args.run_relay >= 0 else ""))
+        voice.say("Machine running.", key="running")
 
     def stop_machine(reason="operator"):
         nonlocal machine_running
@@ -650,12 +732,17 @@ def main():
         if not machine_running and not aborted:
             return
         relay.off(args.start_relay)
+        _aux(args.run_relay, False)
         machine_running = False
         if panel is not None:
             panel.note = reason
         what = "start ABORTED" if aborted and not machine_running else "STOPPED"
         print(f"\n[relay] winding machine {what} ({reason}) "
               f"— relay {args.start_relay} OFF")
+        # A fault announces itself, in its own words, at the point it is
+        # raised; this is only for the ordinary stops.
+        if fault["kind"] is None:
+            voice.say("Machine stopped.", key="stopped")
 
     def scanning():
         """Codes are read when running, when starting — and while a fault is
@@ -670,6 +757,7 @@ def main():
         """Record why the line stopped, which puts it into rewind mode."""
         fault.update(_NO_FAULT)
         fault.update(kind=kind, since=time.time(), **kw)
+        _aux(args.fault_relay, True)
 
     def _clear_fault(why, restart=True):
         """The reason for the stop is gone. Let the machine go by itself.
@@ -681,30 +769,80 @@ def main():
         """
         if fault["kind"] is None:
             return
+        was = fault["kind"]
         fault.update(_NO_FAULT)
+        _aux(args.fault_relay, False)
         print(f"\n[rewind] fault cleared — {why}")
         if not restart:
             return
         if args.no_auto_restart:
             print("[rewind] --no-auto-restart: press START to carry on")
+            voice.say("Fault cleared. Press start.", key="cleared-manual")
             return
+        voice.say("Row complete. Starting again."
+                  if was == "short" else
+                  "Wrong label is clear. Starting again.",
+                  key="cleared", urgent=True)
         start_machine("re-check passed")
 
     globals()["_press_start"] = lambda: start_machine("start button")  # SEAM
 
-    run_name = os.path.splitext(os.path.basename(args.xlsx))[0]
+    # All named after the sheet, and all reopened when the operator loads a
+    # different one, so they are set up in _start_record further down — after
+    # the loaders that fill them in have been defined.
+    run_name = None
     saver = None
-    if not args.no_save_labels:
-        saver = LabelSaver(root=args.result_dir, name=run_name,
-                           ext=args.label_format, pad=args.label_pad)
-
     results = None
-    if not args.no_result_log:
-        results = ResultLog(root=args.result_dir, name=run_name,
-                            columns=per_row)
 
     relay = RelayController(port=args.relay_port, enabled=not args.no_relay,
                             verbose=args.relay_verbose)
+    # The whole vocabulary, rendered once in the background at start-up so
+    # nothing has to be synthesised at the moment it is needed. Only the two
+    # lines carrying a row number are left out -- there is a row number for
+    # every row in the sheet -- and those are the `text` half of an alert,
+    # spoken after a `lead` that is always ready.
+    SPOKEN = ["Reading the labels. Stand clear.",
+              "Machine running.",
+              "Machine stopped.",
+              "Stopped. Rotate the coil back.",
+              "Stopped. Wrong label on the coil.",
+              "Rotate the coil back and take it off.",
+              "Row complete. Starting again.",
+              "Wrong label is clear. Starting again.",
+              "The same wrong label again. Press start to accept it, or take "
+              "it off the coil.",
+              "Fault cleared. Press start.",
+              "Wrong label accepted.",
+              "Label defect."] + \
+             [f"Position {i} found." for i in range(1, per_row + 1)]
+
+    voice = Voice(enabled=not args.no_voice, engine=args.voice_engine,
+                  name=args.voice_name, rate=args.voice_rate,
+                  tone=not args.no_tone, warm=SPOKEN)
+
+    def _aux(which, on):
+        """Drive one of the two follower relays, if it is configured.
+
+        They carry no logic of their own: the run relay mirrors the motor and
+        the fault relay mirrors the fault, so a lamp, a beacon or a downstream
+        interlock can be wired to either without this file knowing what is on
+        the other end.
+        """
+        if which is None or which < 0:
+            return
+        # Every frame on the wire costs the capture loop 150ms waiting for the
+        # board to answer, so only send one when the coil is not already
+        # where it is being asked to go.
+        if relay.states.get(which) is bool(on):
+            return
+        relay.on(which) if on else relay.off(which)
+
+    # A previous run that was killed rather than closed can leave a coil
+    # energised, so start from a state this file knows rather than inheriting
+    # a lamp that is on for no reason.
+    relay.off(args.start_relay)
+    _aux(args.run_relay, False)
+    _aux(args.fault_relay, False)
     panel = None
 
     cam_index = args.index if args.index is not None else find_camera_index()
@@ -755,9 +893,7 @@ def main():
           + "".join(f"  {args.label_class if c == label_cls else args.qr_class}={v}"
                     for c, v in conf_per_class.items()))
 
-    xlsx_path = args.out_xlsx or os.path.join(
-        args.result_dir, run_name, f"checked_{run_name}.xlsx")
-    journal_path = os.path.join(args.result_dir, run_name, "progress.csv")
+    xlsx_path = journal_path = None      # set by _start_record
     journal = [None]         # append-only record; the durable source of truth
     xlsx_lock = threading.Lock()
     xlsx_busy = [False]
@@ -1074,23 +1210,128 @@ def main():
                     BG_BAD, 0.5)
         return img
 
-    # ── what an earlier run already got through ──────────────────────────
-    _load_previous()      # an .xlsx from an older run, if there is one
-    _load_journal()       # then the journal, which wins where they differ
-    _open_journal()
-    if verified:
-        last = max(verified)
-        by_number = {r.number: i for i, r in enumerate(sheet.rows)}
-        resume_hint[0] = by_number.get(last)
-        done = sum(1 for _, st in verified.values() if st == "OK")
-        print(f"[window] resuming from row {last} — {done} rows "
-              f"already verified ({len(verified)} recorded)")
+    # ── the record that goes with the sheet ──────────────────────────────
+    # Every file this run writes is named after the .xlsx and rooted at the
+    # output folder, so those two together define a record. The operator can
+    # change either from the console, which means closing one record and
+    # opening another — _bind_run is the only place that happens.
+
+    def _start_record():
+        """Open the books for the sheet and output folder now in `args`."""
+        nonlocal run_name, saver, results, xlsx_path, journal_path
+        run_name = os.path.splitext(os.path.basename(args.xlsx))[0]
+        xlsx_path = args.out_xlsx or os.path.join(
+            args.result_dir, run_name, f"checked_{run_name}.xlsx")
+        journal_path = os.path.join(args.result_dir, run_name, "progress.csv")
+
+        saver = None
+        if not args.no_save_labels:
+            saver = LabelSaver(root=args.result_dir, name=run_name,
+                               ext=args.label_format, pad=args.label_pad,
+                               min_pad=args.label_pad_px)
+        results = None
+        if not args.no_result_log:
+            results = ResultLog(root=args.result_dir, name=run_name,
+                                columns=per_row)
+
+        # What an earlier run already got through.
+        _load_previous()  # an .xlsx from an older run, if there is one
+        _load_journal()   # then the journal, which wins where they differ
+        _open_journal()
+        if verified:
+            last = max(verified)
+            by_number = {r.number: i for i, r in enumerate(sheet.rows)}
+            resume_hint[0] = by_number.get(last)
+            done = sum(1 for _, st in verified.values() if st == "OK")
+            print(f"[window] resuming from row {last} — {done} rows "
+                  f"already verified ({len(verified)} recorded)")
+
+    def _close_record():
+        """Shut the current record's books, so nothing is left half written
+        when the run is repointed at another sheet or folder."""
+        nonlocal saver, results
+        if journal[0] is not None:
+            journal[0].close()
+            journal[0] = None
+        if verified:
+            for _ in range(60):      # let any background save finish first
+                with xlsx_lock:
+                    if not xlsx_busy[0]:
+                        break
+                time.sleep(0.1)
+            write_annotated_xlsx()
+        if results is not None:
+            print(f"[results] {results.rows} rows written to {results.path}")
+            results.close()
+            results = None
+        if saver is not None:
+            print(f"[crops] saved {saver.count} label crops to {saver.dir}/")
+            saver = None
+
+    def _bind_run(new_xlsx=None, new_result_dir=None):
+        """Point the app at a different sheet and/or output folder.
+
+        Only ever called with the machine idle. Everything a run accumulates
+        belongs to the sheet it was checking, so it is all closed off and
+        started again rather than carried across: a window anchored on the old
+        sheet's rows means nothing against a new one, and codes read from the
+        old coil must not tick off cells in the new record.
+        """
+        nonlocal defects
+        _close_record()
+        if new_xlsx:
+            args.xlsx = new_xlsx
+        if new_result_dir:
+            args.result_dir = new_result_dir
+            args.out_xlsx = None      # it was named after the old folder
+
+        verified.clear()
+        resume_hint[0] = None
+        recent.clear()
+        ever_read.clear()
+        handled[0] = []
+        marks[0] = []
+        defects = set()
+        forgiven.clear()
+        bounced.clear()
+        recheck["row"] = None
+        recheck["attempt"] = 0
+        fault.update(_NO_FAULT)
+        zb_reads[0] = 0
+
+        _open_sheet()
+        _start_record()
+        print(f"[run] now checking {args.xlsx} into {args.result_dir}/")
+
+    _start_record()
+
+    def _band_top():
+        """First row of picture the console chrome does not own."""
+        return panel.header_h if panel is not None else 0
+
+    def _band_bottom():
+        """Last row of picture the console chrome does not own."""
+        return panel.footer_h if panel is not None else 0
+
+    def _band_right(width):
+        """Last column of picture the console chrome does not own."""
+        return panel.content_right if panel is not None else width
+
+    def _tk():
+        """How much bigger than nominal every caption has to be drawn.
+
+        The frame is decoded at 1944x2592 and shown at about a third of that,
+        so a caption drawn at scale 1 arrives on screen a third the size it
+        looks like here. Everything written on the picture multiplies by this
+        so it is sized for the screen the operator is actually reading.
+        """
+        return panel.text if panel is not None else 1.0
 
     def draw_window(frame, compact=False):
         """One status line on the video, since the detail now lives in its own
         window. `compact` skips the per-row breakdown."""
         font = cv2.FONT_HERSHEY_SIMPLEX
-        x, y = 20, 120
+        x, y = 20, _band_top() + int(56 * _tk())
         if window.start is None:
             cv2.putText(frame, "WINDOW: waiting for a known code", (x, y),
                         font, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
@@ -1101,7 +1342,7 @@ def main():
         head = sheet.rows[window.start].number if not window.exhausted else "-"
         cv2.putText(frame, f"WINDOW  {passed} pass / {failed} short"
                            f"   reads {window.reads}   head row {head}",
-                    (x, y), font, 0.8,
+                    (x, y), font, 0.62 * _tk(),
                     (0, 0, 255) if failed else (0, 255, 0), 2, cv2.LINE_AA)
         if compact:
             return frame
@@ -1171,7 +1412,7 @@ def main():
         cv2.imwrite(path, last_frame[0])
         print(f"[dump] frame at the moment of the hold: {path}")
 
-    def draw_decoders(frame):
+    def draw_decoders(frame, legend=False):
         """Repaint each label's box in the colour of the decoder that read it.
 
         draw_detections has already outlined every detection in one colour;
@@ -1179,6 +1420,11 @@ def main():
         verdict — green read by zxing, amber rescued by zbar, red read by
         nothing. A zbar box is the interesting one: it marks a code the
         primary decoder cannot see at all.
+
+        The boxes and the payload under each one are what the operator is
+        looking at, so they are always drawn. `legend` adds the per-frame
+        tally of which decoder read what, which is a diagnostic and belongs
+        with the rest of the debug readout.
         """
         font = cv2.FONT_HERSHEY_SIMPLEX
         for box, who, text in marks[0]:
@@ -1188,33 +1434,47 @@ def main():
 
             # The payload under the box, on a filled strip in the decoder's
             # colour. Only the tail is shown: every code on this reel shares
-            # the same prefix and differs only at the end.
-            caption = _tail(text, 18) if text else "NO READ"
-            (tw, th), _ = cv2.getTextSize(caption, font, 0.75, 2)
+            # the same prefix and differs only at the end, and the shorter it
+            # is the larger it can be set without swamping the label.
+            caption = _tail(text, 14) if text else "NO READ"
+            cs = 0.55 * _tk()
+            # A caption a little wider than its label is readable; one three
+            # times as wide just covers the neighbours, so it gives up size.
+            room = int((x2 - x1) * 1.6)
+            (tw, th), _ = cv2.getTextSize(caption, font, cs, 2)
+            if tw > room:
+                cs *= room / float(tw)
+                (tw, th), _ = cv2.getTextSize(caption, font, cs, 2)
             ty = y2 + th + 12
-            if ty > frame.shape[0] - 4:      # off the bottom: put it inside
-                ty = y1 + th + 12
-            cv2.rectangle(frame, (x1, ty - th - 9), (x1 + tw + 12, ty + 7),
+            if ty > frame.shape[0] - _band_bottom() - 4:
+                ty = y1 + th + 12            # off the bottom: put it inside
+            cv2.rectangle(frame, (x1, ty - th - 9), (x1 + tw + 14, ty + 8),
                           colour, -1)
-            cv2.putText(frame, caption, (x1 + 6, ty), font, 0.75,
+            cv2.putText(frame, caption, (x1 + 7, ty), font, cs,
                         (0, 0, 0), 2, cv2.LINE_AA)
+
+        if not legend:
+            return frame
 
         counts = {}
         for _, who, _t in marks[0]:
             counts[who] = counts.get(who, 0) + 1
-        x = 20
+        tk = _tk()
+        ls = 0.55 * tk
+        box = int(26 * tk)
+        x, y = 20, _band_top() + int(100 * tk)
         for who, text in (("zxing", "zxing"), ("zbar", "zbar"),
                           ("fail", "no read")):
             swatch = DECODER_COLOUR[who]
-            cv2.rectangle(frame, (x, 176), (x + 26, 202), swatch, -1)
+            cv2.rectangle(frame, (x, y - box), (x + box, y), swatch, -1)
             caption = f"{text} {counts.get(who, 0)}"
-            cv2.putText(frame, caption, (x + 34, 198), font, 0.7, swatch,
-                        2, cv2.LINE_AA)
-            x += 44 + cv2.getTextSize(caption, font, 0.7, 2)[0][0]
+            cv2.putText(frame, caption, (x + box + int(10 * tk), y - 4), font,
+                        ls, swatch, 2, cv2.LINE_AA)
+            x += box + int(28 * tk) + cv2.getTextSize(caption, font, ls, 2)[0][0]
         if zb_reads[0]:
             cv2.putText(frame, f"zbar rescues this run: {zb_reads[0]}",
-                        (20, 232), font, 0.7, DECODER_COLOUR["zbar"], 2,
-                        cv2.LINE_AA)
+                        (20, y + int(34 * tk)), font, ls,
+                        DECODER_COLOUR["zbar"], 2, cv2.LINE_AA)
         return frame
 
     # ── the rewind overlay ────────────────────────────────────────────────
@@ -1273,9 +1533,11 @@ def main():
 
         font = cv2.FONT_HERSHEY_SIMPLEX
         h, w = frame.shape[:2]
-        # A red border round the whole frame: a screen stopped on a fault must
-        # not read as an idle one at a glance from across the machine.
-        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), FAULT_RED, 14)
+        # A red border round the picture: a screen stopped on a fault must not
+        # read as an idle one at a glance from across the machine. It frames
+        # the picture only, so the console chrome stays legible.
+        cv2.rectangle(frame, (0, _band_top()),
+                      (_band_right(w), h - _band_bottom()), FAULT_RED, 14)
 
         # Hershey has no glyph for anything outside ASCII, so every string
         # drawn here is plain ASCII: a dash or an ellipsis comes out as "???".
@@ -1294,8 +1556,8 @@ def main():
                 lines.append((f"D{col + 1}  {_tail(want, 20):<22}"
                               f"{'READ' if got else 'NOT READ YET'}",
                               FAULT_GREEN if got else FAULT_RED, 0.8))
-            lines.append(("wind back until every position reads - then it "
-                          "starts itself", FAULT_TEXT, 0.7))
+            lines.append(("rotate the coil back until every position reads "
+                          "- then it starts itself", FAULT_TEXT, 0.7))
             lines.append((f"or press START to record row {fault['row']} as a "
                           f"label defect", FAULT_TEXT, 0.7))
         else:
@@ -1315,23 +1577,36 @@ def main():
                 lines.append((f"out of frame - restarting in {left:.1f}s",
                               FAULT_GREEN, 0.8))
 
-        # The headline goes in a bar across the top, under the counters, where
-        # nothing else is drawn and it cannot be missed from a few feet away.
-        cv2.rectangle(frame, (0, 250), (w, 322), FAULT_RED, -1)
-        (bw, _bh), _ = cv2.getTextSize(banner, font, 1.0, 3)
-        cv2.putText(frame, banner, (max((w - bw) // 2, 12), 300), font,
-                    1.0, (0, 0, 0), 3, cv2.LINE_AA)
+        # The headline goes in a bar right under the header, where nothing
+        # else is drawn and it cannot be missed from a few feet away.
+        tk = _tk()
+        top = _band_top() + int(14 * tk)
+        right = _band_right(w)
+        bs = 1.0 * tk
+        (bw, bh), _ = cv2.getTextSize(banner, font, bs, 3)
+        if bw > right - 24:                  # a long row number, a long code
+            bs *= (right - 24) / float(bw)
+            (bw, bh), _ = cv2.getTextSize(banner, font, bs, 3)
+        bar = bh + int(46 * tk)
+        cv2.rectangle(frame, (0, top), (right, top + bar), FAULT_RED, -1)
+        cv2.putText(frame, banner, (max((right - bw) // 2, 12),
+                                    top + (bar + bh) // 2),
+                    font, bs, (0, 0, 0), 3, cv2.LINE_AA)
 
-        # The detail stacks up from the bottom edge, clear of the counters at
-        # the top and of the payload strips that hang under each box.
-        y = h - 34
+        # The detail stacks up from just above the status bar, clear of the
+        # chrome and of the payload strips that hang under each box.
+        y = h - _band_bottom() - int(20 * tk)
         for text, colour, scale in reversed(lines):
-            (tw, th), _ = cv2.getTextSize(text, font, scale, 2)
+            ts = scale * tk
+            (tw, th), _ = cv2.getTextSize(text, font, ts, 2)
+            if tw > right - 60:
+                ts *= (right - 60) / float(tw)
+                (tw, th), _ = cv2.getTextSize(text, font, ts, 2)
             cv2.rectangle(frame, (16, y - th - 12), (16 + tw + 24, y + 12),
                           (0, 0, 0), -1)
-            cv2.putText(frame, text, (28, y), font, scale, colour, 2,
+            cv2.putText(frame, text, (28, y), font, ts, colour, 2,
                         cv2.LINE_AA)
-            y -= th + 24
+            y -= th + int(20 * tk)
 
         # And on the labels themselves, so the console text and the coil in
         # front of the operator are talking about the same thing.
@@ -1344,10 +1619,15 @@ def main():
             cv2.rectangle(frame, (x1 - 7, y1 - 7), (x2 + 7, y2 + 7), colour, 7)
             # Inside the top of the box, not above it: above would land on
             # the payload strip draw_decoders hangs under the box before it.
-            (tw, th), _ = cv2.getTextSize(caption, font, 0.85, 2)
+            cs = 0.62 * _tk()
+            room = int((x2 - x1) * 1.6)
+            (tw, th), _ = cv2.getTextSize(caption, font, cs, 2)
+            if tw > room:
+                cs *= room / float(tw)
+                (tw, th), _ = cv2.getTextSize(caption, font, cs, 2)
             cv2.rectangle(frame, (x1, y1), (x1 + tw + 18, y1 + th + 18),
                           colour, -1)
-            cv2.putText(frame, caption, (x1 + 9, y1 + th + 6), font, 0.85,
+            cv2.putText(frame, caption, (x1 + 9, y1 + th + 6), font, cs,
                         (0, 0, 0), 2, cv2.LINE_AA)
         return frame
 
@@ -1487,7 +1767,10 @@ def main():
                     saver.save(frame, det[:4], text)
                 _raise_fault("unexpected", text=text, belongs=belongs,
                              seen=time.time())
-                print(f"[rewind] wind the coil back — this label stays "
+                voice.alert("Rotate the coil back and take it off.",
+                            lead="Stopped. Wrong label on the coil.",
+                            key=f"bad-{key}")
+                print(f"[rewind] rotate the coil back — this label stays "
                       f"outlined in red until it is out of frame, then the "
                       f"machine starts itself")
                 stop_machine(f"unexpected code ({belongs})")
@@ -1500,6 +1783,13 @@ def main():
             if status == RollingWindow.MATCH:
                 handled[0].append(tuple(float(v) for v in det[:4]))
                 row_no = sheet.rows[row_idx].number
+
+                # Mid-rewind, call each position as it comes in. The operator
+                # is watching the coil, not the screen, and this is how they
+                # know winding back is working before it finishes.
+                if fault["kind"] == "short" and row_idx == fault["row_idx"]:
+                    voice.say(f"Position {col + 1} found.",
+                              key=f"found-{row_no}-{col}")
                 if args.debug:
                     print(f"[window] row {row_no} QR DATA{col + 1} ok "
                           f"(slot {slot})")
@@ -1603,8 +1893,9 @@ def main():
             for text, verdict in reversed(recent[-8:]):
                 print(f"[recheck]     {_tail(text, 44):<46}{verdict}")
 
-        print(f"[recheck] STOPPED — wind the coil back so row {row_no} passes "
-              f"the camera again; its codes are picked up as they come.")
+        print(f"[recheck] STOPPED — rotate the coil back so row {row_no} "
+              f"passes the camera again; its codes are picked up as they "
+              f"come.")
         print(f"[recheck] the screen shows which positions are still missing. "
               f"Fill them all and the machine starts itself; press START with "
               f"any still missing and the row is recorded as a label defect.")
@@ -1619,6 +1910,10 @@ def main():
                 retire_row(stale, complete=False)
             return
         _raise_fault("short", row=row_no, row_idx=row_idx)
+        spoken = " and ".join(f"position {c + 1}" for c in missing)
+        voice.alert(f"Row {row_no} did not read {spoken}.",
+                    lead="Stopped. Rotate the coil back.",
+                    key=f"short-{row_no}")
         stop_machine(f"row {row_no} short of {cols} — held for re-check")
 
     def _adjudicate_recheck():
@@ -1647,6 +1942,8 @@ def main():
 
         print(f"\n[recheck] row {row_no} is STILL short after re-inspection")
         print(f"[defect]  LABEL HAS ISSUE — sheet row {row_no}")
+        voice.alert(f"Row {row_no}. Recorded.", lead="Label defect.",
+                    key=f"defect-{row_no}")
         for col in missing:
             print(f"[defect]    QR DATA{col + 1}: expected "
                   f"'{sheet.rows[row_idx].texts[col]}'")
@@ -1727,6 +2024,91 @@ def main():
         writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"),
                                   args.fps, (disp_w, disp_h))
 
+    # ── file pickers ─────────────────────────────────────────────────────
+    # OpenCV's GTK highgui has no file chooser, so these borrow tkinter's. The
+    # dialog is modal and runs on this thread, so the capture loop stalls
+    # while it is open — which is exactly right: both pickers are only live
+    # with the machine idle, so there is nothing to capture meanwhile.
+    def _ask(kind):
+        try:
+            import tkinter
+            from tkinter import filedialog
+        except ImportError:
+            print("[ui] tkinter is not installed - apt install python3-tk to "
+                  "use the LOAD SHEET and OUTPUT FOLDER buttons")
+            return None
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            if kind == "sheet":
+                return filedialog.askopenfilename(
+                    parent=root, title="Choose the validation sheet",
+                    initialdir=os.path.dirname(os.path.abspath(args.xlsx)),
+                    filetypes=[("Excel workbook", "*.xlsx *.xlsm"),
+                               ("All files", "*.*")]) or None
+            return filedialog.askdirectory(
+                parent=root, title="Choose the folder to save results in",
+                initialdir=os.path.abspath(args.result_dir),
+                mustexist=False) or None
+        finally:
+            root.destroy()
+
+    def _configurable():
+        """Both pickers repoint the whole record, so they are only live when
+        nothing is part-way through being checked."""
+        return not validating() and fault["kind"] is None
+
+    def _pick_sheet():
+        if not _configurable():
+            print("[ui] stop the machine before loading a different sheet")
+            return
+        path = _ask("sheet")
+        if not path or os.path.abspath(path) == os.path.abspath(args.xlsx):
+            return
+        try:
+            ValidationSheet(path, args.sheet)     # prove it before committing
+        except Exception as exc:
+            print(f"[ui] {path} is not a validation sheet: {exc}")
+            if panel is not None:
+                panel.note = f"Not a validation sheet: {exc}"
+            return
+        _bind_run(new_xlsx=path)
+        if panel is not None:
+            panel.note = None
+
+    def _pick_output():
+        if not _configurable():
+            print("[ui] stop the machine before changing the output folder")
+            return
+        path = _ask("folder")
+        if not path or (os.path.abspath(path)
+                        == os.path.abspath(args.result_dir)):
+            return
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            print(f"[ui] cannot write to {path}: {exc}")
+            if panel is not None:
+                panel.note = f"Cannot write to that folder: {exc}"
+            return
+        _bind_run(new_result_dir=path)
+        if panel is not None:
+            panel.note = None
+
+    def ui_state():
+        """What the console's status pill is showing."""
+        if starting_at[0] is not None:
+            return "reading"
+        if fault["kind"] is not None:
+            return "rewind"
+        return "running" if machine_running else "idle"
+
+    # The counters, the window's check status and the decoder tally are
+    # diagnostics, not something an operator acts on, so they stay off the
+    # screen unless they are asked for. 'd' toggles them mid-run.
+    show_debug = [args.debug]
+
     if not args.no_display:
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
         # at the frame's native resolution which overflows most screens. We
@@ -1746,14 +2128,21 @@ def main():
             return cv2.resize(frame, None, fx=scale, fy=scale,
                               interpolation=cv2.INTER_NEAREST)
 
-        view = render_window_view()
-        cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_VIEW, view.shape[1], view.shape[0])
-        print(f"[window] comparison panel in the '{WINDOW_VIEW}' window")
+        if show_debug[0]:
+            view = render_window_view()
+            cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_VIEW, view.shape[1], view.shape[0])
+            print(f"[window] comparison panel in the '{WINDOW_VIEW}' window")
 
+        # `scale` is how far the frame is shrunk on its way to the screen;
+        # the console needs it so its type is sized for what the operator
+        # actually sees rather than for the captured pixels.
         panel = ControlPanel(disp_w, disp_h,
                              on_start=lambda: start_machine("start button"),
-                             on_stop=lambda: stop_machine("stop button"))
+                             on_stop=lambda: stop_machine("stop button"),
+                             on_load_sheet=_pick_sheet,
+                             on_output_dir=_pick_output,
+                             display_scale=scale)
         # display_frame shrinks the frame by `scale` before imshow, and GTK
         # reports clicks in the coordinates of the image it was handed — so
         # scale them back up before hit-testing the buttons, which are laid
@@ -1762,7 +2151,9 @@ def main():
             panel.on_mouse(event, int(x / scale), int(y / scale), flags, param)
 
         cv2.setMouseCallback(win_name, on_mouse)
-        print("[ui] START/STOP buttons in the window (keys: s = start, x = stop)")
+        print("[ui] console buttons in the window (keys: s = start, "
+              "x = stop, o = load sheet, f = output folder, d = debug "
+              "readout, q = quit)")
 
     try:
         # Deliberately not started here. Nothing is decoded and nothing is
@@ -1821,31 +2212,26 @@ def main():
                                   f"stopped the line twice — not restarting "
                                   f"on its own. Press START to accept it, or "
                                   f"take that label off the web.")
+                            voice.alert("The same wrong label again. Press "
+                                        "start to accept it, or take it off "
+                                        "the coil.", key="bounced")
                     else:
                         bounced.add(key)
                         _clear_fault(f"the unexpected code has been out of "
                                      f"frame for {gone:.1f}s")
 
+            # What the operator needs is the picture, the boxes, what each
+            # one read, and — when something is wrong — the fault. The
+            # counters and the window's check status are for whoever is
+            # debugging the line, and stay off unless asked for.
             frame = draw_detections(frame, dets, class_names)
             if scanning():
-                draw_decoders(frame)
+                draw_decoders(frame, legend=show_debug[0])
             else:
                 marks[0] = []      # stopped: no verdicts, so no stale colours
             draw_fault(frame)
-            draw_window(frame, compact=True)
-            if starting_at[0] is not None:
-                left = max(args.start_delay - (time.time() - starting_at[0]), 0)
-                cv2.putText(frame, f"READING LABELS… {left:.1f}s",
-                            (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                            (0, 200, 255), 2, cv2.LINE_AA)
-            elif fault["kind"] is not None:
-                pass                     # the rewind banner says it instead
-            elif not machine_running:
-                cv2.putText(frame, "IDLE — press START to validate and run",
-                            (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                            (150, 150, 150), 2, cv2.LINE_AA)
-            if panel is not None:
-                panel.draw(frame, machine_running)
+            if show_debug[0]:
+                draw_window(frame, compact=True)
 
             # Simple running FPS: time between consecutive frames, smoothed
             # with an exponential moving average so the readout doesn't
@@ -1856,6 +2242,18 @@ def main():
             if dt > 0:
                 inst_fps = 1.0 / dt
                 fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
+
+            if panel is not None:
+                panel.sheet_name = os.path.basename(args.xlsx)
+                panel.output_dir = args.result_dir
+                panel.configurable = _configurable()
+                if starting_at[0] is not None:
+                    left = max(args.start_delay
+                               - (time.time() - starting_at[0]), 0)
+                    panel.note = f"Reading labels - {left:.1f}s to relay on"
+                elif fault["kind"] is not None:
+                    panel.note = "STOPPED: " + _fault_headline()
+                panel.draw(frame, ui_state())
 
             if args.no_display:
                 passed = sum(1 for _, ok in window.done if ok)
@@ -1872,10 +2270,14 @@ def main():
                       f"short={len(window.done) - passed}  "
                       f"reads={window.reads}{held}   ", end="\r")
             else:
-                cv2.putText(frame, f"FPS: {fps:.1f}  dets: {len(dets)}", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+                if show_debug[0]:
+                    cv2.putText(frame, f"FPS {fps:.1f}   DETS {len(dets)}",
+                                (20, _band_top() + int(30 * _tk())),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * _tk(),
+                                (120, 220, 120), 2, cv2.LINE_AA)
                 cv2.imshow(win_name, display_frame(frame))
-                cv2.imshow(WINDOW_VIEW, render_window_view())
+                if show_debug[0]:
+                    cv2.imshow(WINDOW_VIEW, render_window_view())
 
             if writer:
                 writer.write(frame)
@@ -1884,10 +2286,29 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                if panel is not None:
+                if key == ord("d"):
+                    show_debug[0] = not show_debug[0]
+                    if show_debug[0]:
+                        view = render_window_view()
+                        cv2.namedWindow(WINDOW_VIEW, cv2.WINDOW_NORMAL)
+                        cv2.resizeWindow(WINDOW_VIEW, view.shape[1],
+                                         view.shape[0])
+                    else:
+                        cv2.destroyWindow(WINDOW_VIEW)
+                    print(f"[ui] debug readout "
+                          f"{'on' if show_debug[0] else 'off'}")
+                elif panel is not None:
                     panel.on_key(key)
+    except KeyboardInterrupt:
+        # Ctrl+C is how the line is stopped from the terminal, so it is an
+        # ordinary way out, not a crash: swallow it here and let the shutdown
+        # below run — a traceback would only bury the run's closing tally.
+        print("\n[ui] interrupted — shutting down")
     finally:
         stop_machine("shutting down")
+        _aux(args.run_relay, False)
+        _aux(args.fault_relay, False)
+        voice.close()
         relay.close()
         cap.release()
         if writer:
