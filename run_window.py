@@ -50,7 +50,7 @@ import time
 import cv2
 
 from utils.crops import LabelSaver
-from utils.qr import decode_qr, pick_qr_for_label
+from utils.qr import decode_qr, decode_qr_opencv, pick_qr_for_label
 from utils.relay import RelayController
 from utils.results import ResultLog
 from utils.trt_engine import YOLO26TRT
@@ -81,7 +81,7 @@ DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
 DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 
 # ── Validation / machine config ──────────────────────────────────────────────
-DEFAULT_XLSX        = "validation_x300.xlsx"   # expected QR sequence
+DEFAULT_XLSX        = "validation_x300_test.xlsx"   # expected QR sequence
 DEFAULT_START_RELAY = 0                   # relay 0 = winding machine start
 DEFAULT_START_DELAY = 2.0                 # seconds of reading after START is
                                           # pressed, before the relay goes on
@@ -419,6 +419,14 @@ def main():
                      help="quiet zone around the qr box, as a fraction of its size.")
     ap.add_argument("--qr-margin-min", type=int, default=8,
                      help="minimum quiet zone in pixels.")
+    ap.add_argument("--opencv-fallback", type=int, default=1,
+                     help="how many labels per frame may fall back to "
+                          "OpenCV's QR decoder after zxing has failed on "
+                          "them. zxing and OpenCV fail on different codes, so "
+                          "this reads symbols zxing will not touch — but it "
+                          "costs ~10ms a call, hence the per-frame cap. A "
+                          "label sits in view for many frames, so a cap of 1 "
+                          "still gives it plenty of attempts. 0 = off.")
     ap.add_argument("--dump-crops", default=None,
                      help="directory to save what the camera saw whenever a "
                           "label was detected but would not decode: the label "
@@ -667,6 +675,8 @@ def main():
     resume_hint = [None]
     handled = [[]]           # boxes whose code was accepted on the last frame
     last_frame = [None]      # most recent frame, for the diagnostic dump
+    recent = []              # [(payload, verdict)] most recent decodes
+    ever_read = set()        # every payload decoded this run, normalised
     verified = {}          # excel row number -> (per-column marks, status)
 
     # ── re-inspection state (row mode) ───────────────────────────────────
@@ -1057,6 +1067,7 @@ def main():
             return
 
         qr_dets = [d for d in dets if int(d[5]) == qr_cls]
+        cv_budget = [args.opencv_fallback]   # spent on this frame only
         settled = list(handled[0])       # labels dealt with on the last frame
         handled[0] = []
         budget = args.max_decodes or None
@@ -1084,6 +1095,15 @@ def main():
             if not text and qr is not None:
                 text, box = decode_qr(frame, qr[:4], args.qr_margin,
                                       args.qr_margin_min)
+            if not text and cv_budget[0] > 0 and not _at_edge(det[:4], frame):
+                # Everything cheap has failed on a crop that is otherwise
+                # sound. A crop running off the frame edge is skipped: part of
+                # the symbol is simply not on the sensor and no decoder will
+                # recover it, so it is not worth the 10ms.
+                cv_budget[0] -= 1
+                text, box = decode_qr_opencv(frame, det[:4])
+                if text:
+                    cv_reads[0] += 1
             if not text:
                 _dump_miss(frame, det[:4], qr)
                 continue
@@ -1102,6 +1122,14 @@ def main():
                       f"{note} — window covers {window.size} rows from there")
 
             status, row_idx, col, slot = window.offer(text)
+
+            # Keep what was decoded and where it landed, so a row that comes
+            # up short can be explained rather than just reported.
+            ever_read.add(normalize(text))
+            where = (f"row {sheet.rows[row_idx].number} QR DATA{col + 1}"
+                     if row_idx is not None else "no row in the window")
+            recent.append((text, f"{status} -> {where}"))
+            del recent[:-40]
 
             if status == RollingWindow.UNKNOWN:
                 # A real code that belongs to no row inside the window: either
@@ -1156,6 +1184,17 @@ def main():
                         recheck["attempt"] = 0
                     retire_row(done_idx, complete=True)
 
+    cv_reads = [0]           # labels rescued by the OpenCV fallback
+
+    def _at_edge(box, frame):
+        h, w = frame.shape[:2]
+        return (box[0] <= 2 or box[1] <= 2 or box[2] >= w - 2 or box[3] >= h - 2)
+
+    def _tail(text, n=46):
+        """Payloads differ only at the end, so keep the tail, not the head."""
+        text = str(text) if text else ""
+        return text if len(text) <= n else ".." + text[-(n - 2):]
+
     def _hold_head_for_recheck(row_idx):
         """The head row came up short. Stop, and keep it open.
 
@@ -1171,9 +1210,45 @@ def main():
         recheck["row"] = row_no
         recheck["attempt"] = 1
         print(f"\n[recheck] row {row_no} did not validate: never read {cols}")
+
+        # What the sheet wanted against what actually came off the camera, for
+        # every position of this row — not just the ones that failed. A code
+        # that read fine proves the row was in view, which is what makes the
+        # missing one interesting.
+        req = window.required(row_idx)
+        seen = window.seen.get(row_idx, set())
+        print(f"[recheck]   {'POS':<5}{'EXPECTED (xlsx)':<48}"
+              f"{'DECODED (camera)':<48}RESULT")
+        for col, want in enumerate(sheet.rows[row_idx].texts):
+            if col not in req:
+                got, res = "(not checked)", "-"
+            elif col in seen:
+                got, res = window.texts.get((row_idx, col), want), "OK"
+            else:
+                got, res = "*** NOTHING DECODED ***", "MISSING"
+            print(f"[recheck]   D{col + 1:<4}{_tail(want, 46):<48}"
+                  f"{_tail(got, 46):<48}{res}")
+
+        # Was the missing code read anywhere at all? If it was, the label is
+        # legible and the problem is which row it was credited to. If it was
+        # never seen, the label never gave the decoder anything.
         for col in missing:
-            print(f"[recheck]   QR DATA{col + 1}: expected "
-                  f"'{sheet.rows[row_idx].texts[col]}'")
+            want = sheet.rows[row_idx].texts[col]
+            if normalize(want) in ever_read:
+                print(f"[recheck]   note: QR DATA{col + 1}'s code HAS been "
+                      f"decoded earlier in this run — it was read somewhere, "
+                      f"just not credited to row {row_no}")
+            else:
+                print(f"[recheck]   note: QR DATA{col + 1}'s code has NEVER "
+                      f"decoded in this run — that label is not being read "
+                      f"at all")
+
+        if recent:
+            print(f"[recheck]   last {min(len(recent), 8)} codes decoded, "
+                  f"newest first:")
+            for text, verdict in reversed(recent[-8:]):
+                print(f"[recheck]     {_tail(text, 44):<46}{verdict}")
+
         print(f"[recheck] STOPPED — wind the coil back so row {row_no} passes "
               f"the camera again; its codes will be picked up automatically.")
         print(f"[recheck] then press START: if it read clean the run carries "
@@ -1441,6 +1516,9 @@ def main():
             results.close()
         if saver is not None:
             print(f"[crops] saved {saver.count} label crops to {saver.dir}/")
+        if cv_reads[0]:
+            print(f"[qr] {cv_reads[0]} label(s) read by the OpenCV fallback "
+                  f"after zxing failed on them")
         if defects:
             print(f"[defect] {len(defects)} row(s) failed twice and were "
                   f"recorded as LABEL ISSUE: "
