@@ -20,8 +20,8 @@ is actually in.
 
 ## The re-inspection cycle
 
-Nothing is tolerated. A row that reaches the end of the window still missing a
-code is not written off — the line stops and the row is held open:
+Nothing is tolerated. A row the coil has moved past while it is still missing
+a code is not written off — the line stops and the row is held open:
 
     row comes up short   ->  STOPPED, row held at the head of the window
     wind the coil back   ->  the same labels pass the camera again
@@ -30,12 +30,23 @@ code is not written off — the line stops and the row is held open:
                                still short  -> LABEL HAS ISSUE, recorded as a
                                                defect, window moves past it
 
+If **no** code read is anywhere in the sheet, the roll is not the one the
+sheet describes — a new roll went on and the sheet was not changed with it.
+The line stops before the relay is energised at all, the console reads WRONG
+SHEET, and LOAD SHEET stays live so the right sheet can be loaded; loading it
+starts a fresh record and the run carries on normally.
+
 ## Common flags
 
-    --window-size 4        how many sheet rows are open at once. Also the
-                           detection latency: a short row is only noticed once
-                           the web has run a whole window past it, and that is
-                           how far back you have to wind. Smaller = sooner.
+    --hold-after 2         how many rows the coil may move past a row that
+                           did not read everything before the line stops for
+                           it. This is the detection latency, and how far back
+                           you have to wind. 1 stops at the very next row;
+                           raise it if labels from several rows are in view at
+                           once, so a row's last code has time to arrive.
+    --window-size 8        how many sheet rows a code can still be recognised
+                           from. Bigger tolerates more out-of-order arrival;
+                           it no longer decides how long a short row runs on.
     --start-delay 2.0      seconds of reading after START before the relay
                            goes on. 0 = energise immediately.
     --xlsx validation.xlsx which sheet holds the expected QR DATA1..N codes.

@@ -54,6 +54,9 @@ STATES = {
     "running": ("RUNNING", OK),
     "reading": ("READING", WARN),
     "rewind": ("REWIND", BAD),
+    # Not a rewind: nothing on the coil is going to fix it, the sheet has to
+    # be changed. Different word, so the operator is not sent to the winder.
+    "mismatch": ("WRONG SHEET", BAD),
     "idle": ("IDLE", MUTED),
 }
 
@@ -631,7 +634,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
         if state != self._state:
             self._state = state
             self._set_pill(state)
-            self.start_btn.setEnabled(state in ("idle", "rewind"))
+            self.start_btn.setEnabled(state in ("idle", "rewind",
+                                                "mismatch"))
             self.stop_btn.setEnabled(self._running)
 
         self._recent = list(snap.get("recent") or ())
@@ -658,7 +662,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         note = snap.get("note") or "Press START to read the labels and run."
         if self.status.text() != note:
             self.status.setText(note)
-            colour = BAD if state == "rewind" else (
+            colour = BAD if state in ("rewind", "mismatch") else (
                 WARN if state == "reading" else MUTED)
             self.status.setStyleSheet(f"color: {colour};")
 

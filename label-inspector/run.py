@@ -29,12 +29,20 @@ reason for it is gone:
                                           stops the line twice it waits for a
                                           human)
 
+One fault does not clear itself, because nothing on the coil can clear it: if
+no code read has been in the sheet at all, the roll on the machine is not the
+one the sheet describes -- a new roll went on and the sheet was not changed
+with it. The line stops before the relay is ever energised, the console says
+WRONG SHEET, and LOAD SHEET stays live so the right one can be loaded.
+
 Pressing START while the fault is still live is the operator overruling it:
 
     row still short                   ->  LABEL HAS ISSUE, recorded as a
                                           defect, and the window moves past it
     unexpected code still there       ->  accepted, and that payload will not
                                           stop the line again this run
+    wrong sheet for the roll          ->  that code is accepted; the next one
+                                          that is in no row stops it again
 
 Nothing is read while the machine is idle. Pressing START does not energise
 the relay straight away: for --start-delay seconds the camera reads the labels
@@ -126,7 +134,7 @@ DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/2
 
 # ── Inference config ─────────────────────────────────────────────────────────
 DEFAULT_IMGSZ      = 640
-DEFAULT_CONF_THRES = 0.25   # applies to any class without its own threshold
+DEFAULT_CONF_THRES = 0.75   # applies to any class without its own threshold
 DEFAULT_CONF_LABEL = None   # None -> fall back to DEFAULT_CONF_THRES
 DEFAULT_CONF_QR    = None
 
@@ -587,7 +595,17 @@ def main():
     ap.add_argument("--window-size", type=int, default=8,
                      help="how many sheet rows the rolling window holds. "
                           "Bigger tolerates more out-of-order arrival and more "
-                          "missed rows; smaller catches a stray label sooner.")
+                          "missed rows; smaller catches a stray label sooner. "
+                          "This is how far a code may be recognised from, not "
+                          "how long a short row is tolerated — that is "
+                          "--hold-after.")
+    ap.add_argument("--hold-after", type=int, default=2,
+                     help="how far past an incomplete row the coil may move "
+                          "before the line stops and that row is held open "
+                          "for a re-check, in sheet rows. 1 stops at the very "
+                          "next row; raise it if labels from several rows are "
+                          "in view at once, so a row's last code has time to "
+                          "arrive. Capped at --window-size - 1.")
     ap.add_argument("--window-grace", type=int, default=None,
                      help="rows kept matchable behind the window, so a label "
                           "still in view after its row finished is recognised "
@@ -693,6 +711,11 @@ def main():
     # Loaded through a function rather than inline, because the operator can
     # load a different sheet from the console without restarting the app.
     sheet = window = per_row = checked = None
+    # How many rows the coil may move past a row that has not read everything
+    # before the line is stopped for it. Kept here rather than read straight
+    # off args because the window can be shrunk by a repeating sheet, and this
+    # has to stay inside it.
+    hold_after = [1]
 
     def _open_sheet():
         """Read args.xlsx and build the rolling window over it."""
@@ -721,6 +744,7 @@ def main():
                       f"using {max(1, room)} instead")
                 size = max(1, room)
         window = RollingWindow(sheet, size=size, check=checked, grace=grace)
+        hold_after[0] = max(1, min(args.hold_after, window.size - 1))
         # Only once it has parsed: the recent list is for sheets that worked.
         prefs.remember_sheet(args.xlsx)
         print(f"[window] rolling window of {window.size} sheet rows "
@@ -731,6 +755,8 @@ def main():
     print(f"[window] a row that comes up short stops the line and is held "
           f"open — wind the coil back and the screen shows what is still "
           f"missing; fill it and the machine starts itself")
+    print(f"[window] the line stops as soon as the coil has moved "
+          f"{hold_after[0]} row(s) past a row that did not read everything")
     if args.no_auto_restart:
         print(f"[window] --no-auto-restart: a cleared fault still waits for "
               f"START")
@@ -764,7 +790,7 @@ def main():
         # row settles itself in _finish_start once the read-in has had its
         # chance at it. An unexpected code has to be forgiven by name, or it
         # would stop the line again on the very next frame it decodes on.
-        if fault["kind"] == "unexpected" and fault["text"]:
+        if fault["kind"] in ("unexpected", "mismatch") and fault["text"]:
             forgiven.add(normalize(fault["text"]))
             print(f"[rewind] operator accepted the unexpected code "
                   f"{_tail(fault['text'], 30)} — it will not stop the line "
@@ -1528,7 +1554,7 @@ def main():
             # colour. Only the tail is shown: every code on this reel shares
             # the same prefix and differs only at the end, and the shorter it
             # is the larger it can be set without swamping the label.
-            caption = ("WRONG LABEL" if bad else
+            caption = (_bad_caption() if bad else
                        _tail(text, 14) if text else "NO READ")
             cs = 0.55 * _tk()
             # A caption a little wider than its label is readable; one three
@@ -1642,6 +1668,15 @@ def main():
             return f"unexpected {_tail(fault['text'], 20)}"
         return ""
 
+    def _bad_caption():
+        """What the strip under the offending label reads.
+
+        Two different faults put a red box on a label, and they call for two
+        different things: one label wound out of the roll, or the whole sheet
+        changed.
+        """
+        return "NOT IN SHEET" if fault["kind"] == "mismatch" else "WRONG LABEL"
+
     def _bad_label(box):
         """Is this the physical label that stopped the line?
 
@@ -1668,6 +1703,10 @@ def main():
             return None
         key = normalize(text or "")
         if not key and not _bad_label(box):
+            return None
+        if fault["kind"] == "mismatch":
+            if key == normalize(fault["text"] or "") or _bad_label(box):
+                return "NOT IN THIS SHEET", FAULT_RED
             return None
         if fault["kind"] == "unexpected":
             if key == normalize(fault["text"] or "") or _bad_label(box):
@@ -1723,6 +1762,22 @@ def main():
                           "- then it starts itself", FAULT_TEXT, 0.7))
             lines.append((f"or press START to record row {fault['row']} as a "
                           f"label defect", FAULT_TEXT, 0.7))
+        elif fault["kind"] == "mismatch":
+            # No rewind for this one: there is nothing on the coil to wind
+            # back to. What has to change is the sheet, or the roll.
+            banner = "WRONG SHEET FOR THIS ROLL"
+            lines.append((f"read     {_tail(fault['text'] or '', 26)}",
+                          FAULT_RED, 0.8))
+            lines.append((f"sheet    {os.path.basename(args.xlsx)}",
+                          FAULT_TEXT, 0.8))
+            lines.append(("that code is in no row of this sheet, and",
+                          FAULT_TEXT, 0.75))
+            lines.append(("nothing read so far has matched it either",
+                          FAULT_TEXT, 0.75))
+            lines.append(("load the sheet for this roll - LOAD SHEET",
+                          FAULT_WANT, 0.85))
+            lines.append(("or press START to run this label past anyway",
+                          FAULT_TEXT, 0.7))
         elif fault["kind"] is not None:
             gone = time.time() - fault["seen"]
             banner = f"REWIND: UNEXPECTED CODE {_tail(fault['text'] or '', 16)}"
@@ -1900,6 +1955,37 @@ def main():
             if window.start is None:
                 hit = sheet.find(text, near=resume_hint[0])
                 if hit is None:
+                    # This code is nowhere in the sheet, and nothing has
+                    # anchored the window yet -- so not one label read so far
+                    # belongs to this sheet. That is a coil the sheet does not
+                    # describe: a new roll went on and the sheet was not
+                    # changed with it, or the wrong sheet was loaded.
+                    #
+                    # It has to be caught here rather than by the unexpected
+                    # path below, which only exists once the window has
+                    # anchored. Until then every foreign code fell through
+                    # this `continue` and the machine wound the whole roll
+                    # through, reading and validating nothing.
+                    key = normalize(text)
+                    if fault["kind"] is not None or key in forgiven:
+                        handled[0].append(tuple(float(v) for v in det[:4]))
+                        continue
+                    print(f"\n[window] WRONG COIL FOR THIS SHEET: {text}")
+                    print(f"[window]   this code is in no row of "
+                          f"{os.path.basename(args.xlsx)}, and no code read "
+                          f"so far is either")
+                    print(f"[window]   load the sheet that goes with this "
+                          f"roll, or put the right roll on")
+                    if saver is not None:
+                        saver.save(frame, det[:4], text)
+                    _raise_fault("mismatch", text=text,
+                                 belongs="nothing in this sheet",
+                                 seen=time.time(),
+                                 box=tuple(float(v) for v in det[:4]))
+                    voice.alert("Load the sheet for this roll.",
+                                lead="Stopped. These labels are not in the "
+                                     "sheet.", key="mismatch")
+                    stop_machine("labels do not match the sheet")
                     continue
                 anchored = window.anchor(hit[0])
                 note = ("" if resume_hint[0] is None else
@@ -2014,13 +2100,20 @@ def main():
                 if saver is not None:
                     saver.save(frame, det[:4], text)
 
-                # A hit in the last slot means the web has run a full window
-                # past the head, so the head is not going to fill in on its
-                # own. Rather than write it off, hold the line and keep the
-                # row open: the operator winds the coil back, the same labels
+                # A code this far past the head means the coil has moved
+                # on and the head row is not going to fill in on its own --
+                # what is in front of the camera now is a later row. Rather
+                # than write the head off, hold the line and keep the row
+                # open: the operator winds the coil back, the same labels
                 # come past again, and the row either completes or is judged
                 # a real defect.
-                if (slot >= window.size - 1 and recheck["row"] is None
+                #
+                # This used to wait for the whole window (8 rows by default),
+                # which meant the machine wound on through several more rows
+                # before stopping for the one that failed. --hold-after is
+                # how many rows of grace it gets, and it is small because the
+                # point of stopping is to stop at the fault.
+                if (slot >= hold_after[0] and recheck["row"] is None
                         and fault["kind"] is None):
                     head_idx = window.start
                     if head_idx is not None and window.missing(head_idx):
@@ -2054,7 +2147,8 @@ def main():
         marked on the frames where it reads as the printed code underneath,
         or does not read at all.
         """
-        if fault["kind"] != "unexpected" or fault["box"] is None:
+        if fault["kind"] not in ("unexpected", "mismatch") \
+                or fault["box"] is None:
             return
         best, score = None, 0.20
         for box, _who, _text in marks[0]:
@@ -2302,8 +2396,12 @@ def main():
 
     def _configurable():
         """Both pickers repoint the whole record, so they are only live when
-        nothing is part-way through being checked."""
-        return not validating() and fault["kind"] is None
+        nothing is part-way through being checked.
+
+        A wrong-sheet fault is the exception: loading the right sheet is the
+        fix for it, so the button that does that has to stay live.
+        """
+        return not validating() and fault["kind"] in (None, "mismatch")
 
     # Choosing a file and acting on the choice are separate, because under Qt
     # they happen on different threads: the dialog has to run on the GUI
@@ -2380,6 +2478,8 @@ def main():
         """What the console's status pill is showing."""
         if starting_at[0] is not None:
             return "reading"
+        if fault["kind"] == "mismatch":
+            return "mismatch"
         if fault["kind"] is not None:
             return "rewind"
         return "running" if machine_running else "idle"
@@ -2598,7 +2698,7 @@ def main():
             colour = (DECODER_COLOUR["fail"] if bad
                       else DECODER_COLOUR.get(who, DECODER_COLOUR["fail"]))
             boxes.append((x1, y1, x2, y2, _rgb(colour),
-                          "WRONG LABEL" if bad else
+                          _bad_caption() if bad else
                           _tail(text, 14) if text else "NO READ"))
 
         tags = []

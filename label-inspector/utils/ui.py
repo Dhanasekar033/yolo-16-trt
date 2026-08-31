@@ -162,6 +162,7 @@ class ControlPanel:
         "running": ("RUNNING",  OK,    True),
         "reading": ("READING",  WARN,  True),
         "rewind":  ("REWIND",   BAD,   True),
+        "mismatch": ("WRONG SHEET", BAD, True),
         "idle":    ("IDLE",     MUTED, False),
     }
 
@@ -344,7 +345,7 @@ class ControlPanel:
             state = "idle"
 
         running = state in ("running", "reading")
-        self.buttons[0].enabled = state in ("idle", "rewind")
+        self.buttons[0].enabled = state in ("idle", "rewind", "mismatch")
         self.buttons[1].enabled = running
         for button in self.config_buttons:
             button.enabled = self.configurable and not running
