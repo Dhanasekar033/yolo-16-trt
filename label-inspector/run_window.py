@@ -10,19 +10,37 @@ belongs to — so the order codes happen to decode in never matters.
 
 Nothing is tolerated. A row that reaches the end of the window still missing
 a code does not get written off: the line stops and the row is held open at
-the head of the window. The operator winds the coil back, the same labels
-pass the camera again, and their codes tick off exactly as they would have the
-first time. Pressing START is the adjudication:
+the head of the window.
 
-    row filled in while winding back  ->  cleared, the run carries on
+Stopping on a fault puts the app into REWIND. The relay is off, but the camera
+keeps decoding, so the operator can wind the coil backwards by hand and watch
+the labels that caused the stop come past again on screen. What is wrong is
+drawn on the frame — the held row's positions ticking from NOT READ YET to
+READ as they come, or the offending label outlined in red — so the console
+text and the coil in front of the operator are talking about the same thing.
+
+The fault clears itself, and the machine restarts itself, the moment the
+reason for it is gone:
+
+    a held row reads every code       ->  cleared, relay back on, run carries
+                                          on where it left off
+    an unexpected code goes out of    ->  cleared after --rewind-clear seconds
+    frame and stays out                   (once per code: if the same one
+                                          stops the line twice it waits for a
+                                          human)
+
+Pressing START while the fault is still live is the operator overruling it:
+
     row still short                   ->  LABEL HAS ISSUE, recorded as a
                                           defect, and the window moves past it
+    unexpected code still there       ->  accepted, and that payload will not
+                                          stop the line again this run
 
-Nothing is read while the machine is stopped. Pressing START does not energise
+Nothing is read while the machine is idle. Pressing START does not energise
 the relay straight away: for --start-delay seconds the camera reads the labels
 standing in front of it while the coil is still, and only then does the relay
 go on. That read-in is what validates the position the coil is actually in,
-and it is also the second look a held row gets — starting the web first would
+and it is also the last look a held row gets — starting the web first would
 drag those labels out of frame before they could be checked.
 
 What this build does NOT do, compared to run.py: no trigger-line mode, no
@@ -467,10 +485,15 @@ def main():
                      help="how many sheet rows the rolling window holds. "
                           "Bigger tolerates more out-of-order arrival and more "
                           "missed rows; smaller catches a stray label sooner.")
-    ap.add_argument("--window-grace", type=int, default=4,
+    ap.add_argument("--window-grace", type=int, default=None,
                      help="rows kept matchable behind the window, so a label "
                           "still in view after its row finished is recognised "
-                          "as a re-read instead of an unexpected code.")
+                          "as a re-read instead of an unexpected code. "
+                          "Defaults to --window-size, which is the least that "
+                          "is safe: a held row healing on a rewind can retire "
+                          "every row behind it at once, and the labels that "
+                          "just retired are still standing in front of the "
+                          "lens.")
     ap.add_argument("--out-xlsx", default=None,
                      help="where to write the sheet annotated with what was "
                           "decoded. Defaults to a fixed path per sheet so it "
@@ -505,7 +528,18 @@ def main():
                      help="relay that starts the winding machine.")
     ap.add_argument("--relay-verbose", action="store_true",
                      help="print every modbus frame sent to the relay board.")
+    ap.add_argument("--no-auto-restart", action="store_true",
+                     help="after a fault, wait for START even once the fault "
+                          "has cleared on the rewind. By default the machine "
+                          "restarts itself the moment the reason it stopped "
+                          "is gone.")
+    ap.add_argument("--rewind-clear", type=float, default=2.5,
+                     help="seconds an unexpected code must stay out of frame "
+                          "during a rewind before the fault counts as "
+                          "cleared and the machine restarts itself.")
     args = ap.parse_args()
+    if args.window_grace is None:
+        args.window_grace = args.window_size
 
     # ── the expected sheet, and the window over it ───────────────────────
     sheet = ValidationSheet(args.xlsx, args.sheet)
@@ -535,7 +569,11 @@ def main():
           f"(+{window.grace} kept behind for re-reads); every QR in frame "
           f"is matched on its own, order does not matter")
     print(f"[window] a row that comes up short stops the line and is held "
-          f"open — wind it back past the camera, then press START")
+          f"open — wind the coil back and the screen shows what is still "
+          f"missing; fill it and the machine starts itself")
+    if args.no_auto_restart:
+        print(f"[window] --no-auto-restart: a cleared fault still waits for "
+              f"START")
 
     machine_running = False
     # When START was pressed, or None when it was not. Between that moment and
@@ -560,6 +598,17 @@ def main():
             return
         starting_at[0] = time.time()
         start_reason[0] = reason
+
+        # Pressing START while the fault is still live is the operator saying
+        # they have looked at it and want the line to run regardless. A short
+        # row settles itself in _finish_start once the read-in has had its
+        # chance at it. An unexpected code has to be forgiven by name, or it
+        # would stop the line again on the very next frame it decodes on.
+        if fault["kind"] == "unexpected" and fault["text"]:
+            forgiven.add(normalize(fault["text"]))
+            print(f"[rewind] operator accepted the unexpected code "
+                  f"{_tail(fault['text'], 30)} — it will not stop the line "
+                  f"again this run")
         if panel is not None:
             panel.note = f"reading labels… ({args.start_delay:.0f}s)"
         held = (f", re-checking row {recheck['row']}"
@@ -579,6 +628,13 @@ def main():
         # confirmed defect.
         if recheck["row"] is not None:
             _adjudicate_recheck()
+
+        # The fault survived the button press so that the overlay kept
+        # showing what was missing all through the read-in — the last few
+        # seconds in which it could still fill in. Now it is settled either
+        # way, so it goes.
+        if fault["kind"] is not None:
+            fault.update(_NO_FAULT)
 
         relay.on(args.start_relay)
         machine_running = True
@@ -600,6 +656,39 @@ def main():
         what = "start ABORTED" if aborted and not machine_running else "STOPPED"
         print(f"\n[relay] winding machine {what} ({reason}) "
               f"— relay {args.start_relay} OFF")
+
+    def scanning():
+        """Codes are read when running, when starting — and while a fault is
+        live. That last one is the rewind: the relay is off and the operator
+        is winding the coil backwards by hand, but the camera keeps decoding,
+        because the whole point is to see the offending labels come past
+        again and prove the fault has gone.
+        """
+        return validating() or fault["kind"] is not None
+
+    def _raise_fault(kind, **kw):
+        """Record why the line stopped, which puts it into rewind mode."""
+        fault.update(_NO_FAULT)
+        fault.update(kind=kind, since=time.time(), **kw)
+
+    def _clear_fault(why, restart=True):
+        """The reason for the stop is gone. Let the machine go by itself.
+
+        Auto-restart runs the normal start sequence, read-in and all, so the
+        labels standing in front of the lens are validated in place before
+        the relay comes back on — exactly as if the operator had pressed the
+        button.
+        """
+        if fault["kind"] is None:
+            return
+        fault.update(_NO_FAULT)
+        print(f"\n[rewind] fault cleared — {why}")
+        if not restart:
+            return
+        if args.no_auto_restart:
+            print("[rewind] --no-auto-restart: press START to carry on")
+            return
+        start_machine("re-check passed")
 
     globals()["_press_start"] = lambda: start_machine("start button")  # SEAM
 
@@ -689,6 +778,27 @@ def main():
     # failing again makes it a confirmed defect.
     recheck = {"row": None, "attempt": 0}   # sheet row awaiting re-inspection
     defects = set()                         # rows confirmed bad on re-check
+
+    # The live fault, if any. Setting this is what puts the app into rewind
+    # mode: the relay is off, but the camera keeps decoding, so the operator
+    # can wind the coil backwards and watch the very labels that caused the
+    # stop come past again. What the fault records is what the overlay draws
+    # and what has to go away before the machine is allowed to start itself.
+    #
+    #   kind   'short'      the head row never read every code it needed
+    #          'unexpected' a code came off the web that belongs nowhere here
+    #   row    sheet row number held open (short)
+    #   text   the offending payload (unexpected)
+    #   seen   when that payload was last decoded, so its absence can be timed
+    #   strikes payloads that have already been forgiven once, so the same
+    #          bad label cannot bounce the line between stop and start on its
+    #          own — the second time it stops, a human has to press START.
+    _NO_FAULT = {"kind": None, "row": None, "row_idx": None, "text": None,
+                 "belongs": None, "seen": 0.0, "since": 0.0, "warned": False,
+                 "in_frame": False}
+    fault = dict(_NO_FAULT)
+    forgiven = set()      # unexpected payloads the operator has waved through
+    bounced = set()       # unexpected payloads already given one free auto-restart
 
     def _open_journal():
         """A one-line-per-row append log, flushed as it goes.
@@ -1070,15 +1180,29 @@ def main():
         nothing. A zbar box is the interesting one: it marks a code the
         primary decoder cannot see at all.
         """
-        for box, who in marks[0]:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for box, who, text in marks[0]:
             x1, y1, x2, y2 = (int(v) for v in box)
-            cv2.rectangle(frame, (x1, y1), (x2, y2),
-                          DECODER_COLOUR.get(who, (60, 60, 235)), 4)
+            colour = DECODER_COLOUR.get(who, DECODER_COLOUR["fail"])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 4)
+
+            # The payload under the box, on a filled strip in the decoder's
+            # colour. Only the tail is shown: every code on this reel shares
+            # the same prefix and differs only at the end.
+            caption = _tail(text, 18) if text else "NO READ"
+            (tw, th), _ = cv2.getTextSize(caption, font, 0.75, 2)
+            ty = y2 + th + 12
+            if ty > frame.shape[0] - 4:      # off the bottom: put it inside
+                ty = y1 + th + 12
+            cv2.rectangle(frame, (x1, ty - th - 9), (x1 + tw + 12, ty + 7),
+                          colour, -1)
+            cv2.putText(frame, caption, (x1 + 6, ty), font, 0.75,
+                        (0, 0, 0), 2, cv2.LINE_AA)
 
         counts = {}
-        for _, who in marks[0]:
+        for _, who, _t in marks[0]:
             counts[who] = counts.get(who, 0) + 1
-        x, font = 20, cv2.FONT_HERSHEY_SIMPLEX
+        x = 20
         for who, text in (("zxing", "zxing"), ("zbar", "zbar"),
                           ("fail", "no read")):
             swatch = DECODER_COLOUR[who]
@@ -1091,6 +1215,140 @@ def main():
             cv2.putText(frame, f"zbar rescues this run: {zb_reads[0]}",
                         (20, 232), font, 0.7, DECODER_COLOUR["zbar"], 2,
                         cv2.LINE_AA)
+        return frame
+
+    # ── the rewind overlay ────────────────────────────────────────────────
+    # A stop is only half the job. The operator now winds the coil backwards
+    # by hand, and while they do the camera keeps decoding — so the screen can
+    # show, live, which physical label the fault is about and whether winding
+    # back has fixed it yet.
+    FAULT_RED = (60, 60, 235)
+    FAULT_GREEN = (80, 220, 80)
+    FAULT_WANT = (255, 200, 0)       # a position of the held row not read yet
+    FAULT_TEXT = (240, 240, 240)
+
+    def _fault_headline():
+        """One line saying what is wrong, for the headless status line."""
+        if fault["kind"] == "short":
+            idx = fault["row_idx"]
+            miss = sorted(window.missing(idx)) if idx is not None else []
+            return (f"row {fault['row']} needs "
+                    + (", ".join(f"D{c + 1}" for c in miss) if miss
+                       else "nothing"))
+        if fault["kind"] == "unexpected":
+            return f"unexpected {_tail(fault['text'], 20)}"
+        return ""
+
+    def _fault_tag(text):
+        """What this label is, in terms of the live fault.
+
+        Returns (caption, colour) for a label worth pointing at during the
+        rewind, or None for one that has nothing to do with the fault. This
+        is the answer to 'where is it' — the offending label carries its own
+        label on screen instead of the operator having to work out which of
+        the codes on the coil the console was talking about.
+        """
+        if fault["kind"] is None or not text:
+            return None
+        key = normalize(text)
+        if fault["kind"] == "unexpected":
+            if key == normalize(fault["text"] or ""):
+                return "UNEXPECTED - WIND THIS OUT", FAULT_RED
+            return None
+        idx = fault["row_idx"]
+        if idx is None:
+            return None
+        for col, want in enumerate(sheet.rows[idx].texts):
+            if normalize(want) == key:
+                got = col in window.seen.get(idx, set())
+                return (f"ROW {fault['row']} D{col + 1} "
+                        + ("READ" if got else "NEEDED"),
+                        FAULT_GREEN if got else FAULT_WANT)
+        return None
+
+    def draw_fault(frame):
+        """Everything the operator needs while winding the coil back."""
+        if fault["kind"] is None:
+            return frame
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        h, w = frame.shape[:2]
+        # A red border round the whole frame: a screen stopped on a fault must
+        # not read as an idle one at a glance from across the machine.
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), FAULT_RED, 14)
+
+        # Hershey has no glyph for anything outside ASCII, so every string
+        # drawn here is plain ASCII: a dash or an ellipsis comes out as "???".
+        banner = ""
+        lines = []                    # (text, colour, scale)
+        if fault["kind"] == "short":
+            idx = fault["row_idx"]
+            req = sorted(window.required(idx))
+            seen = window.seen.get(idx, set())
+            missing = [c for c in req if c not in seen]
+            banner = (f"REWIND: ROW {fault['row']} NEEDS "
+                      + ", ".join(f"D{c + 1}" for c in missing))
+            for col in req:
+                got = col in seen
+                want = sheet.rows[idx].texts[col]
+                lines.append((f"D{col + 1}  {_tail(want, 20):<22}"
+                              f"{'READ' if got else 'NOT READ YET'}",
+                              FAULT_GREEN if got else FAULT_RED, 0.8))
+            lines.append(("wind back until every position reads - then it "
+                          "starts itself", FAULT_TEXT, 0.7))
+            lines.append((f"or press START to record row {fault['row']} as a "
+                          f"label defect", FAULT_TEXT, 0.7))
+        else:
+            gone = time.time() - fault["seen"]
+            banner = f"REWIND: UNEXPECTED CODE {_tail(fault['text'] or '', 16)}"
+            lines.append((f"read     {_tail(fault['text'] or '', 26)}",
+                          FAULT_RED, 0.8))
+            lines.append((f"belongs  {fault['belongs']}", FAULT_TEXT, 0.8))
+            if fault["in_frame"]:
+                lines.append(("that label is IN FRAME - outlined in red",
+                              FAULT_RED, 0.8))
+            elif fault["warned"]:
+                lines.append(("stopped the line twice - press START to accept "
+                              "it", FAULT_TEXT, 0.8))
+            else:
+                left = max(args.rewind_clear - gone, 0.0)
+                lines.append((f"out of frame - restarting in {left:.1f}s",
+                              FAULT_GREEN, 0.8))
+
+        # The headline goes in a bar across the top, under the counters, where
+        # nothing else is drawn and it cannot be missed from a few feet away.
+        cv2.rectangle(frame, (0, 250), (w, 322), FAULT_RED, -1)
+        (bw, _bh), _ = cv2.getTextSize(banner, font, 1.0, 3)
+        cv2.putText(frame, banner, (max((w - bw) // 2, 12), 300), font,
+                    1.0, (0, 0, 0), 3, cv2.LINE_AA)
+
+        # The detail stacks up from the bottom edge, clear of the counters at
+        # the top and of the payload strips that hang under each box.
+        y = h - 34
+        for text, colour, scale in reversed(lines):
+            (tw, th), _ = cv2.getTextSize(text, font, scale, 2)
+            cv2.rectangle(frame, (16, y - th - 12), (16 + tw + 24, y + 12),
+                          (0, 0, 0), -1)
+            cv2.putText(frame, text, (28, y), font, scale, colour, 2,
+                        cv2.LINE_AA)
+            y -= th + 24
+
+        # And on the labels themselves, so the console text and the coil in
+        # front of the operator are talking about the same thing.
+        for box, _who, text in marks[0]:
+            tag = _fault_tag(text)
+            if tag is None:
+                continue
+            caption, colour = tag
+            x1, y1, x2, y2 = (int(v) for v in box)
+            cv2.rectangle(frame, (x1 - 7, y1 - 7), (x2 + 7, y2 + 7), colour, 7)
+            # Inside the top of the box, not above it: above would land on
+            # the payload strip draw_decoders hangs under the box before it.
+            (tw, th), _ = cv2.getTextSize(caption, font, 0.85, 2)
+            cv2.rectangle(frame, (x1, y1), (x1 + tw + 18, y1 + th + 18),
+                          colour, -1)
+            cv2.putText(frame, caption, (x1 + 9, y1 + th + 6), font, 0.85,
+                        (0, 0, 0), 2, cv2.LINE_AA)
         return frame
 
     def scan_frame(frame, dets):
@@ -1109,11 +1367,11 @@ def main():
         marks[0] = []
 
         def carry(box):
-            """The verdict this label earned when it was last decoded."""
-            for prev, who in was:
+            """What this label read, and which decoder got it, last time."""
+            for prev, who, text in was:
                 if _overlap(box, prev) > 0.45:
-                    return who
-            return "zxing"
+                    return who, text
+            return "zxing", None
         budget = args.max_decodes or None
 
         for det in dets:
@@ -1127,7 +1385,9 @@ def main():
             box = det[:4]
             if any(_overlap(box, prev) > 0.45 for prev in settled):
                 handled[0].append(tuple(float(v) for v in box))
-                marks[0].append((tuple(float(v) for v in box), carry(box)))
+                prev_who, prev_text = carry(box)
+                marks[0].append((tuple(float(v) for v in box),
+                                 prev_who, prev_text))
                 continue
 
             if budget is not None:
@@ -1154,10 +1414,11 @@ def main():
                     zb_reads[0] += 1
                     who = "zbar"
             if not text:
-                marks[0].append((tuple(float(v) for v in det[:4]), "fail"))
+                marks[0].append((tuple(float(v) for v in det[:4]),
+                                 "fail", None))
                 _dump_miss(frame, det[:4], qr)
                 continue
-            marks[0].append((tuple(float(v) for v in det[:4]), who))
+            marks[0].append((tuple(float(v) for v in det[:4]), who, text))
 
             # The first payload the sheet recognises decides where the window
             # sits; until then there is nothing to hold anything against.
@@ -1183,6 +1444,34 @@ def main():
             del recent[:-40]
 
             if status == RollingWindow.UNKNOWN:
+                key = normalize(text)
+                if key in forgiven:
+                    # The operator pressed START with this code on screen, so
+                    # it has already been judged by a human. Let it pass.
+                    handled[0].append(tuple(float(v) for v in det[:4]))
+                    continue
+
+                if fault["kind"] == "unexpected" and \
+                        normalize(fault["text"]) == key:
+                    # The label that stopped the line is still in front of the
+                    # camera during the rewind. Say nothing, but keep the
+                    # clock alive: the fault only clears once this code has
+                    # been out of frame for --rewind-clear seconds, and that
+                    # is only measurable if it keeps being decoded while it is
+                    # there — so it is deliberately NOT carried forward.
+                    fault["seen"] = time.time()
+                    fault["in_frame"] = True
+                    continue
+
+                if fault["kind"] is not None:
+                    # Already stopped and being wound back. Winding the coil
+                    # in reverse walks rows that finished long ago past the
+                    # lens again, and once they fall outside the grace span
+                    # they read as codes from nowhere. That is the rewind
+                    # working, not a second fault: one fault at a time.
+                    handled[0].append(tuple(float(v) for v in det[:4]))
+                    continue
+
                 # A real code that belongs to no row inside the window: either
                 # the wrong label is on the web, or the window has been left
                 # far behind. Either way it is not something to tolerate.
@@ -1196,10 +1485,12 @@ def main():
                 window.note_unexpected(text, belongs)
                 if saver is not None:
                     saver.save(frame, det[:4], text)
+                _raise_fault("unexpected", text=text, belongs=belongs,
+                             seen=time.time())
+                print(f"[rewind] wind the coil back — this label stays "
+                      f"outlined in red until it is out of frame, then the "
+                      f"machine starts itself")
                 stop_machine(f"unexpected code ({belongs})")
-                # Carried forward like an accepted label so the same offending
-                # code is reported once while it is in view, not every frame.
-                handled[0].append(tuple(float(v) for v in det[:4]))
                 continue
 
             if status == RollingWindow.REPEAT:
@@ -1221,25 +1512,29 @@ def main():
                 # row open: the operator winds the coil back, the same labels
                 # come past again, and the row either completes or is judged
                 # a real defect.
-                if slot >= window.size - 1 and recheck["row"] is None:
+                if (slot >= window.size - 1 and recheck["row"] is None
+                        and fault["kind"] is None):
                     head_idx = window.start
                     if head_idx is not None and window.missing(head_idx):
                         _hold_head_for_recheck(head_idx)
 
                 for done_idx, _ in window.advance():
-                    if recheck["row"] == sheet.rows[done_idx].number:
-                        print(f"\n[recheck] row {sheet.rows[done_idx].number} "
-                              f"PASSED on re-inspection — every code read, "
-                              f"press START to carry on")
+                    passed = sheet.rows[done_idx].number
+                    if recheck["row"] == passed:
+                        print(f"\n[recheck] row {passed} PASSED on "
+                              f"re-inspection — every code read")
                         recheck["row"] = None
                         recheck["attempt"] = 0
+                        retire_row(done_idx, complete=True)
+                        _clear_fault(f"row {passed} read clean on the rewind")
+                        continue
                     retire_row(done_idx, complete=True)
 
     zb_reads = [0]           # labels rescued by the zbar fallback
-    # [(box, who)] for the frame being drawn: who is 'zxing', 'zbar' or
-    # 'fail'. A label skipped by the overlap carry-forward keeps the verdict
-    # it earned when it was actually decoded, so the colours hold steady
-    # instead of flickering as labels stop being re-read.
+    # [(box, who, text)] for the frame being drawn: who is 'zxing', 'zbar'
+    # or 'fail'. A label skipped by the overlap carry-forward keeps both the
+    # verdict and the payload it earned when it was actually decoded, so the
+    # overlay holds steady instead of flickering as labels stop being re-read.
     marks = [[]]
     DECODER_COLOUR = {"zxing": (80, 220, 80),      # green
                       "zbar":  (60, 200, 255),     # amber
@@ -1309,9 +1604,10 @@ def main():
                 print(f"[recheck]     {_tail(text, 44):<46}{verdict}")
 
         print(f"[recheck] STOPPED — wind the coil back so row {row_no} passes "
-              f"the camera again; its codes will be picked up automatically.")
-        print(f"[recheck] then press START: if it read clean the run carries "
-              f"on, if not the row is recorded as a label defect.")
+              f"the camera again; its codes are picked up as they come.")
+        print(f"[recheck] the screen shows which positions are still missing. "
+              f"Fill them all and the machine starts itself; press START with "
+              f"any still missing and the row is recorded as a label defect.")
         _dump_frame(f"row{row_no}-short")
         if args.no_stop_on_fail:
             # Nothing is going to come and look at this row, so writing it off
@@ -1322,6 +1618,7 @@ def main():
             if stale is not None:
                 retire_row(stale, complete=False)
             return
+        _raise_fault("short", row=row_no, row_idx=row_idx)
         stop_machine(f"row {row_no} short of {cols} — held for re-check")
 
     def _adjudicate_recheck():
@@ -1365,6 +1662,7 @@ def main():
                 if window.start is not None and not window.exhausted
                 else "end of sheet")
         print(f"[defect]  accepted — window moves on to row {head}")
+        _clear_fault(f"row {row_no} written off as a defect", restart=False)
 
     def retire_row(row_idx, complete):
         """A sheet row has left the window. Record it and log the verdict.
@@ -1495,24 +1793,53 @@ def main():
             # was pressed. Stopped, the detector still draws boxes but nothing
             # is decoded or held against the sheet — the operator is handling
             # the coil, and whatever drifts past the lens is not a verdict.
-            if validating():
+            # Cleared before the scan and set again by it, so it means
+            # "the offending code decoded on this frame", not "recently".
+            fault["in_frame"] = False
+            if scanning():
                 last_frame[0] = frame
                 scan_frame(frame, dets)
                 if (starting_at[0] is not None
                         and time.time() - starting_at[0] >= args.start_delay):
                     _finish_start()
 
+            # Rewinding after an unexpected code. There is no "it read clean"
+            # moment for this fault the way there is for a short row — the
+            # code is simply wrong — so what clears it is the offending label
+            # being wound out of shot and staying out.
+            if fault["kind"] == "unexpected" and not validating():
+                gone = time.time() - fault["seen"]
+                if not fault["in_frame"] and gone >= args.rewind_clear:
+                    key = normalize(fault["text"])
+                    if key in bounced:
+                        # It has already been let off once and come straight
+                        # back. Restarting again would just bounce the line
+                        # between stop and start with nobody in the loop.
+                        if not fault["warned"]:
+                            fault["warned"] = True
+                            print(f"\n[rewind] {_tail(fault['text'], 30)} has "
+                                  f"stopped the line twice — not restarting "
+                                  f"on its own. Press START to accept it, or "
+                                  f"take that label off the web.")
+                    else:
+                        bounced.add(key)
+                        _clear_fault(f"the unexpected code has been out of "
+                                     f"frame for {gone:.1f}s")
+
             frame = draw_detections(frame, dets, class_names)
-            if validating():
+            if scanning():
                 draw_decoders(frame)
             else:
                 marks[0] = []      # stopped: no verdicts, so no stale colours
+            draw_fault(frame)
             draw_window(frame, compact=True)
             if starting_at[0] is not None:
                 left = max(args.start_delay - (time.time() - starting_at[0]), 0)
                 cv2.putText(frame, f"READING LABELS… {left:.1f}s",
                             (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                             (0, 200, 255), 2, cv2.LINE_AA)
+            elif fault["kind"] is not None:
+                pass                     # the rewind banner says it instead
             elif not machine_running:
                 cv2.putText(frame, "IDLE — press START to validate and run",
                             (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
@@ -1533,6 +1860,8 @@ def main():
             if args.no_display:
                 passed = sum(1 for _, ok in window.done if ok)
                 held = f"  HELD row {recheck['row']}" if recheck["row"] else ""
+                if fault["kind"] is not None:
+                    held += f"  REWIND[{_fault_headline()}]"
                 if starting_at[0] is not None:
                     left = args.start_delay - (time.time() - starting_at[0])
                     held += f"  READ-IN {max(left, 0):.1f}s"
