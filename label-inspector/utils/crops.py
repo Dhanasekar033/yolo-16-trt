@@ -6,8 +6,9 @@ Files land in
 
 so a run against validation.xlsx fills labels/validation/. `root` is the
 folder the operator chose from the console and holds nothing but crops — the
-record that goes with them is written into the project instead. The payload is
-slugified — a QR carries a URL, and '/' and ':' can't go in a filename — but
+record that goes with them is written into the project instead. The crop is
+the detection box as it came off the model; `pad` widens it if a run asks for
+that, and nothing does by default. The payload is slugified — a QR carries a URL, and '/' and ':' can't go in a filename — but
 stays readable enough to match a file back to the code it holds.
 """
 
@@ -56,6 +57,8 @@ class LabelSaver:
         print(f"[crops] saving label crops to {self.dir}/")
 
     def _box(self, box, shape):
+        """The crop rectangle: the detection box, clipped to the frame, plus
+        `pad` if one was asked for. Nothing is padded by default."""
         h, w = shape[:2]
         x1, y1, x2, y2 = (float(v) for v in box[:4])
         px = max(int(round((x2 - x1) * self.pad)), self.min_pad)

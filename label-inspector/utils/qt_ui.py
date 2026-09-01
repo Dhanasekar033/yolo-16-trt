@@ -57,6 +57,10 @@ STATES = {
     # Not a rewind: nothing on the coil is going to fix it, the sheet has to
     # be changed. Different word, so the operator is not sent to the winder.
     "mismatch": ("WRONG SHEET", BAD),
+    # Labels are going past and not one of them reads.
+    "unread": ("NOT READING", BAD),
+    # A label came past with its code or its logo missing.
+    "incomplete": ("BAD LABEL", BAD),
     "idle": ("IDLE", MUTED),
 }
 
@@ -147,6 +151,7 @@ class VideoView(QtWidgets.QWidget):
         # Text is drawn at the widget's scale, not the picture's, so a
         # stretched window does not give bloated captions.
         self._inv = 1.0 / k if k else 1.0
+        self._draw_parts(p)
         self._draw_boxes(p)
         self._draw_tags(p)
         self._draw_fault(p)
@@ -158,6 +163,18 @@ class VideoView(QtWidgets.QWidget):
         f = QtGui.QFont(font)
         f.setPointSizeF(max(font.pointSizeF() * self._inv, 1.0))
         return f
+
+    def _draw_parts(self, p):
+        """The qr and the logo the model found inside each label.
+
+        Thin, uncaptioned and under the label boxes: they are there to show
+        what the detector has hold of, not to be read. A label outlined with
+        no logo box inside it is the picture of the fault this app stops for.
+        """
+        p.setBrush(Qt.NoBrush)
+        for x1, y1, x2, y2, rgb in self._snap.get("parts", ()):
+            p.setPen(QtGui.QPen(QtGui.QColor(*rgb), 1 * self._inv))
+            p.drawRect(QtCore.QRectF(x1, y1, x2 - x1, y2 - y1))
 
     def _draw_boxes(self, p):
         """One rectangle per label, in the colour of whatever decoded it, and
@@ -634,8 +651,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
         if state != self._state:
             self._state = state
             self._set_pill(state)
-            self.start_btn.setEnabled(state in ("idle", "rewind",
-                                                "mismatch"))
+            self.start_btn.setEnabled(state in ("idle", "rewind", "mismatch",
+                                                "unread", "incomplete"))
             self.stop_btn.setEnabled(self._running)
 
         self._recent = list(snap.get("recent") or ())
@@ -662,7 +679,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
         note = snap.get("note") or "Press START to read the labels and run."
         if self.status.text() != note:
             self.status.setText(note)
-            colour = BAD if state in ("rewind", "mismatch") else (
+            colour = BAD if state in ("rewind", "mismatch", "unread",
+                                      "incomplete") else (
                 WARN if state == "reading" else MUTED)
             self.status.setStyleSheet(f"color: {colour};")
 

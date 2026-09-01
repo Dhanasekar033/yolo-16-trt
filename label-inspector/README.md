@@ -30,6 +30,20 @@ a code is not written off — the line stops and the row is held open:
                                still short  -> LABEL HAS ISSUE, recorded as a
                                                defect, window moves past it
 
+The model detects three classes — `label`, `qr_code` and `logo`. The code is
+cropped with a quiet zone (`--qr-margin`) and handed to the reader; the logo
+is never decoded, it only has to be present. A label found without its code or
+its logo stops the line on that frame, marked in red on the picture, and the
+line restarts once it has been wound out of shot.
+
+A label that will not read at all is the quietest failure there is: it is not
+a match, not a repeat and not an unexpected code, so it moves no part of the
+machine. If labels keep coming past and not one of them gives up a code for
+`--no-read-secs` (1.5s), the line stops — the labels may carry no QR, or the
+lens or the light may have gone. It starts itself again the moment one label
+reads. A single blank row among readable ones is caught by the window
+instead, the same way any short row is.
+
 If **no** code read is anywhere in the sheet, the roll is not the one the
 sheet describes — a new roll went on and the sheet was not changed with it.
 The line stops before the relay is energised at all, the console reads WRONG
@@ -47,11 +61,11 @@ starts a fresh record and the run carries on normally.
     --window-size 8        how many sheet rows a code can still be recognised
                            from. Bigger tolerates more out-of-order arrival;
                            it no longer decides how long a short row runs on.
-    --label-aspect 1.2     least height/width for a detection to count as a
-                           label. Labels come past upright; the tamper strip
-                           across each one is landscape and the detector finds
-                           it too, so without this it shows up as a NO READ
-                           beside the real labels — or stops the line. 0 off.
+    --no-part-check        do not stop when a label is missing its QR or its
+                           logo. On by default: the model finds all three, so
+                           a missing part is caught on the label itself.
+    --no-read-secs 1.5     stop if labels are in frame this long and not one
+                           of them reads. 0 turns the watchdog off.
     --start-delay 2.0      seconds of reading after START before the relay
                            goes on. 0 = energise immediately.
     --xlsx validation.xlsx which sheet holds the expected QR DATA1..N codes.
@@ -79,7 +93,8 @@ The paperwork stays in the project, under `result/<sheet name>/`:
 
 The label crops go somewhere of their own, because they are bulk image data
 and they fill a disk: `--label-dir`, `labels/` by default, one folder per
-sheet and nothing in it but pictures:
+sheet and nothing in it but pictures. Each crop is the detection box exactly
+as the model drew it — nothing is padded unless `--label-pad` asks for it:
 
     <label-dir>/<sheet name>/    one JPEG per decoded label.
 

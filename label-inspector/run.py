@@ -29,6 +29,21 @@ reason for it is gone:
                                           stops the line twice it waits for a
                                           human)
 
+The model finds three things on the web: the label, the qr_code printed on it
+and the logo printed on it. All three are used. The code is what is cropped --
+with a quiet zone round it -- and handed to the reader; the logo is never
+decoded, it only has to be there. A label the model finds without one of its
+parts stops the line on the spot, before anything is read, because a label
+with no code cannot be validated at all and would otherwise pass for a row
+that merely came up short. --no-part-check turns that off.
+
+A label that will not read at all moves no part of this machine -- it is not
+a match, not a repeat, not an unexpected code, and it neither fills a cell nor
+empties one. A roll printed without codes, or a lens that has been knocked,
+would therefore wind through as a quiet, faultless run. --no-read-secs is the
+watchdog for that: labels in frame and not one code out of any of them stops
+the line, and one label reading starts it again.
+
 One fault does not clear itself, because nothing on the coil can clear it: if
 no code read has been in the sheet at all, the roll on the machine is not the
 one the sheet describes -- a new roll went on and the sheet was not changed
@@ -82,7 +97,6 @@ Usage:
     python3 run.py --no-display                     # headless
     python3 run.py --no-relay                       # vision only
     python3 run.py --debug                          # the diagnostic readout
-    python3 run.py --label-pad 0.25                 # wider saved crops
 
 Relays. 0 starts the winding machine and is the only one with any authority;
 the other two are followers, so a lamp, a beacon or a downstream interlock can
@@ -139,8 +153,10 @@ DEFAULT_CONF_LABEL = None   # None -> fall back to DEFAULT_CONF_THRES
 DEFAULT_CONF_QR    = None
 
 # ── QR decode config ─────────────────────────────────────────────────────────
-DEFAULT_LABEL_CLASS = "label"      # class whose crossing triggers a decode
-DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
+DEFAULT_ENGINE      = "best-new.engine"   # label + qr_code + logo
+DEFAULT_LABEL_CLASS = "label"      # the label itself: one per up, per row
+DEFAULT_QR_CLASS    = "qr_code"    # the code inside it, cropped and decoded
+DEFAULT_LOGO_CLASS  = "logo"       # the mark inside it, checked for presence
 DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
 
 # ── Validation / machine config ──────────────────────────────────────────────
@@ -506,7 +522,11 @@ def main():
                      help="print every payload as it reads and where it sits in "
                           "the sheet; without it only the per-row verdicts print.")
     # inference args
-    ap.add_argument("--engine", default="best.engine", help="path to .engine file")
+    ap.add_argument("--engine", default=None,
+                     help=f"path to the .engine file "
+                          f"(default: {DEFAULT_ENGINE} beside run.py). It is "
+                          f"expected to detect three classes: the label, the "
+                          f"qr_code inside it and the logo inside it.")
     ap.add_argument("--classes", default=None,
                      help="txt file, one class name per line "
                           "(default: classes.txt beside run.py, if present)")
@@ -525,6 +545,24 @@ def main():
                      help="class name that triggers a decode when it crosses the line.")
     ap.add_argument("--qr-class", default=DEFAULT_QR_CLASS,
                      help="class name of the QR box that gets cropped and decoded.")
+    ap.add_argument("--logo-class", default=DEFAULT_LOGO_CLASS,
+                     help="class name of the logo printed on each label. It "
+                          "is never decoded — what matters is that it is "
+                          "there.")
+    ap.add_argument("--part-looks", type=int, default=5,
+                     help="how many clear looks at one label before deciding "
+                          "a part is not printed on it. A clear look is a "
+                          "frame in which that label was whole and well "
+                          "inside the picture. The part has to be missing "
+                          "from every one of them: found even once, the "
+                          "label is settled and never looked at again. A "
+                          "detector drops a box now and then, so no smaller "
+                          "amount of evidence is worth stopping a line for.")
+    ap.add_argument("--no-part-check", action="store_true",
+                     help="do not stop when a label is missing its QR or its "
+                          "logo. Off by default: a label with no code cannot "
+                          "be validated at all, and one with no logo is a "
+                          "misprint whatever its code says.")
     ap.add_argument("--qr-margin", type=float, default=DEFAULT_QR_MARGIN,
                      help="quiet zone around the qr box, as a fraction of its size.")
     ap.add_argument("--qr-margin-min", type=int, default=8,
@@ -562,25 +600,13 @@ def main():
                      help="don't save a crop of each decoded label.")
     ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
                      help="image format for the saved label crops.")
-    ap.add_argument("--label-pad", type=float, default=0.18,
+    ap.add_argument("--label-pad", type=float, default=0.0,
                      help="padding around the saved label crop, as a fraction "
-                          "of the box size. The detector draws a box that is "
-                          "tight on the label, and at web speed a little "
-                          "motion smear puts the edge of the label outside "
-                          "it, so a crop with no margin comes out clipped. "
-                          "0 = the box exactly as detected.")
-    ap.add_argument("--label-aspect", type=float, default=1.2,
-                     help="least height/width a detection must have to be "
-                          "treated as a label. The labels come past the "
-                          "camera portrait; the tamper strip printed across "
-                          "each one is landscape, and the detector finds "
-                          "those too. They carry no QR, so they arrive as a "
-                          "NO READ that looks exactly like a real label the "
-                          "reader could not read -- and one of those is the "
-                          "sort of thing that stops a line for nothing. "
-                          "0 turns the test off (use it if the camera is not "
-                          "mounted so labels stand upright).")
-    ap.add_argument("--label-pad-px", type=int, default=24,
+                          "of the box size. Off by default: the crop is the "
+                          "detection box exactly, and so is everything else "
+                          "-- what the reader is handed, what is drawn, and "
+                          "what is matched from frame to frame.")
+    ap.add_argument("--label-pad-px", type=int, default=0,
                      help="least padding around a saved crop, in pixels, "
                           "whatever --label-pad works out to. Small boxes "
                           "need the margin most and get the least from a "
@@ -696,6 +722,15 @@ def main():
                           "has cleared on the rewind. By default the machine "
                           "restarts itself the moment the reason it stopped "
                           "is gone.")
+    ap.add_argument("--no-read-secs", type=float, default=1.5,
+                     help="stop the line if labels have been in front of the "
+                          "camera for this many seconds and not one of them "
+                          "has read. Everything this app decides is driven by "
+                          "a payload, so a label that decodes to nothing "
+                          "exercises nothing: a roll printed without codes, a "
+                          "lens that has been knocked or a light that has "
+                          "failed would otherwise wind through as a quiet, "
+                          "faultless run. 0 turns the watchdog off.")
     ap.add_argument("--rewind-clear", type=float, default=2.5,
                      help="seconds an unexpected code must stay out of frame "
                           "during a rewind before the fault counts as "
@@ -795,12 +830,23 @@ def main():
             return
         starting_at[0] = time.time()
         start_reason[0] = reason
+        # The read-in is its own chance to read something, so the watchdog
+        # starts counting again from here rather than from whenever the last
+        # payload happened to come in.
+        last_read[0] = time.time()
 
         # Pressing START while the fault is still live is the operator saying
         # they have looked at it and want the line to run regardless. A short
         # row settles itself in _finish_start once the read-in has had its
         # chance at it. An unexpected code has to be forgiven by name, or it
         # would stop the line again on the very next frame it decodes on.
+        if fault["kind"] == "incomplete":
+            # No payload to forgive by name, so it is forgiven by the clock:
+            # long enough for the web to carry that label out of frame.
+            waive_until[0] = time.time() + args.start_delay + args.rewind_clear
+            print(f"[label] operator accepted the incomplete label — it will "
+                  f"not stop the line again while it winds out of frame")
+            voice.say("Incomplete label accepted.", key="accepted-label")
         if fault["kind"] in ("unexpected", "mismatch") and fault["text"]:
             forgiven.add(normalize(fault["text"]))
             print(f"[rewind] operator accepted the unexpected code "
@@ -992,6 +1038,8 @@ def main():
             classes_path = beside
             print(f"[model] using {beside}")
     class_names = load_class_names(classes_path)
+    if args.engine is None:
+        args.engine = os.path.join(APP_DIR, DEFAULT_ENGINE)
     model = YOLO26TRT(args.engine, input_size=(args.imgsz, args.imgsz))
     print(f"[model] loaded {args.engine}")
 
@@ -1004,13 +1052,19 @@ def main():
     conf_per_class = {}
     label_cls = class_index(class_names, args.label_class, 0)
     qr_cls = class_index(class_names, args.qr_class, 1)
+    logo_cls = class_index(class_names, args.logo_class, 2)
+    named = {label_cls: args.label_class, qr_cls: args.qr_class,
+             logo_cls: args.logo_class}
     if args.conf_label is not None:
         conf_per_class[label_cls] = args.conf_label
     if args.conf_qr is not None:
         conf_per_class[qr_cls] = args.conf_qr
     print(f"[model] conf thresholds: default={args.conf_thres}"
-          + "".join(f"  {args.label_class if c == label_cls else args.qr_class}={v}"
+          + "".join(f"  {named.get(c, c)}={v}"
                     for c, v in conf_per_class.items()))
+    print(f"[model] classes: {args.label_class} (the label), "
+          f"{args.qr_class} (decoded), {args.logo_class} "
+          f"({'checked for presence' if not args.no_part_check else 'ignored'})")
 
     xlsx_path = journal_path = None      # set by _start_record
     journal = [None]         # append-only record; the durable source of truth
@@ -1554,6 +1608,9 @@ def main():
         with the rest of the debug readout.
         """
         font = cv2.FONT_HERSHEY_SIMPLEX
+        for box, kind in parts[0]:
+            x1, y1, x2, y2 = (int(v) for v in box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), PART_COLOUR[kind], 2)
         for box, who, text in marks[0]:
             x1, y1, x2, y2 = (int(v) for v in box)
             bad = _bad_label(box)
@@ -1677,6 +1734,12 @@ def main():
                        else "nothing"))
         if fault["kind"] == "unexpected":
             return f"unexpected {_tail(fault['text'], 20)}"
+        if fault["kind"] == "unread":
+            return "nothing is reading"
+        if fault["kind"] == "incomplete":
+            return f"label with no {(fault['belongs'] or '').lower()}"
+        if fault["kind"] == "mismatch":
+            return "wrong sheet for this roll"
         return ""
 
     def _bad_caption():
@@ -1686,7 +1749,11 @@ def main():
         different things: one label wound out of the roll, or the whole sheet
         changed.
         """
-        return "NOT IN SHEET" if fault["kind"] == "mismatch" else "WRONG LABEL"
+        if fault["kind"] == "mismatch":
+            return "NOT IN SHEET"
+        if fault["kind"] == "incomplete":
+            return f"NO {fault['belongs'] or 'PART'}"
+        return "WRONG LABEL"
 
     def _bad_label(box):
         """Is this the physical label that stopped the line?
@@ -1714,6 +1781,11 @@ def main():
             return None
         key = normalize(text or "")
         if not key and not _bad_label(box):
+            return None
+        if fault["kind"] == "incomplete":
+            if _bad_label(box):
+                return (f"NO {fault['belongs'] or 'PART'} - WIND THIS OUT",
+                        FAULT_RED)
             return None
         if fault["kind"] == "mismatch":
             if key == normalize(fault["text"] or "") or _bad_label(box):
@@ -1773,6 +1845,28 @@ def main():
                           "- then it starts itself", FAULT_TEXT, 0.7))
             lines.append((f"or press START to record row {fault['row']} as a "
                           f"label defect", FAULT_TEXT, 0.7))
+        elif fault["kind"] == "incomplete":
+            banner = f"LABEL WITH NO {fault['belongs'] or 'PART'}"
+            lines.append(("the model found the label but not its "
+                          f"{(fault['belongs'] or '').lower()}", FAULT_RED, 0.8))
+            lines.append(("it is outlined in red on the picture",
+                          FAULT_RED, 0.8))
+            lines.append(("wind the coil back and take that label out",
+                          FAULT_WANT, 0.85))
+            lines.append(("it starts itself once the label is out of frame",
+                          FAULT_TEXT, 0.7))
+            lines.append(("or press START to let this one past",
+                          FAULT_TEXT, 0.7))
+        elif fault["kind"] == "unread":
+            banner = "NOTHING IS READING"
+            lines.append((f"{fault['row']} label(s) in frame, no code out of "
+                          f"any of them", FAULT_RED, 0.8))
+            lines.append(("these labels may carry no QR at all - check one",
+                          FAULT_TEXT, 0.75))
+            lines.append(("then check the lens, the focus and the light",
+                          FAULT_TEXT, 0.75))
+            lines.append(("it starts itself as soon as one label reads",
+                          FAULT_WANT, 0.85))
         elif fault["kind"] == "mismatch":
             # No rewind for this one: there is nothing on the coil to wind
             # back to. What has to change is the sheet, or the roll.
@@ -1887,6 +1981,16 @@ def main():
             return
 
         qr_dets = [d for d in dets if int(d[5]) == qr_cls]
+        logo_dets = [d for d in dets if int(d[5]) == logo_cls]
+        parts[0] = ([(tuple(float(v) for v in d[:4]), "qr") for d in qr_dets]
+                    + [(tuple(float(v) for v in d[:4]), "logo")
+                       for d in logo_dets])
+        # Before the decoding, and on every label in view rather than only on
+        # the ones being decoded this frame: a label that read fine on the
+        # frame it came in on is skipped by the carry-forward below, and its
+        # logo would never be looked at.
+        _check_parts(frame, [d for d in dets if int(d[5]) == label_cls],
+                     qr_dets, logo_dets)
         zb_budget = [args.zbar_fallback]     # spent on this frame only
         settled = list(handled[0])       # labels dealt with on the last frame
         was = list(marks[0])             # last frame's verdicts, to carry over
@@ -1918,8 +2022,6 @@ def main():
         for det in dets:
             if int(det[5]) != label_cls:
                 continue
-            if not _upright(det[:4]):
-                continue      # not a label: see _upright
 
             # A label sits in view for many frames and would otherwise be
             # decoded on every one of them. Once its code has been accepted
@@ -1938,12 +2040,18 @@ def main():
                     continue         # rest of the labels wait for next frame
                 budget -= 1
 
+            # The model finds the code itself, so that is what goes to the
+            # reader: the qr box plus a quiet zone (--qr-margin), which is
+            # what a QR needs around it to be read at all. The whole label is
+            # the fallback for a label whose qr box was missed -- it holds
+            # the same symbol, just with the artwork and the print around it.
             qr = pick_qr_for_label(det[:4], qr_dets)
             who = "zxing"
-            text, box = decode_qr(frame, det[:4], margin=0.0, min_px=0)
-            if not text and qr is not None:
-                text, box = decode_qr(frame, qr[:4], args.qr_margin,
-                                      args.qr_margin_min)
+            text, box = (decode_qr(frame, qr[:4], args.qr_margin,
+                                   args.qr_margin_min)
+                         if qr is not None else (None, det[:4]))
+            if not text:
+                text, box = decode_qr(frame, det[:4], margin=0.0, min_px=0)
             if not text and zb_budget[0] > 0 and not _at_edge(det[:4], frame):
                 # zxing has exhausted every pass it has on a crop that is
                 # otherwise sound, so hand this one label to a decoder that
@@ -1951,8 +2059,10 @@ def main():
                 # is still skipped: part of the symbol was never on the
                 # sensor, and no library recovers that.
                 zb_budget[0] -= 1
-                text, box = decode_qr_pyzbar(frame, det[:4], margin=0.0,
-                                             min_px=0)
+                text, box = decode_qr_pyzbar(
+                    frame, qr[:4] if qr is not None else det[:4],
+                    args.qr_margin if qr is not None else 0.0,
+                    args.qr_margin_min if qr is not None else 0)
                 if text:
                     zb_reads[0] += 1
                     who = "zbar"
@@ -2152,6 +2262,151 @@ def main():
     # that repeats every few rows.
     credited = {}
     rewound = [0]            # times an already-signed-off code came past again
+    # A label is three things: the label, the code on it and the logo on it.
+    # The model finds all three, so a label with a part missing is visible as
+    # such before anything is decoded -- and it has to be, because a label
+    # with no code cannot be validated at all and would otherwise pass as a
+    # row that simply came up short.
+    waive_until = [0.0]      # the operator overruled: don't stop again yet
+    # One entry per label being watched, and what has been seen on it:
+    #
+    #   looks   frames in which that label was whole and well inside the
+    #           picture -- the only frames its printing can be judged from
+    #   qr      how many of those frames the code was found on
+    #   logo    how many of those frames the mark was found on
+    #
+    # A part found even once is a part that is printed: detectors drop boxes,
+    # labels do not grow logos. So what stops the line is a part that is
+    # never found at all, over enough looks that the detector cannot be the
+    # explanation -- not a part missing from any number of frames in a row.
+    tracks = []
+    EDGE_MARGIN = 12         # px of picture edge a label must stand clear of
+    PART_OF_FULL = 0.85      # of the median label height, to count as whole
+
+    def _clear_look(box, frame, full):
+        """Is this a frame the label's printing can be judged from?
+
+        Two ways it is not: the label is crossing the edge of the picture, or
+        its box came back shorter than the others' because part of it is
+        outside. Either way the parts that are 'missing' are missing from the
+        camera, not from the label.
+        """
+        return (not _at_edge(box, frame, EDGE_MARGIN)
+                and (full <= 0 or box[3] - box[1] >= full))
+
+    def _check_parts(frame, label_dets, qr_dets, logo_dets):
+        """Stop for a label that is genuinely short of its code or its mark.
+
+        The evidence is gathered over the whole time a label is in view and
+        the decision is made once there is enough of it.
+        """
+        if (args.no_part_check or not validating()
+                or fault["kind"] is not None
+                or time.time() < waive_until[0]):
+            tracks[:] = []       # nothing carries across a stop
+            return
+
+        # What a whole label looks like on this frame, from the labels
+        # themselves: a clipped one comes back shorter than its neighbours.
+        heights = sorted(float(d[3]) - float(d[1]) for d in label_dets)
+        full = (heights[len(heights) // 2] * PART_OF_FULL
+                if len(heights) >= 3 else 0.0)
+
+        live, claimed = [], set()
+        for det in label_dets:
+            box = tuple(float(v) for v in det[:4])
+            if not _clear_look(box, frame, full):
+                continue
+
+            # Which of the watched labels is this one? Best overlap, each
+            # claimed once, as everywhere else in this file.
+            best, score = None, 0.10
+            for i, t in enumerate(tracks):
+                if i in claimed:
+                    continue
+                overlap = _overlap(box, t["box"])
+                if overlap > score:
+                    best, score = i, overlap
+            if best is None:
+                t = {"box": box, "looks": 0, "qr": 0, "logo": 0}
+            else:
+                claimed.add(best)
+                t = tracks[best]
+                t["box"] = box
+            t["looks"] += 1
+            if pick_qr_for_label(box, qr_dets) is not None:
+                t["qr"] += 1
+            if pick_qr_for_label(box, logo_dets) is not None:
+                t["logo"] += 1
+            live.append(t)
+
+            missing = [name for name, seen in (("QR", t["qr"]),
+                                               ("LOGO", t["logo"]))
+                       if seen == 0]
+            if not missing or t["looks"] < max(1, args.part_looks):
+                continue
+
+            what = " and ".join(missing)
+            print(f"\n[label] INCOMPLETE LABEL: no {what.lower()} on it")
+            print(f"[label]   {t['looks']} clear looks at this label and the "
+                  f"{what.lower()} was not found on any of them "
+                  f"(qr {t['qr']}/{t['looks']}, logo {t['logo']}/{t['looks']})")
+            if saver is not None:
+                saver.save(frame, box, f"no-{what.lower().replace(' ', '-')}")
+            _raise_fault("incomplete", belongs=what, seen=time.time(),
+                         box=box)
+            voice.alert(f"A label has no {what.lower()}.",
+                        lead="Stopped. Incomplete label.",
+                        key=f"incomplete-{what}")
+            print(f"[rewind] wind the coil back and take that label out — it "
+                  f"stays outlined in red until it is out of frame, then the "
+                  f"machine starts itself")
+            stop_machine(f"label with no {what.lower()}")
+            tracks[:] = []
+            return
+        tracks[:] = live
+
+    # The web is only ever judged through payloads. A label that decodes to
+    # nothing is not a match, not a repeat and not an unexpected code; it
+    # fills no cell and empties none, so it moves no part of the machine. A
+    # whole roll of them therefore looks exactly like a clean idle web, and
+    # the line would wind the lot through. This is the watchdog for that.
+    last_read = [0.0]        # when a label with a payload was last in frame
+
+    def _reading():
+        """Is anything in front of the camera actually giving us a code?
+
+        Carried-forward labels count: a label read once and skipped on the
+        frames after is still a label that reads. Without that, a still coil
+        during the read-in would look like a blind camera.
+        """
+        return any(text for _b, _who, text in marks[0])
+
+    def _check_reading():
+        """Stop if labels keep coming past and none of them can be read."""
+        if args.no_read_secs <= 0 or not validating():
+            return
+        if fault["kind"] is not None:
+            return
+        if not marks[0] or _reading():
+            # An empty web is not a fault -- the roll may have run out, and
+            # that is a different thing from a roll that cannot be read.
+            last_read[0] = time.time()
+            return
+        blind = time.time() - last_read[0]
+        if blind < args.no_read_secs:
+            return
+        n = len(marks[0])
+        print(f"\n[window] NOTHING IS READING: {n} label(s) in frame and no "
+              f"code out of any of them for {blind:.1f}s")
+        print(f"[window]   either these labels carry no QR, or the camera "
+              f"has stopped seeing them — check the labels first, then the "
+              f"lens and the light")
+        _raise_fault("unread", seen=time.time(), row=n)
+        voice.alert("Check the labels and the camera.",
+                    lead="Stopped. Nothing is reading.", key="unread")
+        stop_machine(f"no label has read for {blind:.1f}s")
+
     def _track_bad_label():
         """Follow the offending label from frame to frame.
 
@@ -2160,7 +2415,7 @@ def main():
         marked on the frames where it reads as the printed code underneath,
         or does not read at all.
         """
-        if fault["kind"] not in ("unexpected", "mismatch") \
+        if fault["kind"] not in ("unexpected", "mismatch", "incomplete") \
                 or fault["box"] is None:
             return
         best, score = None, 0.20
@@ -2170,8 +2425,15 @@ def main():
                 best, score = box, overlap
         if best is not None:
             fault["box"] = best
+            if fault["kind"] == "incomplete":
+                # Still in view, wherever the winding has moved it to.
+                fault["in_frame"] = True
+                fault["seen"] = time.time()
 
     zb_reads = [0]           # labels rescued by the zbar fallback
+    # [(box, 'qr'|'logo')] for the frame being drawn: what the model found
+    # inside the labels.
+    parts = [[]]
     # [(box, who, text)] for the frame being drawn: who is 'zxing', 'zbar'
     # or 'fail'. A label skipped by the overlap carry-forward keeps both the
     # verdict and the payload it earned when it was actually decoded, so the
@@ -2180,26 +2442,17 @@ def main():
     DECODER_COLOUR = {"zxing": (80, 220, 80),      # green
                       "zbar":  (60, 200, 255),     # amber
                       "fail":  (60, 60, 235)}      # red
+    # The two things the model finds inside a label. Drawn thin, and in
+    # colours that are nobody else's, so the operator can see what the
+    # detector has actually got hold of -- which is the only way to tell a
+    # label that is short of a part from a detector that dropped a box.
+    PART_COLOUR = {"qr":   (255, 190, 60),         # light blue
+                   "logo": (230, 120, 255)}        # pink
 
-    def _upright(box):
-        """Is this detection shaped like a label standing on the web?
-
-        Everything this app decides -- a row short, a code from nowhere, a
-        roll that is not the sheet's -- rests on a box being a label. A
-        detection wider than it is tall is not one: on this machine that is
-        the tamper strip across the top of each label, which never decodes
-        and so cannot be told apart, once it is on screen, from a real label
-        that would not read.
-        """
-        if args.label_aspect <= 0:
-            return True
-        wide = max(float(box[2]) - float(box[0]), 1e-6)
-        tall = float(box[3]) - float(box[1])
-        return tall / wide >= args.label_aspect
-
-    def _at_edge(box, frame):
+    def _at_edge(box, frame, margin=2):
         h, w = frame.shape[:2]
-        return (box[0] <= 2 or box[1] <= 2 or box[2] >= w - 2 or box[3] >= h - 2)
+        return (box[0] <= margin or box[1] <= margin
+                or box[2] >= w - margin or box[3] >= h - margin)
 
     def _tail(text, n=46):
         """Payloads differ only at the end, so keep the tail, not the head."""
@@ -2509,6 +2762,10 @@ def main():
             return "reading"
         if fault["kind"] == "mismatch":
             return "mismatch"
+        if fault["kind"] == "unread":
+            return "unread"
+        if fault["kind"] == "incomplete":
+            return "incomplete"
         if fault["kind"] is not None:
             return "rewind"
         return "running" if machine_running else "idle"
@@ -2636,7 +2893,25 @@ def main():
                 _finish_start()
         else:
             marks[0] = []        # stopped: no verdicts, so no stale colours
+            parts[0] = []
         _track_bad_label()
+        _check_reading()
+
+        # Nothing was reading and now something is: the labels that could not
+        # be read have been wound out of shot, or whatever was in the way of
+        # the camera is gone. Nothing to adjudicate -- a code is a code.
+        if fault["kind"] == "unread" and not validating() and _reading():
+            last_read[0] = time.time()
+            _clear_fault("a label read again")
+
+        # An incomplete label clears the way a wrong one does: there is
+        # nothing to re-read, so what settles it is the label being wound out
+        # of shot and staying out.
+        if fault["kind"] == "incomplete" and not validating():
+            gone = time.time() - fault["seen"]
+            if not fault["in_frame"] and gone >= args.rewind_clear:
+                _clear_fault(f"the incomplete label has been out of frame "
+                             f"for {gone:.1f}s")
 
         # Rewinding after an unexpected code. There is no "it read clean"
         # moment for this fault the way there is for a short row — the code
@@ -2730,6 +3005,9 @@ def main():
                           _bad_caption() if bad else
                           _tail(text, 14) if text else "NO READ"))
 
+        part_boxes = [at(box) + (_rgb(PART_COLOUR[kind]),)
+                      for box, kind in parts[0]]
+
         tags = []
         banner = None
         lines = []
@@ -2746,7 +3024,8 @@ def main():
 
         return {
             "image": display_frame(frame),
-            "boxes": boxes, "tags": tags, "banner": banner, "lines": lines,
+            "boxes": boxes, "parts": part_boxes, "tags": tags,
+            "banner": banner, "lines": lines,
             "state": ui_state(), "note": _live_note(),
             "sheet": os.path.basename(args.xlsx),
             "sheet_dir": os.path.dirname(os.path.abspath(args.xlsx)),

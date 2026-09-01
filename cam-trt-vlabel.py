@@ -56,7 +56,7 @@ DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/2
 
 # ── Inference config ─────────────────────────────────────────────────────────
 DEFAULT_IMGSZ      = 640
-DEFAULT_CONF_THRES = 0.25
+DEFAULT_CONF_THRES = 0.1
 DEFAULT_LABEL_CLS  = 0       # "label" is the first line of classes.txt
 DEFAULT_MIN_ASPECT = 1.20    # height/width at or above which a label is vertical
 
