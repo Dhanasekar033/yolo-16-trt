@@ -1,0 +1,68 @@
+# label-inspector — what run.py needs on another machine.
+#
+#     python3 -m pip install -r requirements.txt
+#
+# Built and run on Python 3.12. Everything below installs from pip; the four
+# things that do NOT are listed at the bottom, and the app will not start
+# without them.
+
+# ── vision ───────────────────────────────────────────────────────────────
+# The camera is opened through a GStreamer pipeline (v4l2src ! image/jpeg !
+# ... ! appsink), and the wheel below is NOT built with GStreamer support.
+# On a machine with the camera attached, build OpenCV from source with
+# -D WITH_GSTREAMER=ON instead of installing this, and comment it out --
+# see the notes at the bottom. This wheel is enough to run --no-display
+# work, the tests, and anything that reads from a file.
+opencv-python==4.13.0.92
+numpy==2.4.6
+
+# ── decoding ─────────────────────────────────────────────────────────────
+zxing-cpp==3.1.1        # the primary reader
+pyzbar==0.1.9           # the fallback: needs libzbar0 from apt, see below
+
+# ── the sheet and the record ─────────────────────────────────────────────
+openpyxl==3.1.5
+
+# ── the machine ──────────────────────────────────────────────────────────
+pyserial==3.5           # the relay board, over USB serial
+
+# ── the console ──────────────────────────────────────────────────────────
+PyQt5==5.15.11          # --ui qt, the default. --ui opencv needs none of it.
+
+# ── the voice ────────────────────────────────────────────────────────────
+# Microsoft's en-IN neural voice. Every phrase is rendered once and cached on
+# disk, so the network is only needed the first time each one is spoken.
+# --no-voice runs silent and needs neither this nor ffmpeg.
+edge-tts==7.2.8
+
+# ── NOT installable from this file ───────────────────────────────────────
+#
+# 1. TensorRT and the CUDA runtime bindings. They come with the CUDA / JetPack
+#    install for that machine and must match its driver, so pinning them here
+#    would break more machines than it fixed. This build runs:
+#
+#        tensorrt==10.15.1.29
+#        cuda-python==12.4.0        (utils/trt_engine.py imports cuda.bindings,
+#                                    falling back to the older cuda.cudart)
+#
+#    An .engine file is also built for the exact GPU and TensorRT version it
+#    will run on: best-new.engine will not load on another card. Rebuild it
+#    there from the .onnx with trtexec.
+#
+# 2. OpenCV with GStreamer, if this machine has the camera on it. The pip
+#    wheel above has GStreamer OFF, and run.py opens the camera through a
+#    GStreamer pipeline. Build it from source (this machine runs 4.12.0 with
+#    GStreamer 1.24.2, GTK2 and v4l2), or the camera will not open.
+#
+# 3. System packages, from apt:
+#
+#        sudo apt install libzbar0 ffmpeg espeak-ng python3-tk
+#
+#    libzbar0    the zbar fallback decoder (pyzbar is only the binding)
+#    ffmpeg      trims the silence off each cached voice phrase
+#    espeak-ng   the offline voice, used when edge-tts cannot be reached
+#    python3-tk  the file dialogs in the --ui opencv console only
+#
+# 4. The model and the sheet: best-new.engine, classes.txt and the .xlsx are
+#    part of the install, not of pip. classes.txt must name the three classes
+#    in the engine's own order: label, qr_code, logo.

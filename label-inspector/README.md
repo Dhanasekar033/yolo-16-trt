@@ -32,9 +32,17 @@ a code is not written off — the line stops and the row is held open:
 
 The model detects three classes — `label`, `qr_code` and `logo`. The code is
 cropped with a quiet zone (`--qr-margin`) and handed to the reader; the logo
-is never decoded, it only has to be present. A label found without its code or
-its logo stops the line on that frame, marked in red on the picture, and the
-line restarts once it has been wound out of shot.
+is never decoded, it only has to be present. A label found without its code or its logo stops the line, marked in red on
+the picture, and the line restarts once it has been wound out of shot.
+
+Deciding that is deliberately slow, because a false stop on a good roll costs
+as much as a bad label let through. Only *clear looks* count — the label whole
+and well inside the picture. A part found even once is a part that is printed,
+and that label is never questioned again: detectors drop boxes, labels do not
+grow logos. A part missing from half the labels in the picture at once is the
+detector, the focus or the light, and counts against none of them. What is
+left — one label, over `--part-looks` (8) clear looks, short of something all
+of its neighbours have — is a label with a part missing.
 
 A label that will not read at all is the quietest failure there is: it is not
 a match, not a repeat and not an unexpected code, so it moves no part of the
@@ -61,6 +69,9 @@ starts a fresh record and the run carries on normally.
     --window-size 8        how many sheet rows a code can still be recognised
                            from. Bigger tolerates more out-of-order arrival;
                            it no longer decides how long a short row runs on.
+    --part-looks 8         clear looks at one label, all of them without a
+                           part, before the line stops for it. Raise it if the
+                           model drops boxes in long bursts.
     --no-part-check        do not stop when a label is missing its QR or its
                            logo. On by default: the model finds all three, so
                            a missing part is caught on the label itself.

@@ -33,9 +33,11 @@ The model finds three things on the web: the label, the qr_code printed on it
 and the logo printed on it. All three are used. The code is what is cropped --
 with a quiet zone round it -- and handed to the reader; the logo is never
 decoded, it only has to be there. A label the model finds without one of its
-parts stops the line on the spot, before anything is read, because a label
-with no code cannot be validated at all and would otherwise pass for a row
-that merely came up short. --no-part-check turns that off.
+parts stops the line, before anything is read, because a label with no code
+cannot be validated at all and would otherwise pass for a row that merely came
+up short. It takes --part-looks clear looks at one label, every one of them
+missing the same part, while its neighbours have it -- a dropped box is not a
+missing logo. --no-part-check turns the whole thing off.
 
 A label that will not read at all moves no part of this machine -- it is not
 a match, not a repeat, not an unexpected code, and it neither fills a cell nor
@@ -549,7 +551,7 @@ def main():
                      help="class name of the logo printed on each label. It "
                           "is never decoded — what matters is that it is "
                           "there.")
-    ap.add_argument("--part-looks", type=int, default=5,
+    ap.add_argument("--part-looks", type=int, default=8,
                      help="how many clear looks at one label before deciding "
                           "a part is not printed on it. A clear look is a "
                           "frame in which that label was whole and well "
@@ -2280,6 +2282,7 @@ def main():
     # never found at all, over enough looks that the detector cannot be the
     # explanation -- not a part missing from any number of frames in a row.
     tracks = []
+    PARTS = ("QR", "LOGO")   # every label carries both
     EDGE_MARGIN = 12         # px of picture edge a label must stand clear of
     PART_OF_FULL = 0.85      # of the median label height, to count as whole
 
@@ -2297,8 +2300,22 @@ def main():
     def _check_parts(frame, label_dets, qr_dets, logo_dets):
         """Stop for a label that is genuinely short of its code or its mark.
 
-        The evidence is gathered over the whole time a label is in view and
-        the decision is made once there is enough of it.
+        Three things stand between a dropped box and a stopped line, because
+        a false stop on a good roll costs as much as a missed bad label:
+
+          * only clear looks count -- the label whole and well inside the
+            picture, so nothing is judged on a label the camera has only
+            half of;
+          * a part found even once is a part that is printed, and that label
+            is never questioned again. Detectors drop boxes; labels do not
+            grow logos;
+          * a part missing from half the labels in the picture at once is the
+            detector, the focus or the light, not the labels. It counts
+            against nobody.
+
+        What is left -- one label, over --part-looks clear looks, short of
+        something every one of its neighbours has -- is a label with a part
+        missing.
         """
         if (args.no_part_check or not validating()
                 or fault["kind"] is not None
@@ -2312,12 +2329,31 @@ def main():
         full = (heights[len(heights) // 2] * PART_OF_FULL
                 if len(heights) >= 3 else 0.0)
 
-        live, claimed = [], set()
+        looks = []
         for det in label_dets:
             box = tuple(float(v) for v in det[:4])
             if not _clear_look(box, frame, full):
                 continue
+            missing = set()
+            if pick_qr_for_label(box, qr_dets) is None:
+                missing.add("QR")
+            if pick_qr_for_label(box, logo_dets) is None:
+                missing.add("LOGO")
+            looks.append((box, missing))
+        if not looks:
+            tracks[:] = []
+            return
 
+        # Half the labels short of the same part is a detector having a bad
+        # frame. Not evidence against any one of them, either way.
+        systemic = set()
+        if len(looks) >= 3:
+            systemic = {part for part in PARTS
+                        if sum(1 for _b, m in looks if part in m) * 2
+                        >= len(looks)}
+
+        live, claimed = [], set()
+        for box, missing in looks:
             # Which of the watched labels is this one? Best overlap, each
             # claimed once, as everywhere else in this file.
             best, score = None, 0.10
@@ -2328,40 +2364,44 @@ def main():
                 if overlap > score:
                     best, score = i, overlap
             if best is None:
-                t = {"box": box, "looks": 0, "qr": 0, "logo": 0}
+                t = {"box": box}
+                for part in PARTS:
+                    t[part] = [0, 0]      # [clear looks, times found]
             else:
                 claimed.add(best)
                 t = tracks[best]
                 t["box"] = box
-            t["looks"] += 1
-            if pick_qr_for_label(box, qr_dets) is not None:
-                t["qr"] += 1
-            if pick_qr_for_label(box, logo_dets) is not None:
-                t["logo"] += 1
             live.append(t)
 
-            missing = [name for name, seen in (("QR", t["qr"]),
-                                               ("LOGO", t["logo"]))
-                       if seen == 0]
-            if not missing or t["looks"] < max(1, args.part_looks):
+            short = None
+            for part in PARTS:
+                if part in systemic:
+                    continue              # this frame says nothing about it
+                t[part][0] += 1
+                if part not in missing:
+                    t[part][1] += 1
+                elif (t[part][1] == 0
+                      and t[part][0] >= max(1, args.part_looks)):
+                    short = part
+            if short is None:
                 continue
 
-            what = " and ".join(missing)
-            print(f"\n[label] INCOMPLETE LABEL: no {what.lower()} on it")
-            print(f"[label]   {t['looks']} clear looks at this label and the "
-                  f"{what.lower()} was not found on any of them "
-                  f"(qr {t['qr']}/{t['looks']}, logo {t['logo']}/{t['looks']})")
+            print(f"\n[label] INCOMPLETE LABEL: no {short.lower()} on it")
+            print(f"[label]   {t[short][0]} clear looks at this label and the "
+                  f"{short.lower()} was not found on any of them"
+                  + "".join(f", {p.lower()} {t[p][1]}/{t[p][0]}"
+                            for p in PARTS if p != short))
             if saver is not None:
-                saver.save(frame, box, f"no-{what.lower().replace(' ', '-')}")
-            _raise_fault("incomplete", belongs=what, seen=time.time(),
+                saver.save(frame, box, f"no-{short.lower()}")
+            _raise_fault("incomplete", belongs=short, seen=time.time(),
                          box=box)
-            voice.alert(f"A label has no {what.lower()}.",
+            voice.alert(f"A label has no {short.lower()}.",
                         lead="Stopped. Incomplete label.",
-                        key=f"incomplete-{what}")
+                        key=f"incomplete-{short}")
             print(f"[rewind] wind the coil back and take that label out — it "
                   f"stays outlined in red until it is out of frame, then the "
                   f"machine starts itself")
-            stop_machine(f"label with no {what.lower()}")
+            stop_machine(f"label with no {short.lower()}")
             tracks[:] = []
             return
         tracks[:] = live
