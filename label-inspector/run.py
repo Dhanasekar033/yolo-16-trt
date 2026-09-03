@@ -83,6 +83,37 @@ progress journal and the run log — always stays inside the project. The
 counters, the window's check status and the decoder tally are diagnostics and
 only appear with --debug, or when 'd' is pressed.
 
+No sheet is loaded at start-up, not even the one loaded last: which roll is
+on the machine is something only the operator knows, and a roll checked
+against somebody else's paperwork is worse than one not checked at all. START
+is dead until a sheet has been chosen.
+
+The winder's own AUTO/MANUAL selector is mirrored above START, and AUTO is
+the only position the start relay is ever closed in. MANUAL opens it at
+once, whatever the app was doing, and holds START dead: the coil is in
+somebody's hands. It opens in MANUAL every time and is never remembered,
+because a winder that could be energised on the strength of yesterday's
+choice is the hazard the switch exists to remove. That relay is the only
+one this app drives.
+
+Ctrl+Alt+E opens the camera: exposure, gain and brightness, stepped one at
+a time, applied as they change and remembered for next time
+(utils/camera.py, straight to V4L2). What the model can find is decided by
+the light in the frame, and a reel with more gloss or a lamp that has aged
+is a thing the operator has to be able to answer at the machine.
+Ctrl+Alt+W shows the diagnostics. Chords, not bare letters: this console
+gets leaned on and wiped down, and a single keystroke that opens a window
+over the live picture is one that will happen by accident.
+
+What belongs to an *installation* rather than to the code -- which camera,
+how big the picture is, which relay starts the motor, how long the read-in
+runs -- is in config.json beside the application, written out with every
+value in it on first run (utils/config.py). The command line still wins over
+it. That file is what makes this packageable with PyInstaller: nothing that
+changes from one machine to the next is compiled in, and the paths it
+resolves know the difference between where the app was unpacked and where
+the app actually lives.
+
 That console is Qt (utils/qt_ui.py): the chrome is widgets and the overlay is
 painted at display resolution, which is both quicker than burning it into a
 5MP frame sixty times a second and far easier to read. Qt owns the main
@@ -100,13 +131,14 @@ Usage:
     python3 run.py --no-relay                       # vision only
     python3 run.py --debug                          # the diagnostic readout
 
-Relays. 0 starts the winding machine and is the only one with any authority;
-the other two are followers, so a lamp, a beacon or a downstream interlock can
-be wired to either without this file knowing what is on the end of it:
+Relay. One, --start-relay 0, and it starts the winding machine. Nothing else
+on the board is touched: a second contact that follows the motor, or a third
+that follows a fault, is a thing to wire off the motor itself rather than a
+thing for this app to hold an opinion about. Fewer coils under software
+control is fewer coils that can be left closed by a crash.
 
-    --start-relay 0    the motor
-    --run-relay   1    ON for as long as the motor is running
-    --fault-relay 2    ON for as long as a fault is live
+It is closed only with the winder selector in AUTO, and opened the instant it
+leaves it.
 
 Sound. The operator's hands are on the coil and the screen is across the
 machine, so the console says out loud what happened and what to do about it --
@@ -127,8 +159,12 @@ import threading
 import time
 import cv2
 
+from utils.camera import CameraControls
+from utils.config import Config, app_dir
 from utils.crops import LabelSaver
-from utils.qr import decode_qr, decode_qr_pyzbar, pick_qr_for_label
+from utils.prepare import prepare as prepare_sheet
+from utils.qr import decode_qr, decode_qr_at, decode_qr_pyzbar, \
+    pick_qr_for_label, read_datamatrix
 from utils.relay import RelayController
 from utils.results import ResultLog
 from utils.settings import Settings
@@ -138,48 +174,44 @@ from utils.utils import preprocess, postprocess, draw_detections
 from utils.voice import Voice
 from utils.validation import ValidationSheet, normalize
 
-# ── Stream config (same defaults as cam_view.py) ────────────────────────────
-DEFAULT_CAM_INDEX = 0
-DEFAULT_WIDTH     = 2592
-DEFAULT_HEIGHT    = 1944
-DEFAULT_FPS       = 60       # MJPG supports 60fps at full 2592x1944; YUYV only
-                              # goes to 35fps at that size (see --list-formats-ext)
-DEFAULT_FORMAT    = "MJPG"
-DISPLAY_MAX_W     = 1280     # imshow window is capped to this width so a full
-DISPLAY_MAX_H     = 960      # -res frame doesn't overflow the screen
-DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/270
+# ── Everything an installation can be told ───────────────────────────────────
+# Read from config.json beside the application, with these defaults behind it
+# (utils/config.py holds them, and writes the file out on first run so an
+# operator can see and edit every one of them). The command line still wins
+# over both, so a shift can be run differently without editing anything.
+#
+# This is what makes the app packageable: nothing that has to change per
+# installation -- which camera, which relay, how big the picture is -- is
+# compiled in any more.
+CFG = Config()
+CAM, DISP, MODEL = CFG["camera"], CFG["display"], CFG["model"]
+DECODE, MACHINE, RELAY = CFG["decode"], CFG["machine"], CFG["relay"]
 
-# ── Inference config ─────────────────────────────────────────────────────────
-DEFAULT_IMGSZ      = 640
-DEFAULT_CONF_THRES = 0.45   # applies to any class without its own threshold
-DEFAULT_CONF_LABEL = None   # None -> fall back to DEFAULT_CONF_THRES
-DEFAULT_CONF_QR    = None
-
-# ── QR decode config ─────────────────────────────────────────────────────────
-DEFAULT_ENGINE      = "best-new.engine"   # label + qr_code + logo
-DEFAULT_LABEL_CLASS = "label"      # the label itself: one per up, per row
-DEFAULT_QR_CLASS    = "qr_code"    # the code inside it, cropped and decoded
-DEFAULT_LOGO_CLASS  = "logo"       # the mark inside it, checked for presence
-DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
-
-# ── Validation / machine config ──────────────────────────────────────────────
-# Where this app lives. The record it writes is part of the project, not
-# of whatever directory the app happened to be launched from, so both the
-# default sheet and the record root are anchored here.
-APP_DIR             = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_XLSX        = os.path.join(APP_DIR, "validation_x300.xlsx")
-DEFAULT_START_RELAY = 0                   # relay 0 = winding machine start
-DEFAULT_RUN_RELAY   = 1                   # relay 1 = ON while the motor runs
-DEFAULT_FAULT_RELAY = 2                   # relay 2 = ON while a fault is live
-DEFAULT_START_DELAY = 2.0                 # seconds of reading after START is
-                                          # pressed, before the relay goes on
+# Where this app lives: the directory the application sits in, which under
+# PyInstaller is not the same as the one the code was unpacked to. The
+# record it writes belongs beside the application, not in whatever directory
+# it happened to be launched from, and not in a temp folder that is deleted
+# on exit.
+APP_DIR             = app_dir()
+# There is deliberately no default sheet. A sheet is the description of one
+# roll, and a wrong one is worse than none: it would let the line run and
+# validate the coil against somebody else's paperwork. So the app starts with
+# nothing loaded and START stays dead until the operator says which sheet
+# this roll is.
+#
 # Two roots, because the two things a run writes belong in different
 # places. The record -- the checked .xlsx, progress.csv and the run logs
-# -- is the project's own paperwork and stays inside the project. The
+# -- is the project's own paperwork and stays beside the application. The
 # label crops are bulk image data that fills a disk, so they go wherever
 # the operator points them, and that choice is remembered between runs.
-DEFAULT_RESULT_DIR  = os.path.join(APP_DIR, "result")
-DEFAULT_LABEL_DIR   = os.path.join(APP_DIR, "labels")
+DEFAULT_RESULT_DIR  = CFG["paths"]["result_dir"] or "result"
+DEFAULT_LABEL_DIR   = CFG.get_path(CFG["paths"]["label_dir"]) or \
+    os.path.join(APP_DIR, "labels")
+GS_CAMERA_NAME      = CAM["name"]
+# Ups the voice is warmed up for before a sheet says how many there really
+# are. The console can open with no sheet loaded, and rendering a phrase at
+# the moment it is needed is the one thing the warm-up exists to avoid.
+MAX_UPS             = MACHINE["max_ups"]
 
 ROTATE_MAP = {
     0:   None,
@@ -211,7 +243,6 @@ def rotate_frame(frame, degrees):
     return frame if code is None else cv2.rotate(frame, code)
 
 
-GS_CAMERA_NAME = "Global Shutter Camera"
 WINDOW_VIEW = "Rolling window"
 
 
@@ -230,7 +261,7 @@ def list_cameras():
     return cams
 
 
-def find_camera_index(name_substring=GS_CAMERA_NAME, default=DEFAULT_CAM_INDEX):
+def find_camera_index(name_substring=GS_CAMERA_NAME, default=0):
     """Find the /dev/videoN index whose v4l2 name contains name_substring."""
     cams = list_cameras()
     for index, name in cams:
@@ -241,9 +272,8 @@ def find_camera_index(name_substring=GS_CAMERA_NAME, default=DEFAULT_CAM_INDEX):
     return default
 
 
-def gstreamer_pipeline(cam_index=DEFAULT_CAM_INDEX, width=DEFAULT_WIDTH,
-                        height=DEFAULT_HEIGHT, fps=DEFAULT_FPS, format=DEFAULT_FORMAT,
-                        rotate=0):
+def gstreamer_pipeline(cam_index=0, width=None, height=None, fps=None,
+                        format="MJPG", rotate=0):
     """Build a GStreamer pipeline string for v4l2src (MJPG or YUYV).
 
     `rotate` (0/90/180/270) is applied by videoflip inside the pipeline, so
@@ -359,6 +389,33 @@ class RollingWindow:
         if not hits:
             return self.UNKNOWN, None, None, None
         row_idx, col = min(hits, key=lambda h: h[0])   # nearest the head
+        # A datamatrix is printed several times over, and the working copy
+        # gives each printing a row of its own, so one payload legitimately
+        # holds a cell in each row of its group. The nearest one being
+        # ticked already does not make this a re-read: it is the next label
+        # along, carrying the same value on purpose. Take the first cell of
+        # the group that is still open, so the second and third printings
+        # are checked rather than swallowed — and so a printing that never
+        # came leaves its row short, which is the whole point of the check.
+        # The nearest copy is behind the head once the first printing has
+        # retired, and ticked already before it has; both ask the same
+        # question, which is whether a row of this group is still open.
+        group = self.sheet.rows[row_idx].group
+        if group is not None and (row_idx < self.start
+                                  or col in self.seen.get(row_idx, set())):
+            for cand_row, cand_col in sorted(hits):
+                if (cand_row >= self.start
+                        and self.sheet.rows[cand_row].group == group
+                        and cand_col not in self.seen.get(cand_row, set())):
+                    row_idx, col = cand_row, cand_col
+                    break
+            # Nothing open left in the group: every printing has been seen,
+            # so this is the last of them still standing in front of the
+            # lens. That falls through to the repeat path below, which is
+            # what it is. Payload is all there is to go on here -- three
+            # labels printed alike are alike -- so what keeps one label from
+            # ticking all three rows is the same carry-forward by overlap
+            # that stops any label being decoded twice.
         if row_idx < self.start:
             self.repeats += 1        # a finished row being read again
             return self.REPEAT, row_idx, col, None
@@ -420,6 +477,83 @@ def _overlap(a, b):
     area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
+
+
+def _clearance(label_box, symbol):
+    """Least gap between a symbol and the edges of a label, in pixels.
+
+    Negative when the symbol hangs outside. This is what tells the label a
+    code is printed on from a label that has merely swallowed its
+    neighbour's: a code on its own label sits inside it with room on every
+    side, while the same code seen from the label next door is jammed hard
+    against the edge it came over.
+    """
+    return min(symbol[0] - label_box[0], symbol[1] - label_box[1],
+               label_box[2] - symbol[2], label_box[3] - symbol[3])
+
+
+def _owns_symbol(label_box, symbol, label_dets):
+    """Is this symbol printed on this label, rather than on its neighbour?
+
+    Reading a whole label means reading whatever else falls inside its box,
+    and the labels on this web stand shoulder to shoulder with the code near
+    an edge. So a label with nothing printed on it can come back carrying
+    the code off the label beside it -- and a blank label wearing a payload
+    is worse than a blank label, because it passes.
+
+    Whichever label holds the symbol furthest from its own edges is the one
+    it is printed on. Nothing else in the running leaves it here, which is
+    the ordinary case: one label, its own code, no argument.
+    """
+    if symbol is None:
+        return True                # nothing to place; the crop is all we have
+    mine = _clearance(label_box, symbol)
+    for det in label_dets:
+        other = tuple(float(v) for v in det[:4])
+        if other == tuple(float(v) for v in label_box):
+            continue
+        if _clearance(other, symbol) > mine:
+            return False
+    return True
+
+
+def web_motion(boxes, previous):
+    """How far the web moved between two frames, in pixels: (dx, dy).
+
+    Every label in the picture is on the same web and moves together, so the
+    question is one number, not one per label -- and the median of what the
+    labels individually say is the way to get it without a stray box or a
+    label entering the frame pulling the answer about.
+
+    Matched by nearest centre rather than by overlap, because at the speed
+    this matters at the boxes no longer overlap -- which is exactly the
+    case the whole thing exists for. A match further than half a label is
+    refused: on a web of identical labels a pitch of travel looks precisely
+    like no travel at all, and guessing wrong there is worse than saying
+    nothing.
+    """
+    if not boxes or not previous:
+        return 0.0, 0.0
+    reach = max(min(b[2] - b[0] for b in boxes) * 0.5, 1.0)
+    dxs, dys = [], []
+    for x1, y1, x2, y2 in boxes:
+        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        best = None
+        for px1, py1, px2, py2 in previous:
+            dx = cx - (px1 + px2) * 0.5
+            dy = cy - (py1 + py2) * 0.5
+            far = abs(dx) + abs(dy)
+            if best is None or far < best[0]:
+                best = (far, dx, dy)
+        if best is not None and best[0] <= reach:
+            dxs.append(best[1])
+            dys.append(best[2])
+    if not dxs:
+        return 0.0, 0.0
+    dxs.sort()
+    dys.sort()
+    mid = len(dxs) // 2
+    return dxs[mid], dys[mid]
 
 
 def sheet_period(sheet, limit=400):
@@ -491,13 +625,13 @@ def main():
         description="Global Shutter Camera + YOLO26 TensorRT + rolling-window "
                     "QR validation, with re-inspection on any short row.")
     # camera args
-    ap.add_argument("--index", type=int, default=None,
+    ap.add_argument("--index", type=int, default=CAM["index"],
                      help="Force a /dev/videoN index (skips auto-detect).")
-    ap.add_argument("--width", type=int, default=DEFAULT_WIDTH)
-    ap.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
-    ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
-    ap.add_argument("--format", default=DEFAULT_FORMAT, choices=["MJPG", "YUYV"])
-    ap.add_argument("--rotate", type=int, default=DEFAULT_ROTATE, choices=[0, 90, 180, 270],
+    ap.add_argument("--width", type=int, default=CAM["width"])
+    ap.add_argument("--height", type=int, default=CAM["height"])
+    ap.add_argument("--fps", type=int, default=CAM["fps"])
+    ap.add_argument("--format", default=CAM["format"], choices=["MJPG", "YUYV"])
+    ap.add_argument("--rotate", type=int, default=CAM["rotate"], choices=[0, 90, 180, 270],
                      help="Rotate every frame by a fixed angle (clockwise).")
     ap.add_argument("--ui", default="qt", choices=["qt", "opencv"],
                      help="which console. 'qt' is a real window: the chrome "
@@ -527,32 +661,32 @@ def main():
     # inference args
     ap.add_argument("--engine", default=None,
                      help=f"path to the .engine file "
-                          f"(default: {DEFAULT_ENGINE} beside run.py). It is "
+                          f"(default: {MODEL['engine']} beside the app). It is "
                           f"expected to detect three classes: the label, the "
                           f"qr_code inside it and the logo inside it.")
     ap.add_argument("--classes", default=None,
                      help="txt file, one class name per line "
                           "(default: classes.txt beside run.py, if present)")
-    ap.add_argument("--conf-thres", type=float, default=DEFAULT_CONF_THRES,
+    ap.add_argument("--conf-thres", type=float, default=MODEL["conf"],
                      help="confidence threshold for classes without their own.")
-    ap.add_argument("--conf-label", type=float, default=DEFAULT_CONF_LABEL,
+    ap.add_argument("--conf-label", type=float, default=MODEL["conf_label"],
                      help="confidence threshold for the label class — this is "
                           "what gates a trigger-line crossing.")
-    ap.add_argument("--conf-qr", type=float, default=DEFAULT_CONF_QR,
+    ap.add_argument("--conf-qr", type=float, default=MODEL["conf_qr"],
                      help="confidence threshold for the qr class — this is what "
                           "gates which box gets cropped and decoded.")
-    ap.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    ap.add_argument("--imgsz", type=int, default=MODEL["imgsz"])
     ap.add_argument("--save", default=None, help="optional path to record annotated video")
     # qr decode args
-    ap.add_argument("--label-class", default=DEFAULT_LABEL_CLASS,
+    ap.add_argument("--label-class", default=MODEL["label_class"],
                      help="class name that triggers a decode when it crosses the line.")
-    ap.add_argument("--qr-class", default=DEFAULT_QR_CLASS,
+    ap.add_argument("--qr-class", default=MODEL["qr_class"],
                      help="class name of the QR box that gets cropped and decoded.")
-    ap.add_argument("--logo-class", default=DEFAULT_LOGO_CLASS,
+    ap.add_argument("--logo-class", default=MODEL["logo_class"],
                      help="class name of the logo printed on each label. It "
                           "is never decoded — what matters is that it is "
                           "there.")
-    ap.add_argument("--part-looks", type=int, default=8,
+    ap.add_argument("--part-looks", type=int, default=MACHINE["part_looks"],
                      help="how many clear looks at one label before deciding "
                           "a part is not printed on it. A clear look is a "
                           "frame in which that label was whole and well "
@@ -566,11 +700,13 @@ def main():
                           "logo. Off by default: a label with no code cannot "
                           "be validated at all, and one with no logo is a "
                           "misprint whatever its code says.")
-    ap.add_argument("--qr-margin", type=float, default=DEFAULT_QR_MARGIN,
+    ap.add_argument("--qr-margin", type=float, default=DECODE["qr_margin"],
                      help="quiet zone around the qr box, as a fraction of its size.")
-    ap.add_argument("--qr-margin-min", type=int, default=8,
+    ap.add_argument("--qr-margin-min", type=int,
+                     default=DECODE["qr_margin_min"],
                      help="minimum quiet zone in pixels.")
-    ap.add_argument("--zbar-fallback", type=int, default=2,
+    ap.add_argument("--zbar-fallback", type=int,
+                     default=DECODE["zbar_fallback"],
                      help="how many labels per frame may fall back to zbar "
                           "after zxing has failed on them. zxing and zbar do "
                           "not fail on the same codes, and the gap is not "
@@ -604,21 +740,39 @@ def main():
     ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
                      help="image format for the saved label crops.")
     ap.add_argument("--label-pad", type=float, default=0.0,
-                     help="padding around the saved label crop, as a fraction "
-                          "of the box size. Off by default: the crop is the "
-                          "detection box exactly, and so is everything else "
-                          "-- what the reader is handed, what is drawn, and "
-                          "what is matched from frame to frame.")
+                     help="fixed padding around the saved label crop, as a "
+                          "fraction of the box size, on every side. Only for "
+                          "a run that wants one: left to itself the crop "
+                          "takes half the gutter it can actually see either "
+                          "side of the label, measured off the labels next to "
+                          "it, which is what keeps a code the detection box "
+                          "clipped from being cut out of the picture. Setting "
+                          "this replaces that.")
     ap.add_argument("--label-pad-px", type=int, default=0,
                      help="least padding around a saved crop, in pixels, "
                           "whatever --label-pad works out to. Small boxes "
                           "need the margin most and get the least from a "
-                          "fraction.")
+                          "fraction. Setting either one replaces the measured "
+                          "margin described above.")
     # validation args
-    ap.add_argument("--xlsx", default=DEFAULT_XLSX,
-                     help="xlsx holding the expected QR DATA1..N sequence.")
+    ap.add_argument("--xlsx", default=None,
+                     help="xlsx holding the expected QR DATA1..N sequence. "
+                          "There is no default: without one the console opens "
+                          "with no sheet and START is dead until LOAD SHEET "
+                          "or OPEN RECENT SHEET has been used, because a roll "
+                          "checked against the wrong paperwork is worse than "
+                          "one not checked at all.")
     ap.add_argument("--sheet", default=None,
                      help="worksheet name inside --xlsx (default: the first one).")
+    ap.add_argument("--dm-repeats", type=int, default=MACHINE["dm_repeats"],
+                     help="how many times each DATA MATRIX value is printed "
+                          "down the web. Every value in a DATA MATRIX<n> "
+                          "column is printed on labels of its own, this many "
+                          "in a row, after the QR labels of the row it is "
+                          "listed against — so on load the sheet is copied "
+                          "and each of those becomes this many rows of its "
+                          "own. The copy is what the machine checks against; "
+                          "the operator's file is never written to.")
     ap.add_argument("--labels-per-row", type=int, default=None,
                      help="ups across the web (default: the number of QR DATA "
                           "columns found in the sheet).")
@@ -632,14 +786,16 @@ def main():
                           "validation (default: stop it).")
     ap.add_argument("--no-result-log", action="store_true",
                      help="don't write the per-row CSV of verdicts.")
-    ap.add_argument("--window-size", type=int, default=8,
+    ap.add_argument("--window-size", type=int,
+                     default=MACHINE["window_size"],
                      help="how many sheet rows the rolling window holds. "
                           "Bigger tolerates more out-of-order arrival and more "
                           "missed rows; smaller catches a stray label sooner. "
                           "This is how far a code may be recognised from, not "
                           "how long a short row is tolerated — that is "
                           "--hold-after.")
-    ap.add_argument("--hold-after", type=int, default=2,
+    ap.add_argument("--hold-after", type=int,
+                     default=MACHINE["hold_after"],
                      help="how far past an incomplete row the coil may move "
                           "before the line stops and that row is held open "
                           "for a re-check, in sheet rows. 1 stops at the very "
@@ -676,45 +832,36 @@ def main():
     # relay args
     ap.add_argument("--no-relay", action="store_true",
                      help="don't touch the relay board (vision only).")
-    ap.add_argument("--relay-port", default=None,
+    ap.add_argument("--relay-port", default=RELAY["port"],
                      help="serial port of the relay board (default: auto-detect).")
-    ap.add_argument("--start-delay", type=float, default=DEFAULT_START_DELAY,
+    ap.add_argument("--start-delay", type=float, default=MACHINE["start_delay"],
                      help="seconds to spend reading the labels already in "
                           "front of the camera after START is pressed, before "
                           "the relay is switched on. This is what validates "
                           "the coil at the position it is actually in — and "
                           "what re-checks a row that was held open. 0 = "
                           "energise immediately.")
-    ap.add_argument("--start-relay", type=int, default=DEFAULT_START_RELAY,
-                     help="relay that starts the winding machine.")
-    ap.add_argument("--run-relay", type=int, default=DEFAULT_RUN_RELAY,
-                     help="relay held ON for as long as the motor is "
-                          "running, for a running lamp or a downstream "
-                          "interlock. It follows the motor exactly, including "
-                          "through a fault stop. -1 to leave it alone.")
-    ap.add_argument("--fault-relay", type=int, default=DEFAULT_FAULT_RELAY,
-                     help="relay held ON for as long as a fault is live, for "
-                          "a beacon or a hooter. It goes on the moment the "
-                          "line stops on a fault and off when the fault "
-                          "clears -- on the rewind, or when the operator "
-                          "overrules it with START. -1 to leave it alone.")
+    ap.add_argument("--start-relay", type=int, default=RELAY["start"],
+                     help="the one relay this app drives: it starts the "
+                          "winding machine, and it is only ever closed with "
+                          "the winder in AUTO.")
     ap.add_argument("--relay-verbose", action="store_true",
                      help="print every modbus frame sent to the relay board.")
     ap.add_argument("--no-voice", action="store_true",
                      help="do not speak. By default the console says what "
                           "happened and what to do about it, because the "
                           "operator is at the coil rather than at the screen.")
-    ap.add_argument("--voice-engine", default="auto",
+    ap.add_argument("--voice-engine", default=CFG["voice"]["engine"],
                      choices=["auto", "edge", "espeak"],
                      help="how the prompts are spoken. 'edge' is Microsoft's "
                           "en-IN neural voice, which sounds like a person; "
                           "'espeak' is the offline formant synthesiser, which "
                           "does not. 'auto' uses edge when it can be reached "
                           "or has been cached, and espeak when it cannot.")
-    ap.add_argument("--voice-name", default=None,
+    ap.add_argument("--voice-name", default=CFG["voice"]["name"],
                      help="which voice: female (Neerja), male (Prabhat), "
                           "expressive, or any edge-tts voice name in full.")
-    ap.add_argument("--voice-rate", type=int, default=10,
+    ap.add_argument("--voice-rate", type=int, default=CFG["voice"]["rate"],
                      help="speaking rate as a percentage off normal, e.g. 15 "
                           "for a little quicker, -10 for slower.")
     ap.add_argument("--no-tone", action="store_true",
@@ -725,7 +872,8 @@ def main():
                           "has cleared on the rewind. By default the machine "
                           "restarts itself the moment the reason it stopped "
                           "is gone.")
-    ap.add_argument("--no-read-secs", type=float, default=1.5,
+    ap.add_argument("--no-read-secs", type=float,
+                     default=MACHINE["no_read_secs"],
                      help="stop the line if labels have been in front of the "
                           "camera for this many seconds and not one of them "
                           "has read. Everything this app decides is driven by "
@@ -734,7 +882,8 @@ def main():
                           "lens that has been knocked or a light that has "
                           "failed would otherwise wind through as a quiet, "
                           "faultless run. 0 turns the watchdog off.")
-    ap.add_argument("--rewind-clear", type=float, default=2.5,
+    ap.add_argument("--rewind-clear", type=float,
+                     default=MACHINE["rewind_clear"],
                      help="seconds an unexpected code must stay out of frame "
                           "during a rewind before the fault counts as "
                           "cleared and the machine restarts itself.")
@@ -752,14 +901,21 @@ def main():
         args.label_dir = prefs.label_dir or DEFAULT_LABEL_DIR
     else:
         prefs.remember_label_dir(args.label_dir)
-    if args.xlsx == DEFAULT_XLSX and prefs.sheet:
-        args.xlsx = prefs.sheet     # reopen the sheet that was last loaded
-        print(f"[settings] reopening the last sheet: {args.xlsx}")
+    # The sheet that was loaded last is offered, not reopened. Which roll is
+    # on the machine is something only the operator knows, and a sheet that
+    # loads itself is one nobody chose: the console lists it under OPEN
+    # RECENT SHEET and waits to be told.
+    if args.xlsx is None and prefs.recent:
+        print(f"[settings] {len(prefs.recent)} sheet(s) loaded before — the "
+              f"most recent is {prefs.sheet}")
 
     # ── the expected sheet, and the window over it ───────────────────────
     # Loaded through a function rather than inline, because the operator can
     # load a different sheet from the console without restarting the app.
+    # All None until one is chosen: nothing is read, nothing is recorded and
+    # START does nothing while there is no sheet to check the roll against.
     sheet = window = per_row = checked = None
+    work_xlsx = [None]           # the expanded copy the window runs against
     # How many rows the coil may move past a row that has not read everything
     # before the line is stopped for it. Kept here rather than read straight
     # off args because the window can be shrunk by a repeating sheet, and this
@@ -767,9 +923,39 @@ def main():
     hold_after = [1]
 
     def _open_sheet():
-        """Read args.xlsx and build the rolling window over it."""
+        """Read args.xlsx and build the rolling window over it.
+
+        What the window actually runs against is the working copy: the same
+        sheet with every DATA MATRIX value expanded into rows of its own, one
+        per printing, because those are physical rows of labels on the coil
+        that the operator's sheet has nowhere to put. utils/prepare.py writes
+        it, beside the record for this sheet, and never touches the original.
+        """
         nonlocal sheet, per_row, checked, window
-        sheet = ValidationSheet(args.xlsx, args.sheet)
+        run_dir = os.path.join(
+            args.result_dir,
+            os.path.splitext(os.path.basename(args.xlsx))[0])
+        try:
+            work_xlsx[0] = prepare_sheet(args.xlsx, run_dir, sheet=args.sheet,
+                                         repeats=args.dm_repeats)
+        except Exception as exc:
+            # Never fatal: this runs on the capture thread, from a button
+            # press, and a sheet that cannot be expanded must not take the
+            # console down with it. Running against the sheet unexpanded is
+            # the safe direction — the datamatrix labels then belong to no
+            # row, which stops the line rather than passing them.
+            print(f"\n[prepare] could not expand {args.xlsx}: {exc}")
+            print(f"[prepare]   running against it unexpanded — if it has "
+                  f"datamatrix rows the line will stop at them as unexpected "
+                  f"codes")
+            work_xlsx[0] = args.xlsx
+        sheet = ValidationSheet(work_xlsx[0], args.sheet)
+        # The reader only looks for a datamatrix on a roll that has one: it
+        # is another format for zxing to try on every crop that will not
+        # read, and most rolls carry none.
+        if read_datamatrix(sheet.has_dm):
+            print(f"[qr] the reader is {'now' if sheet.has_dm else 'no longer'}"
+                  f" looking for a datamatrix as well as a QR")
         per_row = args.labels_per_row or sheet.per_row
         checked = parse_check(args.check, per_row)
         if checked is None:
@@ -800,17 +986,49 @@ def main():
               f"(+{window.grace} kept behind for re-reads); every QR in frame "
               f"is matched on its own, order does not matter")
 
-    _open_sheet()
-    print(f"[window] a row that comes up short stops the line and is held "
-          f"open — wind the coil back and the screen shows what is still "
-          f"missing; fill it and the machine starts itself")
-    print(f"[window] the line stops as soon as the coil has moved "
-          f"{hold_after[0]} row(s) past a row that did not read everything")
-    if args.no_auto_restart:
-        print(f"[window] --no-auto-restart: a cleared fault still waits for "
-              f"START")
+    if args.xlsx:
+        try:
+            _open_sheet()
+        except Exception as exc:
+            # A sheet named on the command line that will not open -- moved,
+            # deleted, on a stick that is not in, not a workbook at all. That
+            # is no longer a reason to die: opening with no sheet is a state
+            # this console has, and the operator can load the right one from
+            # the buttons without being sent back to a terminal.
+            print(f"\n[window] cannot use {args.xlsx}: {exc}")
+            print(f"[window]   starting with no sheet — LOAD SHEET, or OPEN "
+                  f"RECENT SHEET, for the one this roll needs")
+            args.xlsx = None
+            sheet = window = None
+    if args.xlsx:
+        print(f"[window] a row that comes up short stops the line and is held "
+              f"open — wind the coil back and the screen shows what is still "
+              f"missing; fill it and the machine starts itself")
+        print(f"[window] the line stops as soon as the coil has moved "
+              f"{hold_after[0]} row(s) past a row that did not read everything")
+        if args.no_auto_restart:
+            print(f"[window] --no-auto-restart: a cleared fault still waits "
+                  f"for START")
+    else:
+        print(f"[window] no sheet loaded — LOAD SHEET for this roll's xlsx, "
+              f"or OPEN RECENT SHEET for one that has been run before. "
+              f"Nothing is read and START does nothing until then.")
+
+    def loaded():
+        """Is there a sheet to check the roll against?"""
+        return window is not None
 
     machine_running = False
+    # The winder's mode, as the console shows it. AUTO is the only position
+    # this app may close the start relay in; MANUAL means the operator has
+    # the coil in their hands, and a motor that could start itself while
+    # they do is the hazard the switch exists to remove.
+    #
+    # It opens in MANUAL, every time, and is never remembered between runs.
+    # An app that came back up in AUTO would be an app that can energise a
+    # winder because of something somebody chose yesterday, and the point of
+    # the switch is that it is chosen now, by whoever is standing there.
+    winder_auto = [False]
     # When START was pressed, or None when it was not. Between that moment and
     # --start-delay seconds later the camera is reading but the relay is still
     # off: the coil is standing still in front of the lens, which is the one
@@ -830,6 +1048,22 @@ def main():
         first would drag them out of frame before they could be checked.
         """
         if machine_running or starting_at[0] is not None:
+            return
+        if not loaded():
+            # Nothing to check the roll against, so there is nothing this
+            # machine could do but wind a coil through unvalidated — which is
+            # the one thing it exists to prevent.
+            print("[ui] no sheet loaded — LOAD SHEET (or OPEN RECENT SHEET) "
+                  "before starting")
+            _note[0] = "Load the sheet for this roll before starting"
+            voice.say("Load a sheet first.", key="no-sheet")
+            return
+        if not winder_auto[0]:
+            # The winder is on hand control. Its motor is the operator's, and
+            # nothing this app does may take it back off them.
+            print("[ui] the winder is in MANUAL — put it in AUTO to run")
+            _note[0] = "Winder is in MANUAL — switch to AUTO to run"
+            voice.say("Put the winder in auto.", key="manual")
             return
         starting_at[0] = time.time()
         start_reason[0] = reason
@@ -883,15 +1117,11 @@ def main():
         if fault["kind"] is not None:
             fault.update(_NO_FAULT)
 
-        _aux(args.fault_relay, False)     # settled above, either way
         relay.on(args.start_relay)
-        _aux(args.run_relay, True)
         machine_running = True
         _note[0] = None
         print(f"[relay] winding machine STARTED ({start_reason[0]}) "
-              f"— relay {args.start_relay} ON"
-              + (f", run relay {args.run_relay} ON"
-                 if args.run_relay >= 0 else ""))
+              f"— relay {args.start_relay} ON")
         voice.say("Machine running.", key="running")
 
     def stop_machine(reason="operator"):
@@ -901,7 +1131,6 @@ def main():
         if not machine_running and not aborted:
             return
         relay.off(args.start_relay)
-        _aux(args.run_relay, False)
         machine_running = False
         _note[0] = reason
         what = "start ABORTED" if aborted and not machine_running else "STOPPED"
@@ -911,6 +1140,32 @@ def main():
         # raised; this is only for the ordinary stops.
         if fault["kind"] is None:
             voice.say("Machine stopped.", key="stopped")
+
+    def set_winder(auto):
+        """AUTO or MANUAL, from the console's toggle.
+
+        Going to MANUAL is a stop, not a mode change to be applied later:
+        the operator is reaching for the coil now. The relay opens before
+        anything else happens, and a run part-way through its read-in is
+        abandoned with it.
+        """
+        auto = bool(auto)
+        if auto == winder_auto[0]:
+            return
+        winder_auto[0] = auto
+        if auto:
+            print("\n[winder] AUTO — the line may be started from the console")
+            _note[0] = None
+            voice.say("Winder in auto.", key="winder-auto")
+            return
+        print("\n[winder] MANUAL — the coil is on hand control")
+        stop_machine("winder switched to manual")
+        # stop_machine only opens the relay when something was running. This
+        # is a mode, not a stop: whatever the app believed, the relay is
+        # open from here until AUTO is chosen again.
+        relay.off(args.start_relay)
+        _note[0] = "Winder in MANUAL — START is off"
+        voice.say("Winder in manual.", key="winder-manual")
 
     def scanning():
         """Codes are read when running, when starting — and while a fault is
@@ -925,7 +1180,6 @@ def main():
         """Record why the line stopped, which puts it into rewind mode."""
         fault.update(_NO_FAULT)
         fault.update(kind=kind, since=time.time(), **kw)
-        _aux(args.fault_relay, True)
 
     def _clear_fault(why, restart=True):
         """The reason for the stop is gone. Let the machine go by itself.
@@ -939,7 +1193,6 @@ def main():
             return
         was = fault["kind"]
         fault.update(_NO_FAULT)
-        _aux(args.fault_relay, False)
         print(f"\n[rewind] fault cleared — {why}")
         if not restart:
             return
@@ -981,36 +1234,21 @@ def main():
               "it off the coil.",
               "Fault cleared. Press start.",
               "Wrong label accepted.",
+              "Load a sheet first.",
+              "Put the winder in auto.",
+              "Winder in auto.",
+              "Winder in manual.",
               "Label defect."] + \
-             [f"Up {i} found." for i in range(1, per_row + 1)]
+             [f"Up {i} found." for i in range(1, (per_row or MAX_UPS) + 1)]
 
     voice = Voice(enabled=not args.no_voice, engine=args.voice_engine,
                   name=args.voice_name, rate=args.voice_rate,
                   tone=not args.no_tone, warm=SPOKEN)
 
-    def _aux(which, on):
-        """Drive one of the two follower relays, if it is configured.
-
-        They carry no logic of their own: the run relay mirrors the motor and
-        the fault relay mirrors the fault, so a lamp, a beacon or a downstream
-        interlock can be wired to either without this file knowing what is on
-        the other end.
-        """
-        if which is None or which < 0:
-            return
-        # Every frame on the wire costs the capture loop 150ms waiting for the
-        # board to answer, so only send one when the coil is not already
-        # where it is being asked to go.
-        if relay.states.get(which) is bool(on):
-            return
-        relay.on(which) if on else relay.off(which)
-
-    # A previous run that was killed rather than closed can leave a coil
+    # A previous run that was killed rather than closed can leave the motor
     # energised, so start from a state this file knows rather than inheriting
-    # a lamp that is on for no reason.
+    # a coil that is on for no reason.
     relay.off(args.start_relay)
-    _aux(args.run_relay, False)
-    _aux(args.fault_relay, False)
     panel = None
 
     cam_index = args.index if args.index is not None else find_camera_index()
@@ -1033,16 +1271,55 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera via GStreamer pipeline")
 
+    # Exposure, gain and brightness, on the same device the pipeline is
+    # streaming from. Whatever the operator set last time goes back on now:
+    # these are a property of this camera in this light, not of a session,
+    # and having to set them again every morning -- in a separate tool --
+    # is how a reel gets run under a setting nobody chose.
+    camera = CameraControls(CAM["device"] or f"/dev/video{cam_index}",
+                            limits=CAM.get("limits"))
+    remembered = prefs.camera
+    if remembered:
+        applied = camera.apply(remembered)
+        if applied:
+            print(f"[camera] restored "
+                  + ", ".join(f"{k} {v}" for k, v in sorted(applied.items())))
+    if camera.available:
+        print(f"[camera] press 's' for the exposure, gain and brightness "
+              f"sliders — now at "
+              + ", ".join(f"{k} {v}"
+                          for k, v in sorted(camera.snapshot().items())))
+
+    # Held rather than read back every frame: the console needs these to draw
+    # the sliders, and asking the device sixty times a second for three
+    # numbers that only change when somebody moves a slider is work for
+    # nothing.
+    cam_values = [camera.snapshot()]
+
+    def _set_camera(arg):
+        """One slider moved. Set it, and remember where it was left."""
+        try:
+            name, value = arg
+        except (TypeError, ValueError):
+            return
+        if not camera.set(name, value):
+            print(f"[camera] {name} would not take {value}")
+            return
+        cam_values[0] = camera.snapshot()
+        # Written on every move rather than on close: the operator adjusts
+        # these and then walks back to the machine, and a console that is
+        # switched off at the wall must not lose them.
+        prefs.remember_camera(cam_values[0])
+
     classes_path = args.classes
     if classes_path is None:
-        beside = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "classes.txt")
-        if os.path.exists(beside):
+        beside = CFG.asset(MODEL["classes"])
+        if beside and os.path.exists(beside):
             classes_path = beside
             print(f"[model] using {beside}")
     class_names = load_class_names(classes_path)
     if args.engine is None:
-        args.engine = os.path.join(APP_DIR, DEFAULT_ENGINE)
+        args.engine = CFG.asset(MODEL["engine"])
     model = YOLO26TRT(args.engine, input_size=(args.imgsz, args.imgsz))
     print(f"[model] loaded {args.engine}")
 
@@ -1232,7 +1509,10 @@ def main():
         try:
             import openpyxl
             os.makedirs(os.path.dirname(xlsx_path) or ".", exist_ok=True)
-            wb = openpyxl.load_workbook(args.xlsx)
+            # The working copy, not the operator's file: the marks are per
+            # row and the copy is the one whose rows the window counted, with
+            # the datamatrix printings expanded into rows of their own.
+            wb = openpyxl.load_workbook(work_xlsx[0] or args.xlsx)
             ws = wb[args.sheet] if args.sheet else wb.worksheets[0]
             first = ws.max_column + 1
             per_row = len(sheet.rows[0].texts)
@@ -1272,6 +1552,8 @@ def main():
     view_cache = [None, None]        # [state key, rendered image]
 
     def _window_view_key():
+        if not loaded():
+            return None
         return (window.start, window.reads, len(window.done), window.last_hit,
                 len(window.unexpected))
 
@@ -1283,8 +1565,21 @@ def main():
         key = _window_view_key()
         if view_cache[0] == key and view_cache[1] is not None:
             return view_cache[1]
-        img = _draw_window_view()
+        img = _no_sheet_view() if not loaded() else _draw_window_view()
         view_cache[0], view_cache[1] = key, img
+        return img
+
+    def _no_sheet_view():
+        """The diagnostics panel before a sheet has been chosen."""
+        import numpy as np
+        img = np.full((120, 1120, 3), (32, 32, 32), np.uint8)
+        cv2.putText(img, "NO SHEET LOADED", (24, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (60, 200, 235), 2,
+                    cv2.LINE_AA)
+        cv2.putText(img, "LOAD SHEET, or OPEN RECENT SHEET for one that has "
+                         "been run before", (24, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
+                    cv2.LINE_AA)
         return img
 
     def _draw_window_view():
@@ -1396,6 +1691,124 @@ def main():
     # closes one record and opens another — _bind_run is the only place that
     # happens.
 
+    def _record_shape():
+        """What a record written now would be numbered against.
+
+        Everything a run records — the journal, the annotated sheet — is
+        keyed by spreadsheet row number, and expanding a datamatrix into
+        rows of its own moves every row after it down. A record written
+        before the expansion therefore has its marks against rows that are
+        now something else, so it is not a record of this sheet at all.
+        """
+        return {"rows": len(sheet.rows), "dm_rows": sheet.dm_rows,
+                "per_row": per_row}
+
+    def _stamp_path():
+        return os.path.join(os.path.dirname(journal_path) or ".",
+                            "record.json")
+
+    def _aside(path, stamp):
+        """Move a file out of the way, keeping it. Returns its new name."""
+        if not os.path.exists(path):
+            return None
+        stem, ext = os.path.splitext(path)
+        aside = f"{stem}.before-{stamp}{ext}"
+        try:
+            os.replace(path, aside)
+            return os.path.basename(aside)
+        except OSError as exc:
+            print(f"[window] could not put {path} aside ({exc})")
+            return None
+
+    def _retire_stale_record():
+        """Bring forward a record whose row numbers no longer mean anything.
+
+        Only ever triggered by a sheet that has a datamatrix in it: without
+        one nothing is expanded, the numbering is what it always was, and
+        the record from any earlier run carries straight on untouched.
+
+        A run before the expansion counted rows the way the operator's own
+        sheet does, and the working copy still says, per row, which of those
+        it came from — so the old journal is not lost, it is renumbered.
+        A shift's work stands, against the rows it was really about.
+        """
+        import csv as _csv
+        import json
+        if not os.path.exists(journal_path):
+            return
+        want = _record_shape()
+        try:
+            with open(_stamp_path()) as fh:
+                have = json.load(fh)
+        except (OSError, ValueError):
+            # No stamp at all: written before this app expanded anything. Its
+            # numbering is only wrong if this sheet is one that gets expanded.
+            have = None if sheet.has_dm else want
+        if have == want:
+            return
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # The annotated .xlsx is rebuilt from the journal at the end of every
+        # run, so it only has to be got out of the way; the journal is the
+        # part worth carrying over.
+        was_xlsx = _aside(xlsx_path, stamp)
+        was_journal = _aside(journal_path, stamp)
+        kept = [n for n in (was_xlsx, was_journal) if n]
+        old = (os.path.join(os.path.dirname(journal_path) or ".", was_journal)
+               if was_journal else None)
+        print(f"\n[window] the record here was written against a different "
+              f"shape of this sheet")
+        print(f"[window]   then: "
+              f"{have or 'the sheet as the operator numbers it'}")
+        print(f"[window]   now:  {want}")
+
+        # Only a record written against the operator's own numbering can be
+        # brought forward by source row: one written against some other
+        # expansion (a different --dm-repeats) is numbered by rows this copy
+        # does not have, and guessing at it would be worse than starting over.
+        by_source = {r.source: r.number for r in sheet.rows
+                     if not r.is_dm and r.source is not None}
+        if have is not None or not by_source or old is None:
+            print(f"[window]   kept as {', '.join(kept)}; this run starts a "
+                  f"fresh record")
+            return
+
+        moved = dropped = 0
+        try:
+            os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
+            with open(old, newline="") as src, \
+                    open(journal_path, "w", newline="") as dst:
+                out = _csv.writer(dst)
+                for rec in _csv.reader(src):
+                    if len(rec) < 2:
+                        continue
+                    if rec[0] == "sheet_row":
+                        out.writerow(rec)          # the header, as it was
+                        continue
+                    try:
+                        number = by_source[int(rec[0])]
+                    except (ValueError, KeyError):
+                        dropped += 1
+                        continue
+                    out.writerow([number] + rec[1:])
+                    moved += 1
+        except OSError as exc:
+            print(f"[window]   could not carry it over ({exc}) — kept as "
+                  f"{', '.join(kept)} and starting a fresh record")
+            return
+        print(f"[window]   {moved} row(s) carried over onto the new numbering"
+              + (f", {dropped} skipped (no such row in this sheet)"
+                 if dropped else "")
+              + f"; the originals are kept as {', '.join(kept)}")
+
+    def _stamp_record():
+        import json
+        try:
+            with open(_stamp_path(), "w") as fh:
+                json.dump(_record_shape(), fh, indent=2)
+        except OSError as exc:
+            print(f"[window] could not write {_stamp_path()} ({exc})")
+
     def _start_record():
         """Open the books for the sheet and output folder now in `args`."""
         nonlocal run_name, saver, results, xlsx_path, journal_path
@@ -1415,9 +1828,11 @@ def main():
                                 columns=per_row)
 
         # What an earlier run already got through.
+        _retire_stale_record()
         _load_previous()  # an .xlsx from an older run, if there is one
         _load_journal()   # then the journal, which wins where they differ
         _open_journal()
+        _stamp_record()
         if verified:
             last = max(verified)
             by_number = {r.number: i for i, r in enumerate(sheet.rows)}
@@ -1482,12 +1897,19 @@ def main():
         fault.update(_NO_FAULT)
         zb_reads[0] = 0
 
+        if not args.xlsx:
+            # The folder was repointed with no sheet loaded. There is nothing
+            # to open books for yet; the sheet will do it when it is chosen.
+            print(f"[run] crops will go to {args.label_dir}/ — still waiting "
+                  f"for a sheet")
+            return
         _open_sheet()
         _start_record()
         print(f"[run] now checking {args.xlsx} — record in "
               f"{args.result_dir}/, crops in {args.label_dir}/")
 
-    _start_record()
+    if loaded():
+        _start_record()
 
     def _band_top():
         """First row of picture the console chrome does not own."""
@@ -1516,6 +1938,10 @@ def main():
         window. `compact` skips the per-row breakdown."""
         font = cv2.FONT_HERSHEY_SIMPLEX
         x, y = 20, _band_top() + int(56 * _tk())
+        if not loaded():
+            cv2.putText(frame, "NO SHEET LOADED", (x, y),
+                        font, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+            return frame
         if window.start is None:
             cv2.putText(frame, "WINDOW: waiting for a known code", (x, y),
                         font, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
@@ -1830,14 +2256,28 @@ def main():
         lines = []                    # (text, colour, relative size)
         if fault["kind"] == "short":
             idx = fault["row_idx"]
+            row = sheet.rows[idx]
             req = sorted(window.required(idx))
             seen = window.seen.get(idx, set())
             missing = [c for c in req if c not in seen]
             banner = (f"REWIND: ROW {fault['row']} NEEDS "
                       + ", ".join(up(c) for c in missing))
+            if row.is_dm:
+                # These are not the QR labels. Say so before the operator
+                # goes looking down the coil for a code that is not there:
+                # they are the datamatrix labels, and this is the Nth of the
+                # few that carry the same value one after another.
+                banner = (f"REWIND: DATA MATRIX {row.printing or '?'} OF "
+                          f"{args.dm_repeats} NEEDS "
+                          + ", ".join(up(c) for c in missing))
+                lines.append((f"row {fault['row']} is a DATA MATRIX row - "
+                              f"printing {row.printing or '?'} of "
+                              f"{args.dm_repeats}", FAULT_WANT, 0.8))
+                lines.append(("these labels carry a datamatrix, not a QR",
+                              FAULT_TEXT, 0.75))
             for col in req:
                 got = col in seen
-                want = sheet.rows[idx].texts[col]
+                want = row.texts[col]
                 lines.append((f"{up(col):<5}{_tail(want, 20):<22}"
                               f"{'READ' if got else 'NOT READ YET'}",
                               FAULT_GREEN if got else FAULT_RED, 0.8))
@@ -1985,6 +2425,15 @@ def main():
 
         qr_dets = [d for d in dets if int(d[5]) == qr_cls]
         logo_dets = [d for d in dets if int(d[5]) == logo_cls]
+        label_dets = [d for d in dets if int(d[5]) == label_cls]
+
+        # How fast the coil is running, in the only units that matter here:
+        # pixels of this picture, per frame. It is what the saved crop
+        # reaches back by, so the margin follows the winder up and down
+        # instead of being a number somebody guessed once.
+        here = [tuple(float(v) for v in d[:4]) for d in label_dets]
+        motion[0] = web_motion(here, last_labels[0])
+        last_labels[0] = here
         parts[0] = ([(tuple(float(v) for v in d[:4]), "qr") for d in qr_dets]
                     + [(tuple(float(v) for v in d[:4]), "logo")
                        for d in logo_dets])
@@ -1992,8 +2441,10 @@ def main():
         # the ones being decoded this frame: a label that read fine on the
         # frame it came in on is skipped by the carry-forward below, and its
         # logo would never be looked at.
-        _check_parts(frame, [d for d in dets if int(d[5]) == label_cls],
-                     qr_dets, logo_dets)
+        # marks[0] is still the last frame's verdicts here — it is reset
+        # below — and a label that gave up a payload on it has a code on it
+        # whatever the detector managed to box this time.
+        _check_parts(frame, label_dets, qr_dets, logo_dets, marks[0])
         zb_budget = [args.zbar_fallback]     # spent on this frame only
         settled = list(handled[0])       # labels dealt with on the last frame
         was = list(marks[0])             # last frame's verdicts, to carry over
@@ -2054,7 +2505,15 @@ def main():
                                    args.qr_margin_min)
                          if qr is not None else (None, det[:4]))
             if not text:
-                text, box = decode_qr(frame, det[:4], margin=0.0, min_px=0)
+                # The whole label goes to the reader, which means so does
+                # anything else inside that box. On a label with nothing
+                # printed on it, what comes back can be the code printed on
+                # the label next door -- so the symbol has to be where the
+                # label is, not merely somewhere in the crop.
+                text, box, where = decode_qr_at(frame, det[:4], margin=0.0,
+                                                min_px=0)
+                if text and not _owns_symbol(det[:4], where, label_dets):
+                    text = None
             if not text and zb_budget[0] > 0 and not _at_edge(det[:4], frame):
                 # zxing has exhausted every pass it has on a crop that is
                 # otherwise sound, so hand this one label to a decoder that
@@ -2103,7 +2562,7 @@ def main():
                     print(f"[window]   load the sheet that goes with this "
                           f"roll, or put the right roll on")
                     if saver is not None:
-                        saver.save(frame, det[:4], text)
+                        saver.save(frame, det[:4], text, label_dets, motion[0])
                     _raise_fault("mismatch", text=text,
                                  belongs="nothing in this sheet",
                                  seen=time.time(),
@@ -2192,7 +2651,7 @@ def main():
                 print(f"[window]   belongs to {belongs}; window starts at row {head}")
                 window.note_unexpected(text, belongs)
                 if saver is not None:
-                    saver.save(frame, det[:4], text)
+                    saver.save(frame, det[:4], text, label_dets, motion[0])
                 _raise_fault("unexpected", text=text, belongs=belongs,
                              seen=time.time(),
                              box=tuple(float(v) for v in det[:4]))
@@ -2224,7 +2683,7 @@ def main():
                     print(f"[window] row {row_no} {up(col)} ok "
                           f"(slot {slot})")
                 if saver is not None:
-                    saver.save(frame, det[:4], text)
+                    saver.save(frame, det[:4], text, label_dets, motion[0])
 
                 # A code this far past the head means the coil has moved
                 # on and the head row is not going to fill in on its own --
@@ -2265,6 +2724,11 @@ def main():
     # that repeats every few rows.
     credited = {}
     rewound = [0]            # times an already-signed-off code came past again
+    # The web's travel between the last two frames, and the label boxes that
+    # measured it. Kept here rather than worked out per crop: every label in
+    # the picture is on the same web, so it is one measurement a frame.
+    last_labels = [[]]
+    motion = [(0.0, 0.0)]
     # A label is three things: the label, the code on it and the logo on it.
     # The model finds all three, so a label with a part missing is visible as
     # such before anything is decoded -- and it has to be, because a label
@@ -2298,12 +2762,18 @@ def main():
         return (not _at_edge(box, frame, EDGE_MARGIN)
                 and (full <= 0 or box[3] - box[1] >= full))
 
-    def _check_parts(frame, label_dets, qr_dets, logo_dets):
+    def _check_parts(frame, label_dets, qr_dets, logo_dets, read=()):
         """Stop for a label that is genuinely short of its code or its mark.
 
-        Three things stand between a dropped box and a stopped line, because
+        Four things stand between a dropped box and a stopped line, because
         a false stop on a good roll costs as much as a missed bad label:
 
+          * a label that read is a label with a code on it, whether or not
+            the detector found a box to call one. That is not a tolerance,
+            it is better evidence than the box: the symbol was not just
+            seen, it was decoded. It matters most on the datamatrix rows,
+            which the detector was never trained on and often does not box
+            at all, and which would otherwise stop the line every time;
           * only clear looks count -- the label whole and well inside the
             picture, so nothing is judged on a label the camera has only
             half of;
@@ -2330,13 +2800,17 @@ def main():
         full = (heights[len(heights) // 2] * PART_OF_FULL
                 if len(heights) >= 3 else 0.0)
 
+        decoded = [b for b, _who, text in read if text]
+
         looks = []
         for det in label_dets:
             box = tuple(float(v) for v in det[:4])
             if not _clear_look(box, frame, full):
                 continue
             missing = set()
-            if pick_qr_for_label(box, qr_dets) is None:
+            if (pick_qr_for_label(box, qr_dets) is None
+                    and not any(_overlap(box, prev) > 0.45
+                                for prev in decoded)):
                 missing.add("QR")
             if pick_qr_for_label(box, logo_dets) is None:
                 missing.add("LOGO")
@@ -2392,8 +2866,12 @@ def main():
                   f"{short.lower()} was not found on any of them"
                   + "".join(f", {p.lower()} {t[p][1]}/{t[p][0]}"
                             for p in PARTS if p != short))
-            if saver is not None:
-                saver.save(frame, box, f"no-{short.lower()}")
+            # No crop for this one. The folder is the record of what was
+            # read, one file per code, named after the code -- and a label
+            # with nothing on it read nothing, so the file would be a
+            # picture of a blank under a name that means nothing and cannot
+            # be searched for. What it was and why it stopped the line is
+            # on the screen, in the console, and in the run log.
             _raise_fault("incomplete", belongs=short, seen=time.time(),
                          box=box)
             voice.alert(f"A label has no {short.lower()}.",
@@ -2509,12 +2987,18 @@ def main():
         time. Reading clean clears it; pressing START while it is still short
         is what turns it into a confirmed defect.
         """
-        row_no = sheet.rows[row_idx].number
+        row = sheet.rows[row_idx]
+        row_no = row.number
         missing = sorted(window.missing(row_idx))
         cols = ", ".join(up(c) for c in missing)
         recheck["row"] = row_no
         recheck["attempt"] = 1
         print(f"\n[recheck] row {row_no} did not validate: never read {cols}")
+        if row.is_dm:
+            print(f"[recheck]   this is a DATA MATRIX row — printing "
+                  f"{row.printing or '?'} of {args.dm_repeats} of the value "
+                  f"listed against row {row.source} of your sheet. The labels "
+                  f"to look for carry a datamatrix, not a QR.")
 
         # What the sheet wanted against what actually came off the camera, for
         # every position of this row — not just the ones that failed. A code
@@ -2703,9 +3187,11 @@ def main():
         root.attributes("-topmost", True)
         try:
             if kind == "sheet":
+                near = args.xlsx or prefs.sheet
                 return filedialog.askopenfilename(
                     parent=root, title="Choose the validation sheet",
-                    initialdir=os.path.dirname(os.path.abspath(args.xlsx)),
+                    initialdir=(os.path.dirname(os.path.abspath(near))
+                                if near else APP_DIR),
                     filetypes=[("Excel workbook", "*.xlsx *.xlsm"),
                                ("All files", "*.*")]) or None
             return filedialog.askdirectory(
@@ -2734,7 +3220,8 @@ def main():
         if not _configurable():
             print("[ui] stop the machine before loading a different sheet")
             return
-        if not path or os.path.abspath(path) == os.path.abspath(args.xlsx):
+        if not path or (args.xlsx
+                        and os.path.abspath(path) == os.path.abspath(args.xlsx)):
             return
         try:
             ValidationSheet(path, args.sheet)     # prove it before committing
@@ -2790,6 +3277,10 @@ def main():
                 _apply_sheet(arg)
             elif name == "labeldir":
                 _apply_label_dir(arg)
+            elif name == "winder":
+                set_winder(arg)
+            elif name == "camera":
+                _set_camera(arg)
             elif name == "debug":
                 show_debug[0] = not show_debug[0]
                 print(f"[ui] diagnostics "
@@ -2799,6 +3290,8 @@ def main():
 
     def ui_state():
         """What the console's status pill is showing."""
+        if not loaded():
+            return "nosheet"
         if starting_at[0] is not None:
             return "reading"
         if fault["kind"] == "mismatch":
@@ -2809,7 +3302,13 @@ def main():
             return "incomplete"
         if fault["kind"] is not None:
             return "rewind"
-        return "running" if machine_running else "idle"
+        if machine_running:
+            return "running"
+        # Idle means ready to go. With the winder on hand control it is not
+        # ready to go, and saying so is the difference between an operator
+        # pressing START and wondering why nothing happens, and an operator
+        # reaching for the selector.
+        return "idle" if winder_auto[0] else "manual"
 
     # The counters, the window's check status and the decoder tally are
     # diagnostics, not something an operator acts on, so they stay off the
@@ -2820,7 +3319,7 @@ def main():
     # the console is what the main thread runs. `scale` is how far the frame
     # is shrunk on its way to the screen, and both consoles need it.
     qt_app = qt_window = None
-    scale = min(DISPLAY_MAX_W / disp_w, DISPLAY_MAX_H / disp_h, 1.0)
+    scale = min(DISP["max_width"] / disp_w, DISP["max_height"] / disp_h, 1.0)
 
     def display_frame(frame):
         """The frame at the size it will actually be shown.
@@ -2856,14 +3355,16 @@ def main():
                 qt_window.showFullScreen()
             else:
                 qt_window.showMaximized()
-            print("[ui] Qt console - START, STOP, LOAD SHEET, OPEN "
-                  "RECENT SHEET and LABEL FOLDER are buttons. The only keys "
-                  "are d (diagnostics) and F11 (full screen).")
+            print("[ui] Qt console - WINDER AUTO/MANUAL, START, STOP, "
+                  "LOAD SHEET, OPEN RECENT SHEET and LABEL FOLDER are "
+                  "buttons. Ctrl+Alt+E is the camera (exposure, gain, "
+                  "brightness), Ctrl+Alt+W the diagnostics, F11 full "
+                  "screen.")
 
     if not args.no_display and args.ui == "opencv":
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
         # at the frame's native resolution which overflows most screens. We
-        # set an initial on-screen size, capped to DISPLAY_MAX_*, while the
+        # set an initial on-screen size, capped to the configured maximum, while the
         # capture/inference itself still runs at full resolution.
         win_name = "Global Shutter Camera - YOLO26 TRT"
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -2993,6 +3494,9 @@ def main():
 
     def _live_note():
         """What the status bar should be saying right now."""
+        if not loaded():
+            return (_note[0] or "Load the sheet for this roll — LOAD SHEET, "
+                    "or OPEN RECENT SHEET")
         if starting_at[0] is not None:
             left = max(args.start_delay - (time.time() - starting_at[0]), 0)
             return f"Reading labels - {left:.1f}s to relay on"
@@ -3000,14 +3504,34 @@ def main():
             return "STOPPED: " + _fault_headline()
         return _note[0]
 
+    def _web_line():
+        """Which way the web is running and how fast, as the crops see it.
+
+        Here because the crop margin follows it: if a crop still clips a
+        code, this is the number that says whether the margin went on the
+        right edge, and how much of one there was to give.
+        """
+        dx, dy = motion[0]
+        if abs(dx) < 1 and abs(dy) < 1:
+            return "web still"
+        if abs(dx) >= abs(dy):
+            return f"web {'right' if dx > 0 else 'left'} {abs(dx):.0f} px/frame"
+        return f"web {'down' if dy > 0 else 'up'} {abs(dy):.0f} px/frame"
+
     def _status_line():
+        if not loaded():
+            return f"no sheet loaded\n{_web_line()}"
         passed = sum(1 for _, ok in window.done if ok)
         head = (sheet.rows[window.start].number
                 if window.start is not None and not window.exhausted else "-")
         return (f"{passed} pass / {len(window.done) - passed} short\n"
-                f"{window.reads} codes read\nhead row {head}")
+                f"{window.reads} codes read\nhead row {head}\n{_web_line()}")
 
     def _headless_line(frame, dets):
+        if not loaded():
+            print(f"[camera] frame {frame.shape}  fps={fps_state[1]:.1f}  "
+                  f"dets={len(dets)}  NO SHEET   ", end="\r")
+            return
         passed = sum(1 for _, ok in window.done if ok)
         held = f"  HELD row {recheck['row']}" if recheck["row"] else ""
         if fault["kind"] is not None:
@@ -3068,12 +3592,21 @@ def main():
             "boxes": boxes, "parts": part_boxes, "tags": tags,
             "banner": banner, "lines": lines,
             "state": ui_state(), "note": _live_note(),
-            "sheet": os.path.basename(args.xlsx),
-            "sheet_dir": os.path.dirname(os.path.abspath(args.xlsx)),
+            "sheet": os.path.basename(args.xlsx) if args.xlsx
+                     else "no sheet loaded",
+            "sheet_dir": (os.path.dirname(os.path.abspath(args.xlsx))
+                          if args.xlsx else ""),
             "labeldir": args.label_dir,
-            "recent": [p for p in prefs.recent
-                       if os.path.abspath(p) != os.path.abspath(args.xlsx)],
+            "recent": [p for p in prefs.recent if not args.xlsx
+                       or os.path.abspath(p) != os.path.abspath(args.xlsx)],
             "configurable": _configurable(),
+            # START is dead until a sheet says what this roll should be, and
+            # until the winder is handed over to the console.
+            "loaded": loaded(),
+            "winder_auto": winder_auto[0],
+            # What the sliders behind 's' are built from: the camera's own
+            # limits, and where it is set now.
+            "camera": {"ranges": camera.ranges, "values": cam_values[0]},
             "debug": show_debug[0],
             "fps": fps_state[1], "dets": len(dets),
             "status": _status_line(),
@@ -3097,7 +3630,8 @@ def main():
                 draw_window(frame, compact=True)
 
             if panel is not None:
-                panel.sheet_name = os.path.basename(args.xlsx)
+                panel.sheet_name = (os.path.basename(args.xlsx) if args.xlsx
+                                    else "NO SHEET LOADED")
                 panel.output_dir = args.label_dir
                 panel.configurable = _configurable()
                 panel.note = _live_note()
@@ -3223,7 +3757,15 @@ def main():
         # held against the sheet until the operator presses START, which is
         # what makes the read-in mean something: it validates the coil at the
         # position it is actually standing in.
-        print("[ui] idle — press START (or 's') to validate and run")
+        if loaded():
+            # 's' is START on the OpenCV console; the Qt one has no bare
+            # keys at all, so the prompt says whichever is true here.
+            print("[ui] idle — set the winder to AUTO, then press START"
+                  if qt_window is not None else
+                  "[ui] idle — press START (or 's') to validate and run")
+        else:
+            print("[ui] waiting for a sheet — LOAD SHEET, or OPEN RECENT "
+                  "SHEET for one that has been run before")
         if qt_window is not None:
             _loop_qt()
         else:
@@ -3236,10 +3778,9 @@ def main():
         print("\n[ui] interrupted — shutting down")
     finally:
         stop_machine("shutting down")
-        _aux(args.run_relay, False)
-        _aux(args.fault_relay, False)
         voice.close()
         relay.close()
+        camera.close()
         cap.release()
         if writer:
             writer.release()
@@ -3266,10 +3807,13 @@ def main():
             print(f"[defect] {len(defects)} row(s) failed twice and were "
                   f"recorded as LABEL ISSUE: "
                   + ", ".join(str(r) for r in sorted(defects)))
-        passed = sum(1 for _, ok in window.done if ok)
-        print(f"[validate] done: {passed} rows passed, "
-              f"{len(window.done) - passed} short, "
-              f"{window.reads} codes read")
+        if loaded():
+            passed = sum(1 for _, ok in window.done if ok)
+            print(f"[validate] done: {passed} rows passed, "
+                  f"{len(window.done) - passed} short, "
+                  f"{window.reads} codes read")
+        else:
+            print("[validate] nothing checked — no sheet was loaded")
 
 
 if __name__ == "__main__":

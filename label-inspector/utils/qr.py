@@ -18,15 +18,41 @@ import zxingcpp
 # run's closing output. Nothing is actually leaking — the mask is simply a
 # module global — so build it on first use and drop it before shutdown.
 _QR_FORMATS = None
+# Whether the reader is also looking for a datamatrix. Off unless the loaded
+# sheet has datamatrix values in it: every format added to the mask is more
+# work zxing does on every crop that does not read, and most rolls carry no
+# datamatrix at all. See utils/prepare.py for what those rows are.
+_WITH_DM = False
 
 
 def qr_formats():
-    """The QRCode|MicroQRCode mask handed to zxingcpp.read_barcode."""
+    """The format mask handed to zxingcpp.read_barcode."""
     global _QR_FORMATS
     if _QR_FORMATS is None:
         _QR_FORMATS = (zxingcpp.BarcodeFormat.QRCode
                        | zxingcpp.BarcodeFormat.MicroQRCode)
+        if _WITH_DM:
+            _QR_FORMATS = _QR_FORMATS | zxingcpp.BarcodeFormat.DataMatrix
     return _QR_FORMATS
+
+
+def read_datamatrix(on=True):
+    """Look for a datamatrix as well as a QR, or stop looking.
+
+    Called when a sheet is loaded, because it is the sheet that says whether
+    this roll has any. Returns whether that changed anything, so the caller
+    can say so once rather than on every load.
+    """
+    global _WITH_DM, _QR_FORMATS
+    if bool(on) == _WITH_DM:
+        return False
+    _WITH_DM = bool(on)
+    _QR_FORMATS = None                # rebuilt, with or without, on next use
+    return True
+
+
+def reads_datamatrix():
+    return _WITH_DM
 
 
 @atexit.register
@@ -50,11 +76,25 @@ def expand_box(box, frame_shape, margin=0.15, min_px=8):
 
 
 def _read(img):
+    """Decode one image. Returns the text, or None."""
+    return _read_at(img)[0]
+
+
+def _read_at(img):
+    """Decode one image, and say where in it the symbol was.
+
+    Returns (text, (x1, y1, x2, y2)) in the image's own coordinates, or
+    (None, None). Where the symbol sits is what tells a label carrying a
+    code apart from a label standing next to one -- see pick_qr_for_label.
+    """
     res = zxingcpp.read_barcode(img, formats=qr_formats(), try_rotate=True,
                                 try_downscale=True, try_invert=True)
     if res is None or not res.valid or not res.text:
-        return None
-    return res.text
+        return None, None
+    p = res.position
+    xs = (p.top_left.x, p.top_right.x, p.bottom_left.x, p.bottom_right.x)
+    ys = (p.top_left.y, p.top_right.y, p.bottom_left.y, p.bottom_right.y)
+    return res.text, (min(xs), min(ys), max(xs), max(ys))
 
 
 # Built once and reused: constructing a QRCodeDetector per call costs more
@@ -154,28 +194,54 @@ def decode_qr(frame, box, margin=0.15, min_px=8, min_side=160):
     the thing to reach for — but the caller decides that, because it costs
     real time and is only worth spending on a crop that stands a chance.
     Returns (text_or_None, expanded_box)."""
+    text, crop_box, _where = decode_qr_at(frame, box, margin, min_px, min_side)
+    return text, crop_box
+
+
+def decode_qr_at(frame, box, margin=0.15, min_px=8, min_side=160):
+    """decode_qr, and where in the frame the symbol it read actually is.
+
+    Returns (text_or_None, expanded_box, symbol_box_or_None), the symbol box
+    in the frame's own coordinates. A crop is only ever a guess at which
+    label a symbol belongs to; this is the fact. Handing a whole label to the
+    reader means handing it whatever else falls inside that box, so on a
+    label with nothing printed on it the code that comes back can be the one
+    printed on the label next door -- and a blank label credited with a
+    payload is exactly the label this machine exists to stop.
+    """
     x1, y1, x2, y2 = expand_box(box, frame.shape, margin, min_px)
     if x2 - x1 < 4 or y2 - y1 < 4:
-        return None, (x1, y1, x2, y2)
+        return None, (x1, y1, x2, y2), None
+
+    def out(text, where, scale=1.0):
+        """A symbol's place in the crop, put back in the frame's terms."""
+        if not text or where is None:
+            return text, (x1, y1, x2, y2), None
+        return text, (x1, y1, x2, y2), (x1 + where[0] / scale,
+                                        y1 + where[1] / scale,
+                                        x1 + where[2] / scale,
+                                        y1 + where[3] / scale)
 
     crop = frame[y1:y2, x1:x2]
 
-    text = _read(crop)
+    text, where = _read_at(crop)
     if text:
-        return text, (x1, y1, x2, y2)
+        return out(text, where)
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    scale = 1.0
     side = min(gray.shape[:2])
     if side < min_side:
         scale = float(min_side) / max(side, 1)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-    text = _read(gray)
+    text, where = _read_at(gray)
     if text:
-        return text, (x1, y1, x2, y2)
+        return out(text, where, scale)
 
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return _read(binary), (x1, y1, x2, y2)
+    text, where = _read_at(binary)
+    return out(text, where, scale)
 
 
 def box_center(box):
@@ -195,10 +261,27 @@ def intersection_area(a, b):
     return iw * ih
 
 
-def pick_qr_for_label(label_box, qr_dets):
-    """Choose the qr_code detection belonging to `label_box`: prefer a QR whose
-    center sits inside the label, else the one overlapping it most. Returns the
-    detection row or None. `qr_dets` rows are [x1,y1,x2,y2,conf,cls]."""
+MIN_SHARE = 0.5    # of a code box's own area, to count as a label's code
+
+
+def pick_qr_for_label(label_box, qr_dets, min_share=MIN_SHARE):
+    """Choose the qr_code detection belonging to `label_box`.
+
+    Preferred: a code whose centre sits inside the label. Failing that, one
+    that is *mostly* inside it — a code the detector boxed a little wide or a
+    little off, which is still this label's own.
+
+    What it must never do is hand a label its neighbour's code. Labels sit
+    shoulder to shoulder on the web and the code is printed near an edge, so
+    on a label with nothing printed on it the nearest code box is the one on
+    the label next door. The old rule -- the code overlapping most, however
+    little that was -- gave it to them: a blank label was cropped around its
+    neighbour's code, decoded, and credited with a payload that was never on
+    it. A label carrying nothing has to come back carrying nothing, because
+    that is a label this machine exists to stop.
+
+    Returns the detection row or None. `qr_dets` rows are
+    [x1,y1,x2,y2,conf,cls]."""
     if len(qr_dets) == 0:
         return None
 
@@ -207,7 +290,9 @@ def pick_qr_for_label(label_box, qr_dets):
         return max(inside, key=lambda d: d[4])
 
     best = max(qr_dets, key=lambda d: intersection_area(label_box, d))
-    return best if intersection_area(label_box, best) > 0 else None
+    area = max((best[2] - best[0]) * (best[3] - best[1]), 1e-9)
+    share = intersection_area(label_box, best) / area
+    return best if share >= min_share else None
 
 
 class Column:

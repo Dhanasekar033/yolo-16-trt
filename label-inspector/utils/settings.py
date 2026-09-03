@@ -38,6 +38,11 @@ class Settings:
     def __init__(self, path=DEFAULT_PATH):
         self.path = path
         self.label_dir = None
+        # Exposure, gain and brightness, as the operator left them. They
+        # belong here rather than in config.json: config.json is how an
+        # installation is set up, this is what somebody adjusted at the
+        # machine, and the two should not be able to overwrite each other.
+        self.camera = {}
         self._recent = []
         self._warned = False
         self._load()
@@ -60,6 +65,10 @@ class Settings:
         recent = data.get("recent")
         if isinstance(recent, list):
             self._recent = [p for p in recent if isinstance(p, str) and p]
+        camera = data.get("camera")
+        if isinstance(camera, dict):
+            self.camera = {k: int(v) for k, v in camera.items()
+                           if isinstance(v, (int, float))}
 
     @property
     def recent(self):
@@ -91,8 +100,26 @@ class Settings:
         self.label_dir = os.path.abspath(path)
         self._save()
 
+    def remember_camera(self, values):
+        """Where the exposure, gain and brightness sliders were left.
+
+        Called on every slider move, which is more often than anything else
+        here writes -- but that is a handful of writes while somebody drags
+        a slider, not a rate, and losing the setting because the console was
+        switched off at the wall is the thing worth avoiding.
+        """
+        if not values:
+            return
+        merged = dict(self.camera)
+        merged.update({k: int(v) for k, v in values.items() if v is not None})
+        if merged == self.camera:
+            return
+        self.camera = merged
+        self._save()
+
     def _save(self):
-        data = {"label_dir": self.label_dir, "recent": self._recent}
+        data = {"label_dir": self.label_dir, "recent": self._recent,
+                "camera": self.camera}
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"

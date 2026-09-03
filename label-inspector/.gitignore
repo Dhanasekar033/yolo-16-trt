@@ -2,3 +2,8 @@ result/
 __pycache__/
 *.pyc
 labels/
+# Written on first run and edited per installation — never one machine's
+# settings pushed onto another.
+config.json
+build/
+dist/

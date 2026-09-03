@@ -1,3 +1,4 @@
+import signal
 import sys
 import time
 import serial
@@ -65,9 +66,30 @@ print(f"Port: {port} | Relay: {relay} | Duration: {duration}s")
 ser = serial.Serial(port=port, baudrate=9600, parity=serial.PARITY_NONE,
                     stopbits=serial.STOPBITS_ONE, bytesize=serial.EIGHTBITS, timeout=0.2)
 
-send_relay(ser, relay, True)
-time.sleep(duration)
-send_relay(ser, relay, False)
+# Ctrl+C used to land in the sleep below and kill the script outright, which
+# left the relay energised -- relay 0 starts the winder, so it would keep
+# running with nothing watching it. The off goes in a finally so it is sent
+# whichever way this script leaves, and SIGTERM is turned into the same
+# orderly exit so a plain `kill` cannot skip it either.
+def _terminate(_sig, _frame):
+    raise KeyboardInterrupt
 
-ser.close()
+signal.signal(signal.SIGTERM, _terminate)
+
+try:
+    send_relay(ser, relay, True)
+    time.sleep(duration)
+except KeyboardInterrupt:
+    print("\nInterrupted -- switching relay off.")
+finally:
+    for _ in range(2):
+        try:
+            send_relay(ser, relay, False)
+            break
+        except KeyboardInterrupt:
+            # Another Ctrl+C while the off was going out. The write is
+            # already on the wire, but send it again to be certain.
+            pass
+    ser.close()
+
 print("Done.")

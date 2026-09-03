@@ -30,6 +30,18 @@ import openpyxl
 
 QR_COL_RE = re.compile(r"^\s*QR\s*DATA\s*(\d+)\s*$", re.IGNORECASE)
 
+# Written by utils/prepare.py onto the working copy of a sheet: which symbol
+# a row's codes are printed as, which of the datamatrix's repeated printings
+# this row is, and the row of the operator's own sheet it came from. A sheet
+# that has not been through the expansion has none of these, and every row of
+# it is read as an ordinary row of QR codes.
+TYPE_COL   = "CODE TYPE"
+PRINT_COL  = "PRINT NO"
+SOURCE_COL = "SOURCE ROW"
+
+QR_CODE     = "qr"        # kind: the codes on this row are QR
+DATA_MATRIX = "dm"        # kind: they are datamatrix, printed several times
+
 OK        = "OK"
 SWAPPED   = "SWAPPED"     # right row, but sitting in another column
 WRONG_ROW = "WRONG-ROW"   # a real code, but from a different sheet row
@@ -49,15 +61,31 @@ def normalize(text):
 class SheetRow:
     """One spreadsheet row: the QR DATA1..N payloads expected side by side."""
 
-    __slots__ = ("index", "number", "texts")
+    __slots__ = ("index", "number", "texts", "kind", "printing", "source",
+                 "group")
 
-    def __init__(self, index, number, texts):
+    def __init__(self, index, number, texts, kind=QR_CODE, printing=None,
+                 source=None, group=None):
         self.index = index        # 0-based position in the sequence
         self.number = number      # 1-based spreadsheet row number
         self.texts = texts        # [QR DATA1, QR DATA2, ...]
+        self.kind = kind          # QR_CODE or DATA_MATRIX
+        self.printing = printing  # 1..N for a datamatrix row, else None
+        self.source = source      # row of the operator's sheet it came from
+        # Rows that hold the same payloads on purpose, because the datamatrix
+        # is printed several times over. A payload found in one of them may
+        # tick any cell of the group, which is how the second and third
+        # printings are checked instead of being read as re-reads of the
+        # first. None for an ordinary row, whose payloads are unique.
+        self.group = group
+
+    @property
+    def is_dm(self):
+        return self.kind == DATA_MATRIX
 
     def __repr__(self):
-        return f"<sheet row {self.number}>"
+        what = " datamatrix" if self.is_dm else ""
+        return f"<sheet row {self.number}{what}>"
 
 
 class ValidationSheet:
@@ -72,13 +100,26 @@ class ValidationSheet:
             raise ValueError(f"{path}: sheet '{ws.title}' is empty")
 
         cols = []
+        header = {}
         for idx, name in enumerate(raw[0]):
-            m = QR_COL_RE.match(str(name)) if name is not None else None
+            if name is None:
+                continue
+            m = QR_COL_RE.match(str(name))
             if m:
                 cols.append((int(m.group(1)), idx))
+            else:
+                header[str(name).strip().upper()] = idx
         if not cols:
             raise ValueError(f"{path}: no 'QR DATA<n>' columns in the header row")
         cols.sort()
+        kind_at = header.get(TYPE_COL)
+        print_at = header.get(PRINT_COL)
+        source_at = header.get(SOURCE_COL)
+
+        def cell(values, idx):
+            if idx is None or idx >= len(values) or values[idx] is None:
+                return ""
+            return str(values[idx]).strip()
 
         self.path = path
         self.sheet_name = ws.title
@@ -94,7 +135,24 @@ class ValidationSheet:
             if not any(texts):
                 continue                       # blank spacer row
 
-            row = SheetRow(len(self.rows), number, texts)
+            # A working copy says what each row is; an operator's own sheet
+            # says nothing, and every row of it is QR.
+            dm = cell(values, kind_at).upper().replace(" ", "") == "DATAMATRIX"
+            source = cell(values, source_at)
+            printing = cell(values, print_at)
+            source = int(source) if source.isdigit() else None
+            row = SheetRow(len(self.rows), number, texts,
+                           kind=DATA_MATRIX if dm else QR_CODE,
+                           printing=int(printing) if printing.isdigit() else None,
+                           source=source,
+                           # The printings of one datamatrix belong together,
+                           # and what they have in common is the row of the
+                           # operator's sheet they were expanded from. A copy
+                           # written without that column falls back to the
+                           # row itself, which groups nothing -- the right
+                           # answer, since nothing says those rows are kin.
+                           group=(f"dm{source if source is not None else number}"
+                                  if dm else None))
             self.rows.append(row)
             for col, text in enumerate(texts):
                 key = normalize(text)
@@ -103,13 +161,30 @@ class ValidationSheet:
                 self.by_text.setdefault(key, []).append((row.index, col))
 
         wb.close()
-        self.repeats = max((len(v) for v in self.by_text.values()), default=0)
+        self.dm_rows = sum(1 for r in self.rows if r.is_dm)
+        # How many times an ordinary payload appears, which is what says the
+        # sheet is one block of codes duplicated over and over. The
+        # datamatrix rows are left out of it: they repeat on purpose, and
+        # counting them would make every prepared sheet look duplicated.
+        self.repeats = max((sum(1 for i, _c in v if not self.rows[i].is_dm)
+                            for v in self.by_text.values()), default=0)
         print(f"[validate] {path} [{self.sheet_name}]: {len(self.rows)} rows x "
               f"{self.per_row} codes = {len(self.by_text)} unique payloads")
+        if self.dm_rows:
+            groups = len({r.group for r in self.rows if r.is_dm})
+            print(f"[validate] {self.dm_rows} of those rows are datamatrix — "
+                  f"{groups} value(s) per up, each printed "
+                  f"{self.dm_rows // max(groups, 1)}x down the web")
         if self.repeats > 1:
             print(f"[validate] the sheet repeats: each payload appears up to "
                   f"{self.repeats} times, so a code is matched to the "
                   f"occurrence nearest the expected row")
+
+    @property
+    def has_dm(self):
+        """Is there a datamatrix anywhere in this sheet? Decides whether the
+        reader is asked to look for one at all."""
+        return bool(self.dm_rows)
 
     def find(self, text, near=None):
         """(row_index, col_index) of this payload, or None.

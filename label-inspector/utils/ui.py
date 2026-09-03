@@ -166,6 +166,11 @@ class ControlPanel:
         "unread":  ("NOT READING", BAD, True),
         "incomplete": ("BAD LABEL", BAD, True),
         "idle":    ("IDLE",     MUTED, False),
+        # Waiting to be told which sheet this roll is. Not the same as idle:
+        # idle is ready to go, this cannot go at all.
+        "nosheet": ("NO SHEET", MUTED, False),
+        # The winder is on hand control; START is off.
+        "manual":  ("WINDER MANUAL", WARN, False),
     }
 
     def __init__(self, width, height, on_start, on_stop,

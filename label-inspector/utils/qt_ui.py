@@ -62,6 +62,12 @@ STATES = {
     # A label came past with its code or its logo missing.
     "incomplete": ("BAD LABEL", BAD),
     "idle": ("IDLE", MUTED),
+    # No sheet has been chosen yet, so there is nothing to check the roll
+    # against and START does nothing. Its own word, because IDLE would say
+    # the machine is ready when it is only waiting.
+    "nosheet": ("NO SHEET", MUTED),
+    # The winder is on hand control, so the console cannot start it.
+    "manual": ("WINDER MANUAL", WARN),
 }
 
 
@@ -244,6 +250,136 @@ class VideoView(QtWidgets.QWidget):
         p.drawRect(QtCore.QRectF(2, 2, w - 4, h - 4))
 
 
+class CameraDialog(QtWidgets.QDialog):
+    """Exposure, gain and brightness, over the live picture.
+
+    Not modal, and deliberately: the only way to set these is to watch the
+    labels while you change them. The dialog sits to one side, the video
+    keeps running behind it, and every change goes to the camera as it is
+    made.
+
+    Stepped rather than dragged. A slider across a range of a thousand puts
+    every value within a pixel or two of three others, which is no way to
+    settle on one -- and settling on one is the whole job: exposure is
+    tuned until the codes read and then left alone. The arrows move it by
+    exactly one, the box takes a number typed straight in, and the wheel
+    works on it for the coarse hunt.
+
+    It builds itself from what the camera says it has. A control the device
+    does not offer gets no row, and the limits are the device's own
+    (narrowed by config.json) rather than anything written here.
+    """
+
+    changed = QtCore.pyqtSignal(str, int)      # control name, new value
+    reset = QtCore.pyqtSignal()
+
+    LABELS = {"exposure": "Exposure", "gain": "Gain",
+              "brightness": "Brightness"}
+    ORDER = ("exposure", "gain", "brightness")
+
+    def __init__(self, ranges, values, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Camera")
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+        self.setStyleSheet(
+            f"QDialog {{ background: {INK}; }}"
+            f"QLabel {{ color: {TEXT}; }}"
+            f"QLabel#hint {{ color: {MUTED}; }}"
+            f"QSpinBox {{ color: {TEXT}; background: {PANEL}; "
+            f"border: 1px solid {LINE}; padding: 6px 4px; "
+            f"font-family: monospace; font-size: 16px; }}"
+            f"QSpinBox:focus {{ border-color: {ACCENT}; }}"
+            # The arrows are the point of this control, so they are given
+            # something to aim at rather than Qt's default few pixels.
+            f"QSpinBox::up-button, QSpinBox::down-button {{ width: 26px; "
+            f"background: {LINE}; border: none; }}"
+            f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ "
+            f"background: {ACCENT}; }}"
+            f"QPushButton {{ color: {TEXT}; background: {PANEL}; "
+            f"border: 1px solid {LINE}; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ border-color: {ACCENT}; }}")
+
+        self._rows = {}
+        grid = QtWidgets.QGridLayout(self)
+        grid.setContentsMargins(18, 16, 18, 14)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+
+        row = 0
+        for name in self.ORDER:
+            spec = ranges.get(name)
+            if not spec:
+                continue                       # this camera has no such knob
+            title = QtWidgets.QLabel(self.LABELS.get(name, name.title()))
+            title.setFont(QtGui.QFont("", 11, QtGui.QFont.DemiBold))
+
+            box = QtWidgets.QSpinBox()
+            box.setRange(int(spec["min"]), int(spec["max"]))
+            box.setSingleStep(int(spec.get("step", 1)) or 1)
+            box.setValue(int(values.get(name, spec.get("default", 0))))
+            box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            box.setFixedWidth(140)
+            # Typing 1000 means passing through 1, 10 and 100, and each of
+            # those would otherwise go to the camera as it was typed. The
+            # value is sent when the digits stop, not while they arrive.
+            box.setKeyboardTracking(False)
+            box.setAccelerated(True)           # held arrows speed up
+
+            ends = QtWidgets.QLabel(f"{spec['min']} – {spec['max']}")
+            ends.setObjectName("hint")
+
+            grid.addWidget(title, row, 0)
+            grid.addWidget(box,   row, 1)
+            grid.addWidget(ends,  row, 2)
+            row += 1
+
+            def emit(value, name=name):
+                self.changed.emit(name, int(value))
+
+            box.valueChanged.connect(emit)
+            self._rows[name] = (box, spec)
+
+        if not self._rows:
+            grid.addWidget(QtWidgets.QLabel(
+                "This camera offers no adjustable exposure, gain or "
+                "brightness."), 0, 0, 1, 3)
+
+        note = QtWidgets.QLabel("Arrows step by one; a number can be typed "
+                                "straight in. Every change reaches the camera "
+                                "at once and is remembered for next time.")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        grid.addWidget(note, row, 0, 1, 3)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        if self._rows:
+            back = QtWidgets.QPushButton("Camera defaults")
+            back.clicked.connect(self._defaults)
+            buttons.addWidget(back)
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(self.close)
+        buttons.addWidget(close)
+        grid.addLayout(buttons, row + 1, 0, 1, 3)
+
+    def _defaults(self):
+        """Back to what the camera itself calls normal."""
+        for _name, (box, spec) in self._rows.items():
+            box.setValue(int(spec.get("default", box.value())))
+
+    def update_values(self, values):
+        """Show what the camera actually holds, without re-emitting it."""
+        for name, (box, _spec) in self._rows.items():
+            if name not in values:
+                continue
+            value = int(values[name])
+            if value == box.value():
+                continue
+            box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(False)
+
+
 class InspectorWindow(QtWidgets.QMainWindow):
     """The console. Emits `command(name, argument)` and nothing else."""
 
@@ -255,7 +391,19 @@ class InspectorWindow(QtWidgets.QMainWindow):
     # keypress on a console standing next to a winder must not be able to
     # stop the line, and must not be able to pop a file dialog over it
     # either. F11 is here because it is how you get out of full screen.
-    KEYS = {Qt.Key_D: "debug", Qt.Key_F11: "fullscreen"}
+    # Nothing on a bare letter. This console stands next to a winder and
+    # gets leaned on, brushed past and wiped down, and a single keystroke
+    # that opens a window over the live picture is a keystroke that will
+    # happen by accident. Both of these are chords instead, which nothing
+    # short of a deliberate three-finger press produces.
+    #
+    #   Ctrl+Alt+E   the camera: exposure, gain, brightness
+    #   Ctrl+Alt+W   the diagnostics readout
+    #
+    # F11 stays a bare key: it only changes the size of the window, and it
+    # is the one binding everybody already expects to find.
+    KEYS = {Qt.Key_F11: "fullscreen"}
+    CHORDS = {"Ctrl+Alt+E": "camera", "Ctrl+Alt+W": "debug"}
 
     def __init__(self, title="VIKBOT Label Inspect"):
         super().__init__()
@@ -285,11 +433,20 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._out_dir = ""
         self._recent = []
         self._running = False
+        self._loaded = None
+        self._winder_auto = None
         self._fault_text = None
+        # What the camera says it can do and where it is set, kept fresh off
+        # the snapshot so the dialog opens showing the truth rather than
+        # whatever it was told the last time it was open.
+        self._camera_ranges = {}
+        self._camera_values = {}
+        self._camera_dialog = None
         # Set False to let the window close on a single click, the way an
         # ordinary application does.
         self.locked = True
         self._build(title)
+        self._bind_chords()
         # Queued by default across threads, so the worker can post a snapshot
         # without touching a widget.
         self._incoming.connect(self._apply, Qt.QueuedConnection)
@@ -334,6 +491,14 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                  color: #2a0505; }}
             QPushButton#start:disabled, QPushButton#stop:disabled {{
                 background: #3a423c; color: #79817a; }}
+            /* The winder selector reads as the position it is in, not as a
+               button waiting to be pressed: amber for MANUAL, because the
+               relay is open and the line cannot run, and green for AUTO
+               once it can. */
+            QPushButton#winder {{ font-size: {int(14 * k)}px; font-weight: 700;
+                                  letter-spacing: 1px; border: none;
+                                  background: {WARN}; color: #2a2205; }}
+            QPushButton#winder:checked {{ background: {OK}; color: #08240f; }}
             QPushButton#secondary {{ font-size: {int(12 * k)}px; font-weight: 600;
                                      color: {ACCENT};
                                      padding: {int(10 * k)}px {int(8 * k)}px; }}
@@ -443,6 +608,17 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.setContentsMargins(14, 14, 14, 14)
         col.setSpacing(8)
 
+        # The winder's own selector, mirrored on the console. AUTO is the
+        # only position this app is allowed to drive the motor in; MANUAL
+        # means the operator has the coil and the relay is open, so START
+        # has nothing to offer and says so by being dead. It sits above
+        # START because it governs it -- you set the mode, then you start.
+        self.winder_btn = QtWidgets.QPushButton(objectName="winder")
+        self.winder_btn.setCheckable(True)
+        self.winder_btn.setFixedHeight(int(46 * self._k))
+        self.winder_btn.clicked.connect(
+            lambda on: self.command.emit("winder", bool(on)))
+
         self.start_btn = QtWidgets.QPushButton("START", objectName="start")
         self.stop_btn = QtWidgets.QPushButton("STOP", objectName="stop")
         self.sheet_btn = QtWidgets.QPushButton("LOAD SHEET",
@@ -460,6 +636,9 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.out_btn.clicked.connect(self._choose_output)
         for b in (self.start_btn, self.stop_btn):
             b.setFixedHeight(int(58 * self._k))
+        col.addWidget(QtWidgets.QLabel("WINDER", objectName="caption"))
+        col.addWidget(self.winder_btn)
+        col.addSpacing(6)
         col.addWidget(self.start_btn)
         col.addWidget(self.stop_btn)
         col.addSpacing(6)
@@ -508,8 +687,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                        "run.", objectName="status")
         row.addWidget(self.status)
         row.addStretch(1)
-        row.addWidget(QtWidgets.QLabel(
-            "[D] DIAGNOSTICS   [F11] FULL SCREEN", objectName="hint"))
+        row.addWidget(QtWidgets.QLabel("[F11] FULL SCREEN", objectName="hint"))
         return bar
 
     # -- input ------------------------------------------------------------
@@ -559,7 +737,52 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.showMaximized() if self.isFullScreen() \
                 else self.showFullScreen()
         else:
+            self._fire(name)
+
+    def _fire(self, name):
+        """What a shortcut does, whichever way it was pressed."""
+        if name == "camera":
+            self.open_camera_dialog()
+        else:
             self.command.emit(name, None)
+
+    def _bind_chords(self):
+        """The two chords, as application shortcuts.
+
+        QShortcut rather than keyPressEvent, so they still fire while the
+        camera window has the focus -- the operator opens it, adjusts, and
+        wants the same chord to shut it again without hunting for the
+        console first.
+        """
+        for sequence, name in self.CHORDS.items():
+            shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(lambda name=name: self._fire(name))
+
+    # -- the camera sliders -----------------------------------------------
+    def open_camera_dialog(self):
+        """Open the camera controls, or shut them again."""
+        if self._camera_dialog is not None:
+            self._camera_dialog.close()      # the same chord puts it away
+            return
+        if not self._camera_ranges:
+            # Said in the status bar, not in a message box. A modal dialog
+            # stops the GUI thread until somebody clicks it, and this
+            # console can be several metres from the nearest hand -- the
+            # picture would sit frozen over a moving web in the meantime.
+            self.status.setText("This camera's exposure, gain and brightness "
+                                "cannot be reached from here.")
+            return
+        dialog = CameraDialog(self._camera_ranges, self._camera_values, self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.changed.connect(
+            lambda name, value: self.command.emit("camera", (name, value)))
+        dialog.destroyed.connect(self._camera_dialog_gone)
+        self._camera_dialog = dialog
+        dialog.show()
+
+    def _camera_dialog_gone(self, *_):
+        self._camera_dialog = None
 
     # -- closing ----------------------------------------------------------
     def _may_close(self):
@@ -611,7 +834,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
     def _set_pill(self, state):
         label, colour = STATES.get(state, STATES["idle"])
         self.pill.setText(label)
-        if state == "idle":
+        if state in ("idle", "nosheet"):
             self.pill.setStyleSheet(f"color: {MUTED}; background: {PANEL}; "
                                     f"border: 1px solid {LINE};")
         else:
@@ -648,12 +871,27 @@ class InspectorWindow(QtWidgets.QMainWindow):
 
         state = snap.get("state", "idle")
         self._running = state in ("running", "reading")
-        if state != self._state:
-            self._state = state
-            self._set_pill(state)
-            self.start_btn.setEnabled(state in ("idle", "rewind", "mismatch",
-                                                "unread", "incomplete"))
+        # Two things gate START besides the machine's own state, and both
+        # are tracked separately from it: a sheet to check the roll against,
+        # and the winder in AUTO. Either can change while the state stays
+        # exactly where it was -- idle -- and the button would never be
+        # re-enabled if it were only watching the state.
+        loaded = bool(snap.get("loaded", True))
+        auto = bool(snap.get("winder_auto", True))
+        if state != self._state or loaded != self._loaded \
+                or auto != self._winder_auto:
+            self._state, self._loaded, self._winder_auto = state, loaded, auto
+            self._set_pill(state if loaded else "nosheet")
+            self.start_btn.setEnabled(
+                loaded and auto and state in ("idle", "rewind", "mismatch",
+                                              "unread", "incomplete"))
             self.stop_btn.setEnabled(self._running)
+            self.winder_btn.setChecked(auto)
+            self.winder_btn.setText("AUTO" if auto else "MANUAL")
+
+        camera = snap.get("camera") or {}
+        self._camera_ranges = camera.get("ranges") or {}
+        self._camera_values = camera.get("values") or {}
 
         self._recent = list(snap.get("recent") or ())
         configurable = bool(snap.get("configurable", True))
