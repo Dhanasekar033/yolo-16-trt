@@ -122,6 +122,7 @@ espeak is the fallback for one that has not. --no-voice runs it silent.
 import argparse
 import os
 import queue
+import signal
 import threading
 import time
 import cv2
@@ -3176,9 +3177,44 @@ def main():
                                                 QtCore.Qt.QueuedConnection)
 
         from PyQt5 import QtCore
+
+        # Ctrl+C, under Qt. Python's default handler raises KeyboardInterrupt
+        # wherever the interpreter happens to be standing, and under exec_()
+        # that is always inside a slot — a paint, or the frame being applied.
+        # An exception cannot cross back into C++, so PyQt prints it and
+        # carries on: the console keeps running and every Ctrl+C only adds
+        # another traceback. So the signal is taken here instead and turned
+        # into the same orderly exit the window's own quit takes, which is
+        # what lets the shutdown below run and put the relays down. Handlers
+        # run on the main thread, the one inside exec_(), so quit() can be
+        # called straight out.
+        def _interrupt(_sig, _frame):
+            if quitting.is_set():
+                # The first one has already been asked for and the shutdown
+                # is taking its time. Hand the signal back to Python so a
+                # third press kills the process outright.
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                print("\n[ui] still shutting down — Ctrl-C again to force it")
+                return
+            print("\n[ui] interrupted — shutting down")
+            quitting.set()
+            qt_app.quit()
+
+        previous = signal.signal(signal.SIGINT, _interrupt)
+        # Qt's loop is C++, and the interpreter only gets to run that handler
+        # when something calls back into Python. Frames do that sixty times a
+        # second — but a camera that has hung posts none at all, which is
+        # exactly when Ctrl+C gets pressed, so this keeps a beat of its own.
+        ticker = QtCore.QTimer()
+        ticker.timeout.connect(lambda: None)
+        ticker.start(200)
+
         worker = threading.Thread(target=work, name="capture", daemon=True)
         worker.start()
-        qt_app.exec_()
+        try:
+            qt_app.exec_()
+        finally:
+            signal.signal(signal.SIGINT, previous)
         quitting.set()
         worker.join(timeout=5.0)
 
