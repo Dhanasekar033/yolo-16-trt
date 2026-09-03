@@ -746,7 +746,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         # reel goes on, while the winder is thrown all shift.
         col.addStretch(1)
 
-        col.addWidget(QtWidgets.QLabel("CHECK DIRECTION",
+        col.addWidget(QtWidgets.QLabel("CHECK DIRECTION IN EXCEL",
                                        objectName="caption"))
         self.dir_switch = ToggleSwitch("FORWARD", "REVERSE", scale=self._k,
                                        on_colour=ACCENT, off_colour=ACCENT)
