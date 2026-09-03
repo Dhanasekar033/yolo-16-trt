@@ -157,23 +157,41 @@ def prepare(src, dest_dir, sheet=None, repeats=REPEATS, force=False,
         return src
 
     width = len(header)
-    out = openpyxl.Workbook(write_only=True)
-    sheet_out = out.create_sheet(title=title[:31] or "Sheet1")
-    sheet_out.append(list(header) + [TYPE_COL, PRINT_COL, SOURCE_COL])
 
-    expanded = kept = 0
+    # Read the sheet through once before writing anything. A workbook is
+    # only opened if there turns out to be something to put in it -- an
+    # openpyxl write-only workbook keeps a generator open over its own
+    # archive from the first row appended, and one built and then abandoned
+    # prints a traceback into the operator's log when it is collected.
+    body = []
     for number, values in enumerate(raw[1:], start=2):
         values = list(values) + [None] * (width - len(values))
         if not any(_text(v) for v in values):
             continue                                   # blank spacer row
-        kept += 1
-        sheet_out.append(values[:width] + [QR, None, number])
-
         matrix = {n: _text(values[i]) for n, i in dm_cols.items()
                   if i < width and _text(values[i])}
+        body.append((number, values, matrix))
+
+    kept = len(body)
+    expanded = sum(1 for _n, _v, m in body if m)
+    if not expanded:
+        # The columns are there but every one of them is empty. There is
+        # nothing to expand, so there is nothing a copy would say that the
+        # sheet does not already, and a prepared_ file that is a byte-for-byte
+        # restatement of the original is only something else to keep in step.
+        if not quiet:
+            print(f"[prepare] {os.path.basename(src)} has DATA MATRIX columns "
+                  f"but no values in them — running against it as it is")
+        return src
+
+    out = openpyxl.Workbook(write_only=True)
+    sheet_out = out.create_sheet(title=title[:31] or "Sheet1")
+    sheet_out.append(list(header) + [TYPE_COL, PRINT_COL, SOURCE_COL])
+
+    for number, values, matrix in body:
+        sheet_out.append(values[:width] + [QR, None, number])
         if not matrix:
             continue
-        expanded += 1
         # One row per printing. The datamatrix goes in the QR DATA column
         # because that is what the window matches on; every other column of
         # the source row is dropped, because none of it is on these labels.
@@ -187,16 +205,6 @@ def prepare(src, dest_dir, sheet=None, repeats=REPEATS, force=False,
                 if n in hr_cols:
                     row[hr_cols[n]] = text     # what is printed beside it
             sheet_out.append(row + [DM, printing, number])
-
-    if not expanded:
-        # The columns are there but every one of them is empty. There is
-        # nothing to expand, so there is nothing a copy would say that the
-        # sheet does not already, and a prepared_ file that is a byte-for-byte
-        # restatement of the original is only something else to keep in step.
-        if not quiet:
-            print(f"[prepare] {os.path.basename(src)} has DATA MATRIX columns "
-                  f"but no values in them — running against it as it is")
-        return src
 
     os.makedirs(dest_dir, exist_ok=True)
     tmp = dest + ".tmp"

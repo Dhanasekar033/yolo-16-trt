@@ -75,6 +75,9 @@ DEFAULTS = {
         "conf": 0.45,            # for any class without its own
         "conf_label": None,
         "conf_qr": None,
+        "conf_logo": None,      # the logo is never decoded, so a box
+                                # at this confidence is the only
+                                # evidence it was printed at all
         "label_class": "label",
         "qr_class": "qr_code",
         "logo_class": "logo",
@@ -83,6 +86,13 @@ DEFAULTS = {
         "qr_margin": 0.15,       # quiet zone round the code box
         "qr_margin_min": 8,
         "zbar_fallback": 2,      # labels per frame that may fall back to zbar
+        # Read datamatrix as well as QR. On, because a sheet does not say
+        # which symbol a code is printed as -- a QR DATA column holds both,
+        # one row after another -- and the label in front of the camera is
+        # the only thing that knows. The cost of looking is 0.02ms on a crop
+        # that reads; the cost of not looking is every datamatrix label on
+        # the reel coming up NO READ and stopping the line.
+        "datamatrix": True,
     },
     "machine": {
         "start_delay": 2.0,      # seconds of reading before the relay goes on

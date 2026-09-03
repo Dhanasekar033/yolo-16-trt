@@ -736,6 +736,12 @@ def main():
     ap.add_argument("--conf-qr", type=float, default=MODEL["conf_qr"],
                      help="confidence threshold for the qr class — this is what "
                           "gates which box gets cropped and decoded.")
+    ap.add_argument("--conf-logo", type=float, default=MODEL["conf_logo"],
+                     help="confidence threshold for the logo class. The logo "
+                          "is never decoded, so unlike the qr it has no "
+                          "reading to fall back on: a box at this confidence "
+                          "is the only evidence it was printed, and this is "
+                          "what the missing-part check is held to.")
     ap.add_argument("--imgsz", type=int, default=MODEL["imgsz"])
     ap.add_argument("--save", default=None, help="optional path to record annotated video")
     # qr decode args
@@ -967,6 +973,15 @@ def main():
     # The command line always wins; the settings file only fills in what was
     # left out, which is the usual case because the operator starts this from
     # a desktop icon and sets everything from the screen.
+    # Both symbols, from the start and whatever the sheet holds. A QR DATA
+    # column carries QR payloads and datamatrix payloads one row after
+    # another, and nothing in it says which is which -- only the label in
+    # front of the camera knows, so the reader is told to accept either and
+    # the payload it comes back with is what identifies the row.
+    read_datamatrix(DECODE["datamatrix"])
+    print(f"[qr] reading QR"
+          + (" and datamatrix" if DECODE["datamatrix"] else " only"))
+
     prefs = Settings()
     args.result_dir = os.path.join(APP_DIR, args.result_dir)
     if args.label_dir is None:
@@ -1031,12 +1046,6 @@ def main():
                   f"codes")
             work_xlsx[0] = args.xlsx
         sheet = ValidationSheet(work_xlsx[0], args.sheet)
-        # The reader only looks for a datamatrix on a roll that has one: it
-        # is another format for zxing to try on every crop that will not
-        # read, and most rolls carry none.
-        if read_datamatrix(sheet.has_dm):
-            print(f"[qr] the reader is {'now' if sheet.has_dm else 'no longer'}"
-                  f" looking for a datamatrix as well as a QR")
         per_row = args.labels_per_row or sheet.per_row
         checked = parse_check(args.check, per_row)
         if checked is None:
@@ -1473,8 +1482,9 @@ def main():
     disp_w, disp_h = (args.height, args.width) if args.rotate in (90, 270) else (args.width, args.height)
 
     # Per-class thresholds: the label one gates line crossings, the qr one
-    # gates which box gets cropped and decoded, and --conf-thres is what every
-    # other class is held to.
+    # gates which box gets cropped and decoded, the logo one gates the
+    # missing-part check, and --conf-thres is what every other class is held
+    # to.
     conf_per_class = {}
     label_cls = class_index(class_names, args.label_class, 0)
     qr_cls = class_index(class_names, args.qr_class, 1)
@@ -1485,6 +1495,8 @@ def main():
         conf_per_class[label_cls] = args.conf_label
     if args.conf_qr is not None:
         conf_per_class[qr_cls] = args.conf_qr
+    if args.conf_logo is not None:
+        conf_per_class[logo_cls] = args.conf_logo
     print(f"[model] conf thresholds: default={args.conf_thres}"
           + "".join(f"  {named.get(c, c)}={v}"
                     for c, v in conf_per_class.items()))
@@ -1913,7 +1925,7 @@ def main():
         # expansion (a different --dm-repeats) is numbered by rows this copy
         # does not have, and guessing at it would be worse than starting over.
         by_source = {r.source: r.number for r in sheet.rows
-                     if not r.is_dm and r.source is not None}
+                     if r.group is None and r.source is not None}
         if have is not None or not by_source or old is None:
             print(f"[window]   kept as {', '.join(kept)}; this run starts a "
                   f"fresh record")
@@ -2419,19 +2431,20 @@ def main():
             missing = [c for c in req if c not in seen]
             banner = (f"REWIND: ROW {fault['row']} NEEDS "
                       + ", ".join(up(c) for c in missing))
-            if row.is_dm:
-                # These are not the QR labels. Say so before the operator
-                # goes looking down the coil for a code that is not there:
-                # they are the datamatrix labels, and this is the Nth of the
-                # few that carry the same value one after another.
-                banner = (f"REWIND: DATA MATRIX {row.printing or '?'} OF "
-                          f"{args.dm_repeats} NEEDS "
+            if row.group is not None:
+                # One of a few labels down the web carrying the same
+                # code. Say which of them before the operator goes
+                # hunting: they all look alike, and the one that is
+                # short is not distinguishable by eye.
+                nth = f"{row.printing or '?'} OF {row.printings or '?'}"
+                banner = (f"REWIND: REPEATED CODE {nth} NEEDS "
                           + ", ".join(up(c) for c in missing))
-                lines.append((f"row {fault['row']} is a DATA MATRIX row - "
-                              f"printing {row.printing or '?'} of "
-                              f"{args.dm_repeats}", FAULT_WANT, 0.8))
-                lines.append(("these labels carry a datamatrix, not a QR",
-                              FAULT_TEXT, 0.75))
+                lines.append((f"row {fault['row']} is printing "
+                              f"{row.printing or '?'} of "
+                              f"{row.printings or '?'} of the same code",
+                              FAULT_WANT, 0.8))
+                lines.append(("those labels all read alike - it is the "
+                              "count that is short", FAULT_TEXT, 0.75))
             for col in req:
                 got = col in seen
                 want = row.texts[col]
@@ -3222,11 +3235,12 @@ def main():
         recheck["row"] = row_no
         recheck["attempt"] = 1
         print(f"\n[recheck] row {row_no} did not validate: never read {cols}")
-        if row.is_dm:
-            print(f"[recheck]   this is a DATA MATRIX row — printing "
-                  f"{row.printing or '?'} of {args.dm_repeats} of the value "
-                  f"listed against row {row.source} of your sheet. The labels "
-                  f"to look for carry a datamatrix, not a QR.")
+        if row.group is not None:
+            print(f"[recheck]   this row is printing {row.printing or '?'} "
+                  f"of {row.printings or '?'} of the same code, which the "
+                  f"sheet carries on rows {row.source} onward. Those "
+                  f"labels are identical to the eye; what is missing is "
+                  f"one of the printings, not a different label.")
 
         # What the sheet wanted against what actually came off the camera, for
         # every position of this row — not just the ones that failed. A code

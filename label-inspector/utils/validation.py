@@ -61,11 +61,12 @@ def normalize(text):
 class SheetRow:
     """One spreadsheet row: the QR DATA1..N payloads expected side by side."""
 
-    __slots__ = ("index", "number", "texts", "kind", "printing", "source",
-                 "group")
+    __slots__ = ("index", "number", "texts", "kind", "printing", "printings",
+                 "source", "group")
 
     def __init__(self, index, number, texts, kind=QR_CODE, printing=None,
-                 source=None, group=None):
+                 source=None, group=None, printings=None):
+        self.printings = printings  # how many rows carry this same code
         self.index = index        # 0-based position in the sequence
         self.number = number      # 1-based spreadsheet row number
         self.texts = texts        # [QR DATA1, QR DATA2, ...]
@@ -163,22 +164,24 @@ class ValidationSheet:
         wb.close()
         self._find_repeats()
         self.dm_rows = sum(1 for r in self.rows if r.is_dm)
+        self.repeat_rows = sum(1 for r in self.rows if r.group is not None)
         # How many times an ordinary payload appears, which is what says the
-        # sheet is one block of codes duplicated over and over. The
-        # datamatrix rows are left out of it: they repeat on purpose, and
-        # counting them would make every prepared sheet look duplicated.
-        self.repeats = max((sum(1 for i, _c in v if not self.rows[i].is_dm)
+        # sheet is one block of codes duplicated over and over. The repeated
+        # rows are left out of it: they repeat on purpose, and counting them
+        # would make every such sheet look duplicated.
+        self.repeats = max((sum(1 for i, _c in v
+                                if self.rows[i].group is None)
                             for v in self.by_text.values()), default=0)
         print(f"[validate] {path} [{self.sheet_name}]: {len(self.rows)} rows x "
               f"{self.per_row} codes = {len(self.by_text)} unique payloads")
-        if self.dm_rows:
-            groups = len({r.group for r in self.rows if r.is_dm})
-            told = kind_at is not None
-            print(f"[validate] {self.dm_rows} of those rows are datamatrix — "
-                  f"{groups} value(s) per up, each printed "
-                  f"{self.dm_rows // max(groups, 1)}x down the web"
-                  + ("" if told else ", read off the sheet itself: those rows "
-                                     "repeat the row above them"))
+        if self.repeat_rows:
+            groups = len({r.group for r in self.rows if r.group})
+            each = self.repeat_rows // max(groups, 1)
+            what = "datamatrix " if self.dm_rows else ""
+            print(f"[validate] {groups} {what}code(s) per up are printed "
+                  f"{each}x over, {self.repeat_rows} rows of the sheet in all"
+                  + (" (the sheet says so)" if kind_at is not None else
+                     " (those rows repeat the row above them)"))
         if self.repeats > 1:
             print(f"[validate] the sheet repeats: each payload appears up to "
                   f"{self.repeats} times, so a code is matched to the "
@@ -188,37 +191,37 @@ class ValidationSheet:
         """Rows that hold the same payloads as the row before them.
 
         Every payload on this line is unique, so a row repeating the one
-        above it is not a coincidence and not a mistake: it is one value
-        printed several times over down the web, which is how the datamatrix
-        is laid down. That has to be recognised or the second and third
-        printings read as re-reads of the first and their rows never
-        complete -- the line stops on a reel that is perfectly good.
+        above it is not a coincidence and not a mistake: it is one code
+        printed several times over down the web. That has to be recognised
+        or the second and third printings read as re-reads of the first and
+        their rows never complete -- the line stops on a reel that is
+        perfectly good.
 
-        Recognised here, from the rows themselves, rather than taken on
-        trust from a column that says so. utils/prepare.py writes such a
-        column when it expands a DATA MATRIX column into rows, and those
-        markings are kept; but a sheet that arrives already expanded --
-        which is what the printer's own output now looks like -- carries
-        nothing to say what those rows are, and would otherwise stop the
-        line at every one of them.
+        What this does *not* do is decide what symbol those codes are
+        printed as. A sheet does not say: a QR DATA column holds a QR
+        payload on one row and a datamatrix payload on the next, and they
+        look the same in a spreadsheet. Only the label in front of the
+        camera knows, and the reader is set to accept either -- so nothing
+        here needs to guess. `kind` stays as it came: whatever an explicit
+        CODE TYPE column said, and QR when there was none.
         """
         keys = [tuple(normalize(t) for t in r.texts) for r in self.rows]
         start = 0
         for i in range(1, len(self.rows) + 1):
             if i < len(self.rows) and keys[i] == keys[start]:
                 continue
-            if i - start > 1:               # a run of identical rows
+            length = i - start
+            if length > 1:                  # a run of identical rows
                 head = self.rows[start]
                 for printing, idx in enumerate(range(start, i), start=1):
                     row = self.rows[idx]
-                    # An explicit CODE TYPE column wins: it knows which
-                    # symbol these are, and this only knows that they repeat.
                     if row.group is None:
                         row.group = f"rep{head.number}"
-                        row.kind = DATA_MATRIX
-                        row.printing = printing
                         if row.source is None:
                             row.source = head.number
+                    if row.printing is None:
+                        row.printing = printing
+                    row.printings = length
             start = i
 
     @property
