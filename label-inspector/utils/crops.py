@@ -151,8 +151,16 @@ class LabelSaver:
             if gaps[b] is None:
                 gaps[b] = gaps[a]
 
-        pad = {side: 0 if gap is None else max(int(gap // 2), 0)
-               for side, gap in gaps.items()}
+        # Left and right only. What a label is short of at top and bottom is
+        # the next label down the web, and there is nothing to be gained by
+        # cropping part of it in -- only the axis the reel travels on has a
+        # box edge that needs help. The other two sides are measured all the
+        # same, because the motion allowance below may land on one of them
+        # if this camera is mounted the other way round.
+        pad = {"left": 0, "right": 0, "up": 0, "down": 0}
+        for side in ("left", "right"):
+            if gaps[side] is not None:
+                pad[side] = max(int(gaps[side] // 2), 0)
 
         # The web runs one way at a time, so only the axis it actually
         # travels on gets the allowance; the other is however the labels

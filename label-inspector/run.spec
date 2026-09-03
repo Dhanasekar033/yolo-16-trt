@@ -41,6 +41,7 @@ a = Analysis(
     datas=[
         ('best-new.engine', '.'),
         ('classes.txt', '.'),
+        ('vikbot-logo.png', '.'),
     ] + cuda_datas,
     hiddenimports=cuda_hiddenimports,
     hookspath=[],

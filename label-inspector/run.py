@@ -88,13 +88,34 @@ on the machine is something only the operator knows, and a roll checked
 against somebody else's paperwork is worse than one not checked at all. START
 is dead until a sheet has been chosen.
 
-The winder's own AUTO/MANUAL selector is mirrored above START, and AUTO is
-the only position the start relay is ever closed in. MANUAL opens it at
-once, whatever the app was doing, and holds START dead: the coil is in
-somebody's hands. It opens in MANUAL every time and is never remembered,
-because a winder that could be energised on the strength of yesterday's
-choice is the hazard the switch exists to remove. That relay is the only
-one this app drives.
+The winder's AUTO/MANUAL selector is mirrored above START, and the one relay
+this app drives follows it.
+
+    MANUAL   the contact closes and stays closed. The winder runs on its own
+             controls and this app stands out of the way -- it still watches
+             and still reads, but it starts and stops nothing, so START is
+             dead.
+    AUTO     the contact is the console's. It opens on the way in and closes
+             only when START has been pressed and the labels standing in
+             front of the camera have been read.
+
+Thrown to MANUAL mid-run, the contact does not open on the way to closing:
+it is a maintained start input, and a gap in it is a pulse, which is the one
+edge a motor starter is built to act on.
+
+It opens in AUTO, which is the position that leaves the contact open, so
+launching the app energises nothing. The choice is never remembered between
+runs: MANUAL closes a start contact, and an app that did that on the
+strength of something chosen yesterday is the hazard the switch removes.
+
+Under it sits the other selector, CHECK FORWARD / CHECK REVERSE. The printer
+lays the sheet down the reel in order, but a reel wound onto a second spool
+comes off it the other way round -- the last row printed is the first one
+past the camera -- so REVERSE walks the window from the row it anchors on
+back toward row one. Only the direction changes: a payload still identifies
+its own row and column, which is what made the matching indifferent to
+arrival order to begin with. It can only be thrown while the line is idle,
+because it decides where the pass goes from here.
 
 Ctrl+Alt+E opens the camera: exposure, gain and brightness, stepped one at
 a time, applied as they change and remembered for next time
@@ -317,18 +338,30 @@ class RollingWindow:
     label can be read on whichever frame it happens to be legible in.
 
     A row leaves the window once every checked cell has been ticked, and the
-    head slides forward one row at a time. A payload that belongs to no cell
-    in the window is the fault worth stopping for — it means a label is on the
-    web that the sheet does not expect here.
+    head slides one row at a time. A payload that belongs to no cell in the
+    window is the fault worth stopping for — it means a label is on the web
+    that the sheet does not expect here.
+
+    Which way it slides is `step`. The printer lays the sheet down the reel
+    in order, but a reel wound onto a second spool comes off it the other way
+    round: the last row printed is the first one past the camera. So the
+    window walks the sheet backwards, from the row it anchors on toward row
+    one, and everything that means "further into the window" or "already
+    behind us" is measured along that direction rather than up the row
+    numbers. Nothing else changes -- a payload still identifies its own row
+    and column, which is what made the matching indifferent to order in the
+    first place.
     """
 
     MATCH, REPEAT, UNKNOWN = "match", "repeat", "unknown"
     UNREAD = "unread"          # a group went by and nothing on it decoded
+    FORWARD, REVERSE = 1, -1
 
-    def __init__(self, sheet, size=8, check=None, grace=4):
+    def __init__(self, sheet, size=8, check=None, grace=4, step=FORWARD):
         self.sheet = sheet
         self.size = max(1, size)
         self.check = check
+        self.step = self.REVERSE if step < 0 else self.FORWARD
         # Rows kept in the lookup *behind* the head. A label stays in view for
         # many frames and is decoded on every one, so codes keep arriving for
         # rows that already finished. Keeping those rows matchable lets such a
@@ -347,11 +380,29 @@ class RollingWindow:
         self.repeats = 0
 
     # ── window contents ───────────────────────────────────────────────────
+    def _in_sheet(self, row_idx):
+        return 0 <= row_idx < len(self.sheet.rows)
+
+    def depth(self, row_idx):
+        """How far into the window a row sits, along the direction of travel.
+
+        0 is the head, positive is ahead of it and still to come, negative is
+        behind it and already retired. Everywhere this file used to subtract
+        row numbers it asks this instead, which is the whole of what makes
+        the reverse pass work.
+        """
+        return (row_idx - self.start) * self.step
+
     def rows(self):
         if self.start is None:
             return []
-        end = min(self.start + self.size, len(self.sheet.rows))
-        return list(range(self.start, end))
+        out = []
+        for i in range(self.size):
+            row_idx = self.start + i * self.step
+            if not self._in_sheet(row_idx):
+                break                       # ran off the end of the sheet
+            out.append(row_idx)
+        return out
 
     def required(self, row_idx):
         """Columns that must be decoded before this row can retire."""
@@ -365,17 +416,22 @@ class RollingWindow:
 
     def _rebuild(self):
         """The payload lookup covers the window plus the grace rows behind it,
-        which is what makes 'not expected here' meaningful."""
+        which is what makes 'not expected here' meaningful. Behind means
+        behind along the direction of travel, not down the row numbers."""
         self.index = {}
-        lo = max(0, self.start - self.grace) if self.start is not None else 0
-        for row_idx in list(range(lo, self.start or 0)) + self.rows():
+        behind = []
+        if self.start is not None:
+            behind = [self.start - i * self.step
+                      for i in range(1, self.grace + 1)]
+            behind = [r for r in behind if self._in_sheet(r)]
+        for row_idx in behind + self.rows():
             for col, text in enumerate(self.sheet.rows[row_idx].texts):
                 key = normalize(text)
                 if key:
                     self.index.setdefault(key, []).append((row_idx, col))
 
     def anchor(self, row_idx):
-        self.start = max(0, row_idx)
+        self.start = min(max(row_idx, 0), len(self.sheet.rows) - 1)
         self.seen = {}
         self._rebuild()
         return self.sheet.rows[self.start].number
@@ -388,7 +444,10 @@ class RollingWindow:
         hits = self.index.get(normalize(text))
         if not hits:
             return self.UNKNOWN, None, None, None
-        row_idx, col = min(hits, key=lambda h: h[0])   # nearest the head
+        # Nearest the head, measured along the direction of travel: the rows
+        # already retired sit at negative depth and so are found first,
+        # which is what makes a label still in view read as a re-read.
+        row_idx, col = min(hits, key=lambda h: self.depth(h[0]))
         # A datamatrix is printed several times over, and the working copy
         # gives each printing a row of its own, so one payload legitimately
         # holds a cell in each row of its group. The nearest one being
@@ -401,10 +460,11 @@ class RollingWindow:
         # retired, and ticked already before it has; both ask the same
         # question, which is whether a row of this group is still open.
         group = self.sheet.rows[row_idx].group
-        if group is not None and (row_idx < self.start
+        if group is not None and (self.depth(row_idx) < 0
                                   or col in self.seen.get(row_idx, set())):
-            for cand_row, cand_col in sorted(hits):
-                if (cand_row >= self.start
+            for cand_row, cand_col in sorted(
+                    hits, key=lambda h: (self.depth(h[0]), h[1])):
+                if (self.depth(cand_row) >= 0
                         and self.sheet.rows[cand_row].group == group
                         and cand_col not in self.seen.get(cand_row, set())):
                     row_idx, col = cand_row, cand_col
@@ -416,10 +476,10 @@ class RollingWindow:
             # labels printed alike are alike -- so what keeps one label from
             # ticking all three rows is the same carry-forward by overlap
             # that stops any label being decoded twice.
-        if row_idx < self.start:
+        if self.depth(row_idx) < 0:
             self.repeats += 1        # a finished row being read again
             return self.REPEAT, row_idx, col, None
-        slot = row_idx - self.start
+        slot = self.depth(row_idx)
         self.last_hit = (row_idx, col)
         if col in self.seen.get(row_idx, set()):
             self.repeats += 1
@@ -439,12 +499,12 @@ class RollingWindow:
     def advance(self):
         """Retire finished rows from the head. Returns [(row index, True)]."""
         retired = []
-        while self.start is not None and self.start < len(self.sheet.rows):
+        while self.start is not None and self._in_sheet(self.start):
             if self.missing(self.start):
                 break
             retired.append((self.start, True))
             self.done.append((self.start, True))
-            self.start += 1
+            self.start += self.step
         if retired:
             self._rebuild()
         return retired
@@ -452,17 +512,18 @@ class RollingWindow:
     def evict_head(self):
         """Drop the head row even though it is short — the web has moved a
         whole window past it, so it is never going to be completed."""
-        if self.start is None or self.start >= len(self.sheet.rows):
+        if self.start is None or not self._in_sheet(self.start):
             return None
         row_idx = self.start
         self.done.append((row_idx, False))
-        self.start += 1
+        self.start += self.step
         self._rebuild()
         return row_idx
 
     @property
     def exhausted(self):
-        return self.start is not None and self.start >= len(self.sheet.rows)
+        """Walked off the end of the sheet -- whichever end that is."""
+        return self.start is not None and not self._in_sheet(self.start)
 
 
 def _overlap(a, b):
@@ -764,6 +825,15 @@ def main():
                           "one not checked at all.")
     ap.add_argument("--sheet", default=None,
                      help="worksheet name inside --xlsx (default: the first one).")
+    ap.add_argument("--reverse", action="store_true",
+                     default=MACHINE["check_reverse"],
+                     help="check the sheet from its last row toward its "
+                          "first. A reel wound onto a second spool comes off "
+                          "it the other way round, so the last row printed is "
+                          "the first one past the camera and the window has "
+                          "to walk backwards to follow it. The console's "
+                          "CHECK FORWARD / CHECK REVERSE button is the same "
+                          "switch, and can be thrown while the line is idle.")
     ap.add_argument("--dm-repeats", type=int, default=MACHINE["dm_repeats"],
                      help="how many times each DATA MATRIX value is printed "
                           "down the web. Every value in a DATA MATRIX<n> "
@@ -842,9 +912,11 @@ def main():
                           "what re-checks a row that was held open. 0 = "
                           "energise immediately.")
     ap.add_argument("--start-relay", type=int, default=RELAY["start"],
-                     help="the one relay this app drives: it starts the "
-                          "winding machine, and it is only ever closed with "
-                          "the winder in AUTO.")
+                     help="the one relay this app drives. In AUTO it is "
+                          "the console's, closed for a validated run and "
+                          "open otherwise; in MANUAL it is closed and "
+                          "stays closed, and the winder runs on its own "
+                          "controls.")
     ap.add_argument("--relay-verbose", action="store_true",
                      help="print every modbus frame sent to the relay board.")
     ap.add_argument("--no-voice", action="store_true",
@@ -921,6 +993,15 @@ def main():
     # off args because the window can be shrunk by a repeating sheet, and this
     # has to stay inside it.
     hold_after = [1]
+    # Which way the window walks the sheet. Set from the console's CHECK
+    # FORWARD / CHECK REVERSE button, and only while the line is idle: it
+    # decides where the pass goes from here, so throwing it mid-run would
+    # send the window off in the opposite direction from the coil.
+    check_step = [RollingWindow.REVERSE if args.reverse
+                  else RollingWindow.FORWARD]
+
+    def checking_reverse():
+        return check_step[0] == RollingWindow.REVERSE
 
     def _open_sheet():
         """Read args.xlsx and build the rolling window over it.
@@ -978,13 +1059,16 @@ def main():
                       f"window of {size} would see each code twice — "
                       f"using {max(1, room)} instead")
                 size = max(1, room)
-        window = RollingWindow(sheet, size=size, check=checked, grace=grace)
+        window = RollingWindow(sheet, size=size, check=checked,
+                               grace=grace, step=check_step[0])
         hold_after[0] = max(1, min(args.hold_after, window.size - 1))
         # Only once it has parsed: the recent list is for sheets that worked.
         prefs.remember_sheet(args.xlsx)
         print(f"[window] rolling window of {window.size} sheet rows "
-              f"(+{window.grace} kept behind for re-reads); every QR in frame "
-              f"is matched on its own, order does not matter")
+              f"(+{window.grace} kept behind for re-reads), walking the "
+              f"sheet "
+              + ("BACKWARDS, last row first — the reel is wound over"
+                 if checking_reverse() else "forwards, first row first"))
 
     if args.xlsx:
         try:
@@ -1019,16 +1103,26 @@ def main():
         return window is not None
 
     machine_running = False
-    # The winder's mode, as the console shows it. AUTO is the only position
-    # this app may close the start relay in; MANUAL means the operator has
-    # the coil in their hands, and a motor that could start itself while
-    # they do is the hazard the switch exists to remove.
+    # The winder's mode. In AUTO the start relay is the console's, closed
+    # when a run has been validated into life and open otherwise; in MANUAL
+    # it is closed and stays closed, and the machine runs on its own
+    # controls with this app out of the way.
     #
-    # It opens in MANUAL, every time, and is never remembered between runs.
-    # An app that came back up in AUTO would be an app that can energise a
-    # winder because of something somebody chose yesterday, and the point of
-    # the switch is that it is chosen now, by whoever is standing there.
-    winder_auto = [False]
+    # None until somebody says. Not False: MANUAL means a closed contact on
+    # a maintained start input, and this app is not going to make that
+    # decision on its own at launch -- it may be launching from a desktop
+    # shortcut, or on boot, with nobody yet standing at the machine. So it
+    # starts with the relay open, shows MANUAL because that is what an open
+    # console with no run in it amounts to, and applies whichever mode the
+    # operator picks first, even if they pick the one already showing.
+    #
+    # Never remembered between runs, either. An app that came back up and
+    # closed a start contact because of something chosen yesterday is the
+    # hazard the switch exists to remove.
+    winder_auto = [True]
+
+    def winder_is_auto():
+        return bool(winder_auto[0])
     # When START was pressed, or None when it was not. Between that moment and
     # --start-delay seconds later the camera is reading but the relay is still
     # off: the coil is standing still in front of the lens, which is the one
@@ -1058,11 +1152,14 @@ def main():
             _note[0] = "Load the sheet for this roll before starting"
             voice.say("Load a sheet first.", key="no-sheet")
             return
-        if not winder_auto[0]:
+        if not winder_is_auto():
             # The winder is on hand control. Its motor is the operator's, and
             # nothing this app does may take it back off them.
-            print("[ui] the winder is in MANUAL — put it in AUTO to run")
-            _note[0] = "Winder is in MANUAL — switch to AUTO to run"
+            print("[ui] the winder is in MANUAL — it is running on its "
+                  "own controls. Switch to AUTO to hand it to the "
+                  "console.")
+            _note[0] = "Winder is in MANUAL — switch to AUTO to run "\
+                       "from here"
             voice.say("Put the winder in auto.", key="manual")
             return
         starting_at[0] = time.time()
@@ -1124,47 +1221,96 @@ def main():
               f"— relay {args.start_relay} ON")
         voice.say("Machine running.", key="running")
 
-    def stop_machine(reason="operator"):
+    def stop_machine(reason="operator", open_relay=True):
+        """Stop the line. `open_relay` is only ever False for the handover to
+        MANUAL, where the contact is not opening at all -- it is staying
+        closed for the operator, and taking it off and putting it straight
+        back would be a pulse on a start input."""
         nonlocal machine_running
         aborted = starting_at[0] is not None
         starting_at[0] = None
         if not machine_running and not aborted:
             return
-        relay.off(args.start_relay)
+        if open_relay:
+            relay.off(args.start_relay)
         machine_running = False
         _note[0] = reason
         what = "start ABORTED" if aborted and not machine_running else "STOPPED"
-        print(f"\n[relay] winding machine {what} ({reason}) "
-              f"— relay {args.start_relay} OFF")
+        print(f"\n[relay] winding machine {what} ({reason}) — relay "
+              f"{args.start_relay} "
+              + ("OFF" if open_relay else "stays ON for hand control"))
         # A fault announces itself, in its own words, at the point it is
         # raised; this is only for the ordinary stops.
         if fault["kind"] is None:
             voice.say("Machine stopped.", key="stopped")
 
-    def set_winder(auto):
-        """AUTO or MANUAL, from the console's toggle.
+    def set_direction(reverse):
+        """CHECK FORWARD / CHECK REVERSE, from the console.
 
-        Going to MANUAL is a stop, not a mode change to be applied later:
-        the operator is reaching for the coil now. The relay opens before
-        anything else happens, and a run part-way through its read-in is
-        abandoned with it.
+        Which end of the sheet the pass is working toward. Changing it
+        restarts the pass rather than turning the window round where it
+        stands: the rows already ticked off were ticked in the other
+        direction, and the window has to find the coil again from whatever
+        code comes past next. What the run has recorded is untouched -- the
+        journal is the record of which rows were checked, and they were.
+        """
+        nonlocal window
+        reverse = bool(reverse)
+        if reverse == checking_reverse():
+            return
+        if not _configurable():
+            print("[ui] stop the machine before changing the check direction")
+            return
+        check_step[0] = RollingWindow.REVERSE if reverse else \
+            RollingWindow.FORWARD
+        which = ("REVERSE — last row of the sheet first, for a reel wound "
+                 "onto a second spool" if reverse else
+                 "FORWARD — first row of the sheet first, as printed")
+        print(f"\n[window] checking {which}")
+        if window is not None:
+            fresh = RollingWindow(sheet, size=window.size, check=checked,
+                                  grace=window.grace, step=check_step[0])
+            # The pass starts again; the run's tally does not.
+            fresh.done, fresh.reads = window.done, window.reads
+            fresh.repeats = window.repeats
+            window = fresh
+            print(f"[window] the window will re-anchor on the next code it "
+                  f"recognises")
+        _note[0] = f"Checking {'in reverse' if reverse else 'forward'}"
+
+    def set_winder(auto):
+        """AUTO or MANUAL, from the console's toggle. The relay follows it.
+
+        MANUAL hands the winder back: the contact closes and stays closed,
+        so the machine runs on its own controls with this app standing out
+        of the way. It is not a stop -- the coil may well keep turning --
+        but it is the end of anything the console was doing, so a run
+        part-way through its read-in is abandoned and START goes dead.
+
+        AUTO takes it back, and takes it back open: in AUTO the contact is
+        the app's to close, and it closes it when the labels standing in
+        front of the camera have been read and not before.
+
+        The contact is never taken off and put straight back on the way
+        into MANUAL. It is a maintained start input, and a gap in it is a
+        pulse -- which is the one edge a motor starter is built to act on.
         """
         auto = bool(auto)
         if auto == winder_auto[0]:
             return
         winder_auto[0] = auto
         if auto:
-            print("\n[winder] AUTO — the line may be started from the console")
+            print(f"\n[winder] AUTO — relay {args.start_relay} OFF; the line "
+                  f"is the console's to start now")
+            relay.off(args.start_relay)
             _note[0] = None
             voice.say("Winder in auto.", key="winder-auto")
             return
-        print("\n[winder] MANUAL — the coil is on hand control")
-        stop_machine("winder switched to manual")
-        # stop_machine only opens the relay when something was running. This
-        # is a mode, not a stop: whatever the app believed, the relay is
-        # open from here until AUTO is chosen again.
-        relay.off(args.start_relay)
-        _note[0] = "Winder in MANUAL — START is off"
+        print(f"\n[winder] MANUAL — relay {args.start_relay} ON; the winder "
+              f"runs on its own controls")
+        stop_machine("winder switched to manual", open_relay=False)
+        relay.on(args.start_relay)
+        _note[0] = "Winder in MANUAL — the machine is on hand control"
         voice.say("Winder in manual.", key="winder-manual")
 
     def scanning():
@@ -1834,7 +1980,10 @@ def main():
         _open_journal()
         _stamp_record()
         if verified:
-            last = max(verified)
+            # Where the last run got to is the far end of what it
+            # checked, and which end that is depends on which way it
+            # was walking the sheet.
+            last = min(verified) if checking_reverse() else max(verified)
             by_number = {r.number: i for i, r in enumerate(sheet.rows)}
             resume_hint[0] = by_number.get(last)
             done = sum(1 for _, st in verified.values() if st == "OK")
@@ -1891,6 +2040,7 @@ def main():
         forgiven.clear()
         bounced.clear()
         credited.clear()
+        pending_crops.clear()
         rewound[0] = 0
         recheck["row"] = None
         recheck["attempt"] = 0
@@ -2140,14 +2290,21 @@ def main():
         # yet, so it lies ahead -- but by how far is not known, and that is
         # what decides whether a distance can honestly be quoted.
         unknown = len(here) - len(rows)
-        behind = [r for r in rows if r < target]
-        ahead = [r for r in rows if r > target]
+        # How far each of them sits from the held row, counted the way the
+        # pass runs: negative is already gone past, positive is still to
+        # come. On a reel being checked backwards the row numbers run the
+        # other way, and comparing them raw would send the operator winding
+        # in exactly the wrong direction.
+        step = window.step
+        gaps = [(r - target) * step for r in rows]
+        behind = [d for d in gaps if d < 0]
+        ahead = [d for d in gaps if d > 0]
 
         if behind and not ahead and not unknown:
-            return (f">> WOUND TOO FAR - wind forward {target - max(behind)} "
+            return (f">> WOUND TOO FAR - wind forward {-max(behind)} "
                     f"row(s), until row {fault['row']} shows", FAULT_OVER)
         if not behind:
-            gap = (f" - {min(ahead) - target} more row(s)"
+            gap = (f" - {min(ahead)} more row(s)"
                    if ahead and not unknown else "")
             return (f">> KEEP WINDING BACK{gap}, until row {fault['row']} "
                     f"shows", FAULT_WANT)
@@ -2427,6 +2584,10 @@ def main():
         logo_dets = [d for d in dets if int(d[5]) == logo_cls]
         label_dets = [d for d in dets if int(d[5]) == label_cls]
 
+        # Crops held back from an earlier frame, in case this one has
+        # the label whole.
+        _flush_crops(frame, label_dets)
+
         # How fast the coil is running, in the only units that matter here:
         # pixels of this picture, per frame. It is what the saved crop
         # reaches back by, so the margin follows the winder up and down
@@ -2562,7 +2723,7 @@ def main():
                     print(f"[window]   load the sheet that goes with this "
                           f"roll, or put the right roll on")
                     if saver is not None:
-                        saver.save(frame, det[:4], text, label_dets, motion[0])
+                        _save_crop(frame, det[:4], text, label_dets)
                     _raise_fault("mismatch", text=text,
                                  belongs="nothing in this sheet",
                                  seen=time.time(),
@@ -2651,7 +2812,7 @@ def main():
                 print(f"[window]   belongs to {belongs}; window starts at row {head}")
                 window.note_unexpected(text, belongs)
                 if saver is not None:
-                    saver.save(frame, det[:4], text, label_dets, motion[0])
+                    _save_crop(frame, det[:4], text, label_dets)
                 _raise_fault("unexpected", text=text, belongs=belongs,
                              seen=time.time(),
                              box=tuple(float(v) for v in det[:4]))
@@ -2683,7 +2844,7 @@ def main():
                     print(f"[window] row {row_no} {up(col)} ok "
                           f"(slot {slot})")
                 if saver is not None:
-                    saver.save(frame, det[:4], text, label_dets, motion[0])
+                    _save_crop(frame, det[:4], text, label_dets)
 
                 # A code this far past the head means the coil has moved
                 # on and the head row is not going to fill in on its own --
@@ -2724,6 +2885,19 @@ def main():
     # that repeats every few rows.
     credited = {}
     rewound = [0]            # times an already-signed-off code came past again
+    # Crops waiting for a frame worth taking them from. A label is decoded on
+    # whichever frame it first reads on, and that can easily be one where it
+    # is half out of the picture -- the code can be wholly inside the sensor
+    # while the rest of the label is not. The box is right; the label is
+    # simply not all there. Saving from that frame is where a crop with the
+    # code sliced down one edge comes from, and why the same label comes out
+    # 244px wide one pass and 301 the next.
+    #
+    # So the two are separated: read it when it can be read, photograph it
+    # when it is whole. A label stands in front of the camera for many
+    # frames, so the wait is nearly always a frame or two.
+    pending_crops = []       # [{"box", "text", "seen"}]
+    CROP_PATIENCE = 120      # frames to wait for a clean look before giving up
     # The web's travel between the last two frames, and the label boxes that
     # measured it. Kept here rather than worked out per crop: every label in
     # the picture is on the same web, so it is one measurement a frame.
@@ -2750,6 +2924,60 @@ def main():
     PARTS = ("QR", "LOGO")   # every label carries both
     EDGE_MARGIN = 12         # px of picture edge a label must stand clear of
     PART_OF_FULL = 0.85      # of the median label height, to count as whole
+
+    def _whole_label(box, frame, label_dets):
+        """Is all of this label inside the picture?
+
+        Touching the edge is the obvious half of it. The other half is a box
+        that came back short of what its neighbours measure: a label on its
+        way out of frame stops at the sensor boundary, and the boundary is
+        not always the very last pixel. Measured against the labels standing
+        beside it, so it needs no notion of how big a label ought to be.
+        """
+        if _at_edge(box, frame, EDGE_MARGIN):
+            return False
+        if len(label_dets) < 3:
+            return True                  # nothing to measure against
+        widths = sorted(float(d[2]) - float(d[0]) for d in label_dets)
+        heights = sorted(float(d[3]) - float(d[1]) for d in label_dets)
+        full_w = widths[len(widths) // 2] * PART_OF_FULL
+        full_h = heights[len(heights) // 2] * PART_OF_FULL
+        return (box[2] - box[0]) >= full_w and (box[3] - box[1]) >= full_h
+
+    def _save_crop(frame, box, text, label_dets):
+        """Write the crop, or hold it until the label is all in the picture."""
+        if saver is None:
+            return
+        box = tuple(float(v) for v in box[:4])
+        if _whole_label(box, frame, label_dets):
+            saver.save(frame, box, text, label_dets, motion[0])
+            return
+        pending_crops.append({"box": box, "text": text, "seen": 0})
+
+    def _flush_crops(frame, label_dets):
+        """Take the crops that have been waiting, off this frame if it will
+        do. One pass per frame, and a label that never comes whole into the
+        picture is let go rather than saved badly."""
+        if saver is None or not pending_crops:
+            return
+        keep = []
+        for item in pending_crops:
+            best, score = None, 0.45
+            for det in label_dets:
+                other = tuple(float(v) for v in det[:4])
+                lap = _overlap(item["box"], other)
+                if lap > score:
+                    best, score = other, lap
+            item["seen"] += 1
+            if best is None:
+                continue                 # gone from the picture; let it go
+            if _whole_label(best, frame, label_dets):
+                saver.save(frame, best, item["text"], label_dets, motion[0])
+                continue
+            item["box"] = best           # follow it while it is still here
+            if item["seen"] < CROP_PATIENCE:
+                keep.append(item)
+        pending_crops[:] = keep
 
     def _clear_look(box, frame, full):
         """Is this a frame the label's printing can be judged from?
@@ -3279,6 +3507,8 @@ def main():
                 _apply_label_dir(arg)
             elif name == "winder":
                 set_winder(arg)
+            elif name == "direction":
+                set_direction(arg)
             elif name == "camera":
                 _set_camera(arg)
             elif name == "debug":
@@ -3308,7 +3538,7 @@ def main():
         # ready to go, and saying so is the difference between an operator
         # pressing START and wondering why nothing happens, and an operator
         # reaching for the selector.
-        return "idle" if winder_auto[0] else "manual"
+        return "idle" if winder_is_auto() else "manual"
 
     # The counters, the window's check status and the decoder tally are
     # diagnostics, not something an operator acts on, so they stay off the
@@ -3603,7 +3833,8 @@ def main():
             # START is dead until a sheet says what this roll should be, and
             # until the winder is handed over to the console.
             "loaded": loaded(),
-            "winder_auto": winder_auto[0],
+            "winder_auto": winder_is_auto(),
+            "reverse": checking_reverse(),
             # What the sliders behind 's' are built from: the camera's own
             # limits, and where it is set now.
             "camera": {"ranges": camera.ranges, "values": cam_values[0]},

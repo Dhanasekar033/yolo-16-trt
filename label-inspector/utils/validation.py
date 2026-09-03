@@ -161,6 +161,7 @@ class ValidationSheet:
                 self.by_text.setdefault(key, []).append((row.index, col))
 
         wb.close()
+        self._find_repeats()
         self.dm_rows = sum(1 for r in self.rows if r.is_dm)
         # How many times an ordinary payload appears, which is what says the
         # sheet is one block of codes duplicated over and over. The
@@ -172,18 +173,66 @@ class ValidationSheet:
               f"{self.per_row} codes = {len(self.by_text)} unique payloads")
         if self.dm_rows:
             groups = len({r.group for r in self.rows if r.is_dm})
+            told = kind_at is not None
             print(f"[validate] {self.dm_rows} of those rows are datamatrix — "
                   f"{groups} value(s) per up, each printed "
-                  f"{self.dm_rows // max(groups, 1)}x down the web")
+                  f"{self.dm_rows // max(groups, 1)}x down the web"
+                  + ("" if told else ", read off the sheet itself: those rows "
+                                     "repeat the row above them"))
         if self.repeats > 1:
             print(f"[validate] the sheet repeats: each payload appears up to "
                   f"{self.repeats} times, so a code is matched to the "
                   f"occurrence nearest the expected row")
 
+    def _find_repeats(self):
+        """Rows that hold the same payloads as the row before them.
+
+        Every payload on this line is unique, so a row repeating the one
+        above it is not a coincidence and not a mistake: it is one value
+        printed several times over down the web, which is how the datamatrix
+        is laid down. That has to be recognised or the second and third
+        printings read as re-reads of the first and their rows never
+        complete -- the line stops on a reel that is perfectly good.
+
+        Recognised here, from the rows themselves, rather than taken on
+        trust from a column that says so. utils/prepare.py writes such a
+        column when it expands a DATA MATRIX column into rows, and those
+        markings are kept; but a sheet that arrives already expanded --
+        which is what the printer's own output now looks like -- carries
+        nothing to say what those rows are, and would otherwise stop the
+        line at every one of them.
+        """
+        keys = [tuple(normalize(t) for t in r.texts) for r in self.rows]
+        start = 0
+        for i in range(1, len(self.rows) + 1):
+            if i < len(self.rows) and keys[i] == keys[start]:
+                continue
+            if i - start > 1:               # a run of identical rows
+                head = self.rows[start]
+                for printing, idx in enumerate(range(start, i), start=1):
+                    row = self.rows[idx]
+                    # An explicit CODE TYPE column wins: it knows which
+                    # symbol these are, and this only knows that they repeat.
+                    if row.group is None:
+                        row.group = f"rep{head.number}"
+                        row.kind = DATA_MATRIX
+                        row.printing = printing
+                        if row.source is None:
+                            row.source = head.number
+            start = i
+
     @property
     def has_dm(self):
         """Is there a datamatrix anywhere in this sheet? Decides whether the
-        reader is asked to look for one at all."""
+        reader is asked to look for one at all.
+
+        A repeated row counts. Nothing in a sheet says outright which symbol
+        a code is printed as, but on this line a payload printed several
+        times in a row is the datamatrix stretch, and the two mistakes are
+        not equal: looking for a datamatrix that is not there costs a
+        fraction of a millisecond on crops that fail anyway, while not
+        looking for one that is there stops the line on every label of it.
+        """
         return bool(self.dm_rows)
 
     def find(self, text, near=None):

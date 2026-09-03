@@ -188,6 +188,16 @@ def prepare(src, dest_dir, sheet=None, repeats=REPEATS, force=False,
                     row[hr_cols[n]] = text     # what is printed beside it
             sheet_out.append(row + [DM, printing, number])
 
+    if not expanded:
+        # The columns are there but every one of them is empty. There is
+        # nothing to expand, so there is nothing a copy would say that the
+        # sheet does not already, and a prepared_ file that is a byte-for-byte
+        # restatement of the original is only something else to keep in step.
+        if not quiet:
+            print(f"[prepare] {os.path.basename(src)} has DATA MATRIX columns "
+                  f"but no values in them — running against it as it is")
+        return src
+
     os.makedirs(dest_dir, exist_ok=True)
     tmp = dest + ".tmp"
     out.save(tmp)

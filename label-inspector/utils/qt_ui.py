@@ -37,7 +37,14 @@ import numpy as np
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from utils.config import app_dir, bundle_dir
+
 Qt = QtCore.Qt
+
+# The mark drawn in the header. Beside the application first and in
+# the bundle after -- the order config.asset() uses -- so a re-branded
+# logo can be dropped in next to the exe without a rebuild.
+LOGO_FILE = "vikbot-logo.png"
 
 # RGB here, unlike the rest of the app: this is Qt's side of the fence.
 INK = "#1a1613"
@@ -250,6 +257,64 @@ class VideoView(QtWidgets.QWidget):
         p.drawRect(QtCore.QRectF(2, 2, w - 4, h - 4))
 
 
+class ToggleSwitch(QtWidgets.QAbstractButton):
+    """A two-position selector, drawn as one.
+
+    A pushbutton that stays down says "I have been pressed"; a switch says
+    "the machine is in this position", which is the thing that matters when
+    the position decides whether a relay is closed. It is painted rather
+    than styled because Qt has no switch, and a checkbox with a stylesheet
+    over it still reads as a checkbox at arm's length across a machine.
+
+    The two labels sit inside the track, both always legible, with the knob
+    over the one in force -- so it can be read from the far side of the
+    winder without having to remember which way round on means.
+    """
+
+    def __init__(self, off_text, on_text, parent=None, scale=1.0,
+                 on_colour=OK, off_colour=WARN):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._texts = (off_text, on_text)
+        self._colours = (off_colour, on_colour)
+        self._k = scale
+        self.setFixedHeight(int(44 * scale))
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Fixed)
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        r = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = r.height() / 2.0
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor(PANEL))
+        p.drawRoundedRect(r, radius, radius)
+
+        # The knob covers its half of the track, and carries the colour.
+        half = QtCore.QRectF(r.left() + (r.width() / 2.0 if self.isChecked()
+                                         else 0.0),
+                             r.top(), r.width() / 2.0, r.height())
+        p.setBrush(QtGui.QColor(self._colours[bool(self.isChecked())]))
+        p.drawRoundedRect(half.adjusted(2, 2, -2, -2), radius - 2, radius - 2)
+
+        font = QtGui.QFont("DejaVu Sans", 0, QtGui.QFont.Bold)
+        font.setPointSizeF(max(8.0 * self._k, 6.0))
+        font.setLetterSpacing(QtGui.QFont.PercentageSpacing, 105)
+        p.setFont(font)
+        for i, text in enumerate(self._texts):
+            side = QtCore.QRectF(r.left() + i * r.width() / 2.0, r.top(),
+                                 r.width() / 2.0, r.height())
+            live = bool(self.isChecked()) == bool(i)
+            p.setPen(QtGui.QColor("#12100e" if live else MUTED))
+            p.drawText(side, Qt.AlignCenter, text)
+
+    def sizeHint(self):
+        return QtCore.QSize(int(150 * self._k), int(44 * self._k))
+
+
 class CameraDialog(QtWidgets.QDialog):
     """Exposure, gain and brightness, over the live picture.
 
@@ -405,7 +470,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
     KEYS = {Qt.Key_F11: "fullscreen"}
     CHORDS = {"Ctrl+Alt+E": "camera", "Ctrl+Alt+W": "debug"}
 
-    def __init__(self, title="VIKBOT Label Inspect"):
+    def __init__(self, title=" Label Inspect"):
         super().__init__()
         self.setWindowTitle(title)
 
@@ -435,6 +500,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._running = False
         self._loaded = None
         self._winder_auto = None
+        self._reverse = None
         self._fault_text = None
         # What the camera says it can do and where it is set, kept fresh off
         # the snapshot so the dialog opens showing the truth rather than
@@ -491,14 +557,6 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                  color: #2a0505; }}
             QPushButton#start:disabled, QPushButton#stop:disabled {{
                 background: #3a423c; color: #79817a; }}
-            /* The winder selector reads as the position it is in, not as a
-               button waiting to be pressed: amber for MANUAL, because the
-               relay is open and the line cannot run, and green for AUTO
-               once it can. */
-            QPushButton#winder {{ font-size: {int(14 * k)}px; font-weight: 700;
-                                  letter-spacing: 1px; border: none;
-                                  background: {WARN}; color: #2a2205; }}
-            QPushButton#winder:checked {{ background: {OK}; color: #08240f; }}
             QPushButton#secondary {{ font-size: {int(12 * k)}px; font-weight: 600;
                                      color: {ACCENT};
                                      padding: {int(10 * k)}px {int(8 * k)}px; }}
@@ -550,6 +608,21 @@ class InspectorWindow(QtWidgets.QMainWindow):
         f.setFixedHeight(1)
         return f
 
+    def _logo(self, height):
+        """The Vikbot mark, scaled to sit with the header type.
+
+        Artwork that has gone missing must never be the thing that stops a
+        line, so a logo that cannot be found is simply not drawn and the
+        header falls back to the accent mark and the title on their own.
+        """
+        for base in (app_dir(), bundle_dir()):
+            path = os.path.join(base, LOGO_FILE)
+            if os.path.exists(path):
+                pix = QtGui.QPixmap(path)
+                if not pix.isNull():
+                    return pix.scaledToHeight(height, Qt.SmoothTransformation)
+        return None
+
     def _header(self, title):
         bar = QtWidgets.QFrame()
         bar.setObjectName("header")
@@ -561,6 +634,12 @@ class InspectorWindow(QtWidgets.QMainWindow):
         mark.setFixedWidth(4)
         mark.setStyleSheet(f"background: {ACCENT}; border-radius: 2px;")
         row.addWidget(mark)
+
+        logo = self._logo(int(30 * self._k))
+        if logo is not None:
+            badge = QtWidgets.QLabel()
+            badge.setPixmap(logo)
+            row.addWidget(badge)
 
         self.title_label = QtWidgets.QLabel(title, objectName="title")
         row.addWidget(self.title_label)
@@ -608,17 +687,6 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.setContentsMargins(14, 14, 14, 14)
         col.setSpacing(8)
 
-        # The winder's own selector, mirrored on the console. AUTO is the
-        # only position this app is allowed to drive the motor in; MANUAL
-        # means the operator has the coil and the relay is open, so START
-        # has nothing to offer and says so by being dead. It sits above
-        # START because it governs it -- you set the mode, then you start.
-        self.winder_btn = QtWidgets.QPushButton(objectName="winder")
-        self.winder_btn.setCheckable(True)
-        self.winder_btn.setFixedHeight(int(46 * self._k))
-        self.winder_btn.clicked.connect(
-            lambda on: self.command.emit("winder", bool(on)))
-
         self.start_btn = QtWidgets.QPushButton("START", objectName="start")
         self.stop_btn = QtWidgets.QPushButton("STOP", objectName="stop")
         self.sheet_btn = QtWidgets.QPushButton("LOAD SHEET",
@@ -636,9 +704,6 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.out_btn.clicked.connect(self._choose_output)
         for b in (self.start_btn, self.stop_btn):
             b.setFixedHeight(int(58 * self._k))
-        col.addWidget(QtWidgets.QLabel("WINDER", objectName="caption"))
-        col.addWidget(self.winder_btn)
-        col.addSpacing(6)
         col.addWidget(self.start_btn)
         col.addWidget(self.stop_btn)
         col.addSpacing(6)
@@ -675,7 +740,27 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.addWidget(self.debug_box)
         self.debug_box.hide()
 
+        # The two selectors live at the foot of the column, under everything
+        # that acts, because neither of them acts: they say what the machine
+        # is set to. Direction above winder because it is set once when the
+        # reel goes on, while the winder is thrown all shift.
         col.addStretch(1)
+
+        col.addWidget(QtWidgets.QLabel("CHECK DIRECTION",
+                                       objectName="caption"))
+        self.dir_switch = ToggleSwitch("FORWARD", "REVERSE", scale=self._k,
+                                       on_colour=ACCENT, off_colour=ACCENT)
+        self.dir_switch.clicked.connect(
+            lambda on: self.command.emit("direction", bool(on)))
+        col.addWidget(self.dir_switch)
+
+        col.addSpacing(10)
+        col.addWidget(QtWidgets.QLabel("WINDER", objectName="caption"))
+        self.winder_btn = ToggleSwitch("MANUAL", "AUTO", scale=self._k,
+                                       on_colour=OK, off_colour=WARN)
+        self.winder_btn.clicked.connect(
+            lambda on: self.command.emit("winder", bool(on)))
+        col.addWidget(self.winder_btn)
         return side
 
     def _footer(self):
@@ -887,11 +972,15 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                               "unread", "incomplete"))
             self.stop_btn.setEnabled(self._running)
             self.winder_btn.setChecked(auto)
-            self.winder_btn.setText("AUTO" if auto else "MANUAL")
 
         camera = snap.get("camera") or {}
         self._camera_ranges = camera.get("ranges") or {}
         self._camera_values = camera.get("values") or {}
+
+        reverse = bool(snap.get("reverse", False))
+        if reverse != self._reverse:
+            self._reverse = reverse
+            self.dir_switch.setChecked(reverse)
 
         self._recent = list(snap.get("recent") or ())
         configurable = bool(snap.get("configurable", True))
@@ -900,6 +989,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.sheet_btn.setEnabled(configurable)
             self.recent_btn.setEnabled(configurable)
             self.out_btn.setEnabled(configurable)
+            self.dir_switch.setEnabled(configurable)
 
         self._sheet_dir = snap.get("sheet_dir", "")
         self._out_dir = snap.get("labeldir", "")

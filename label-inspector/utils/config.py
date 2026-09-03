@@ -92,6 +92,12 @@ DEFAULTS = {
         "no_read_secs": 1.5,
         "rewind_clear": 2.5,
         "dm_repeats": 3,         # printings of each datamatrix down the web
+        # Which way the sheet is walked. The printer lays it down the reel in
+        # order, but a reel wound onto a second spool comes off it the other
+        # way round -- last row printed, first past the camera. true makes
+        # that the starting position; the console can flip it either way
+        # while the line is idle.
+        "check_reverse": False,
         "max_ups": 8,            # ups the voice is warmed up for before a
                                  # sheet says how many there really are
     },
