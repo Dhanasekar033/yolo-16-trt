@@ -94,6 +94,25 @@ DEFAULTS = {
         # the reel coming up NO READ and stopping the line.
         "datamatrix": True,
     },
+    # Reading the codes straight off the picture, with the detector switched
+    # out of the way. The console's SCAN selector is this setting, and what
+    # is written here is the position it opens in.
+    "scan": {
+        "direct": False,
+        # How far the frame is shrunk before it is read. Whole-frame reading
+        # costs about 21ms of a ~17ms frame budget at 5MP and about 3ms at
+        # half size; the small print is what pays for it, so this comes down
+        # only as far as the codes on this reel will still read.
+        "scale": 1.0,
+        # From the code out to the edges of the crop that is saved, in
+        # pixels of the picture. There is no label box in this mode -- the
+        # symbol is the only thing on the frame anything is known about --
+        # so the label is cut out around it by these four margins, set at
+        # the machine against the live picture. They are per side because a
+        # code is printed towards one end of a label, not in the middle of
+        # it.
+        "pad": {"left": 120, "right": 120, "top": 120, "bottom": 120},
+    },
     "machine": {
         "start_delay": 2.0,      # seconds of reading before the relay goes on
         "window_size": 8,
@@ -122,6 +141,12 @@ DEFAULTS = {
         "result_dir": "result",
         "label_dir": None,       # null -> <app_dir>/labels, and the console
                                  # remembers whatever the operator picks
+        # Where the console's CAPTURE FRAME button writes the whole picture,
+        # as the camera saw it. Nothing writes here on its own -- it fills
+        # only when somebody presses the button -- so it is kept apart from
+        # the crops, which arrive by the thousand.
+        "capture_dir": None,     # null -> <app_dir>/captures, and the
+                                 # console remembers the operator's choice
     },
     "voice": {
         "engine": "auto",        # auto | edge | espeak

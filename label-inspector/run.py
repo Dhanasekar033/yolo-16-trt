@@ -182,10 +182,10 @@ import cv2
 
 from utils.camera import CameraControls
 from utils.config import Config, app_dir
-from utils.crops import LabelSaver
+from utils.crops import LabelSaver, timestamp
 from utils.prepare import prepare as prepare_sheet
 from utils.qr import decode_qr, decode_qr_at, decode_qr_pyzbar, \
-    pick_qr_for_label, read_datamatrix
+    pick_qr_for_label, read_datamatrix, scan_codes
 from utils.relay import RelayController
 from utils.results import ResultLog
 from utils.settings import Settings
@@ -207,6 +207,7 @@ from utils.validation import ValidationSheet, normalize
 CFG = Config()
 CAM, DISP, MODEL = CFG["camera"], CFG["display"], CFG["model"]
 DECODE, MACHINE, RELAY = CFG["decode"], CFG["machine"], CFG["relay"]
+SCAN = CFG["scan"]
 
 # Where this app lives: the directory the application sits in, which under
 # PyInstaller is not the same as the one the code was unpacked to. The
@@ -228,6 +229,11 @@ APP_DIR             = app_dir()
 DEFAULT_RESULT_DIR  = CFG["paths"]["result_dir"] or "result"
 DEFAULT_LABEL_DIR   = CFG.get_path(CFG["paths"]["label_dir"]) or \
     os.path.join(APP_DIR, "labels")
+# Where CAPTURE FRAME writes. Its own folder rather than a corner of the
+# crops one: a capture is a whole picture somebody asked for by hand, and
+# it should not have to be picked out of a folder filling with crops.
+DEFAULT_CAPTURE_DIR = CFG.get_path(CFG["paths"]["capture_dir"]) or \
+    os.path.join(APP_DIR, "captures")
 GS_CAMERA_NAME      = CAM["name"]
 # Ups the voice is warmed up for before a sheet says how many there really
 # are. The console can open with no sheet loaded, and rendering a phrase at
@@ -661,6 +667,33 @@ def parse_check(spec, per_row):
     return wanted
 
 
+def fit_ups(wanted, per_row):
+    """The ups being checked, cut to the sheet that is actually loaded.
+
+    None either way means all of them, which is what the window wants for
+    "hold every column open": a set covering every position would say the
+    same thing the long way round. Ups the sheet does not have are dropped
+    rather than refused -- the tick boxes are remembered across sheets, and
+    a narrower sheet loaded after a wider one must not be left checking a
+    column that is not in it.
+    """
+    if not wanted:
+        return None
+    fitted = {c for c in wanted if 0 <= c < per_row}
+    if not fitted or fitted == set(range(per_row)):
+        return None
+    return fitted
+
+
+def describe_ups(checked, per_row):
+    """What is being checked, in the operator's words."""
+    if checked is None:
+        return f"all {per_row} ups"
+    on = ", ".join(up(i) for i in sorted(checked))
+    off = ", ".join(up(i) for i in range(per_row) if i not in checked)
+    return on + (f" (ignoring {off})" if off else "")
+
+
 def up(col):
     """What a position across the web is called on the machine.
 
@@ -782,6 +815,41 @@ def main():
                           "decodes. At ~2.2ms a call it is cheap enough that "
                           "the cap is a safety net rather than a real "
                           "constraint. 0 = off.")
+    # direct scan args
+    ap.add_argument("--direct-scan", action="store_true",
+                     default=SCAN["direct"],
+                     help="read the codes straight off the picture and leave "
+                          "the detector out of it. zxing is handed the whole "
+                          "frame and asked for every symbol on it at once, so "
+                          "a roll can be checked with no model trained for "
+                          "its labels at all -- and the label crop is cut out "
+                          "around each code by --qr-pad-* rather than round a "
+                          "box the model drew. What is given up with the "
+                          "model is everything the model knew: nothing sees a "
+                          "label that carries no code, so neither the "
+                          "missing-part check nor the nothing-is-reading "
+                          "watchdog can fire. The console's SCAN selector is "
+                          "this switch, and it can be thrown while the line "
+                          "is idle.")
+    ap.add_argument("--scan-scale", type=float, default=SCAN["scale"],
+                     help="how far the frame is shrunk before it is read in "
+                          "--direct-scan. Reading a whole 5MP frame costs "
+                          "about 21ms against a ~17ms frame budget and about "
+                          "3ms at 0.5, but a code has to survive the shrink "
+                          "to be found: bring this down only as far as the "
+                          "codes on this reel still read at.")
+    ap.add_argument("--qr-pad", type=int, default=None,
+                     help="all four --qr-pad-* margins at once.")
+    for _side, _where in (("left", "to the left of"), ("right", "to the right "
+                          "of"), ("top", "above"), ("bottom", "below")):
+        ap.add_argument(f"--qr-pad-{_side}", type=int, default=None,
+                         help=f"pixels of picture kept {_where} the code when "
+                              f"the label crop is cut out around it in "
+                              f"--direct-scan. Per side, because a code is "
+                              f"printed towards one end of a label rather "
+                              f"than in the middle of it. Set from the "
+                              f"console against the live picture, and "
+                              f"remembered between runs.")
     ap.add_argument("--dump-crops", default=None,
                      help="directory to save what the camera saw whenever a "
                           "label was detected but would not decode: the label "
@@ -802,6 +870,12 @@ def main():
                           "operator sets from the console, and the last "
                           "choice is remembered between runs. "
                           f"Default: {DEFAULT_LABEL_DIR}.")
+    ap.add_argument("--capture-dir", default=None,
+                     help="where the console's CAPTURE FRAME button writes "
+                          "the whole picture, as the camera saw it and with "
+                          "none of the console's drawing on it. Set from the "
+                          "console too, and the last choice is remembered "
+                          f"between runs. Default: {DEFAULT_CAPTURE_DIR}.")
     ap.add_argument("--no-save-labels", action="store_true",
                      help="don't save a crop of each decoded label.")
     ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
@@ -856,7 +930,10 @@ def main():
                      help="which ups to validate, across the web, e.g. "
                           "'UP2,UP3' or '2,3' (D2,D3 still works). The rest "
                           "are neither decoded nor held against the row. "
-                          "Default: all of them.")
+                          "Default: all of them, or whatever the console's "
+                          "UPS CHECKED boxes were last left on — this is the "
+                          "same choice made on the command line, and the "
+                          "console has it from the first sheet that loads.")
     ap.add_argument("--no-stop-on-fail", action="store_true",
                      help="keep the machine running when a row fails "
                           "validation (default: stop it).")
@@ -988,6 +1065,10 @@ def main():
         args.label_dir = prefs.label_dir or DEFAULT_LABEL_DIR
     else:
         prefs.remember_label_dir(args.label_dir)
+    if args.capture_dir is None:
+        args.capture_dir = prefs.capture_dir or DEFAULT_CAPTURE_DIR
+    else:
+        prefs.remember_capture_dir(args.capture_dir)
     # The sheet that was loaded last is offered, not reopened. Which roll is
     # on the machine is something only the operator knows, and a sheet that
     # loads itself is one nobody chose: the console lists it under OPEN
@@ -996,12 +1077,61 @@ def main():
         print(f"[settings] {len(prefs.recent)} sheet(s) loaded before — the "
               f"most recent is {prefs.sheet}")
 
+    # ── how the codes are read ───────────────────────────────────────────
+    # Two ways, and the console switches between them while the line is idle.
+    #
+    #   detection   the model finds the labels, and each label's own code box
+    #               is what goes to the reader. Everything the machine knows
+    #               about a label that carries nothing comes from here.
+    #   direct      zxing is handed the frame and asked for every symbol on
+    #               it. Nothing has to be trained for this reel, and nothing
+    #               is known about a label beyond the code printed on it --
+    #               so the label crop is measured out from the code itself,
+    #               by four margins set at the machine.
+    #
+    # The command line wins, then whatever was last set from the console,
+    # then config.json -- the same order as everything else the operator can
+    # reach from the screen.
+    scan_direct = [bool(args.direct_scan)]
+    scan_scale = [float(args.scan_scale or 1.0)]
+    qr_pad = {side: max(int(SCAN["pad"].get(side, 0) or 0), 0)
+              for side in ("left", "right", "top", "bottom")}
+    if not args.direct_scan and isinstance(prefs.scan.get("direct"), bool):
+        scan_direct[0] = prefs.scan["direct"]
+    for side, value in (prefs.scan.get("pad") or {}).items():
+        if side in qr_pad and isinstance(value, (int, float)):
+            qr_pad[side] = max(int(value), 0)
+    if args.qr_pad is not None:
+        qr_pad = {side: max(args.qr_pad, 0) for side in qr_pad}
+    for side in qr_pad:
+        given = getattr(args, f"qr_pad_{side}")
+        if given is not None:
+            qr_pad[side] = max(given, 0)
+    if scan_direct[0]:
+        print(f"[scan] reading codes straight off the picture — no detector, "
+              f"crops cut "
+              + ", ".join(f"{v}px {k}" for k, v in sorted(qr_pad.items()))
+              + " of the code")
+
     # ── the expected sheet, and the window over it ───────────────────────
     # Loaded through a function rather than inline, because the operator can
     # load a different sheet from the console without restarting the app.
     # All None until one is chosen: nothing is read, nothing is recorded and
     # START does nothing while there is no sheet to check the roll against.
     sheet = window = per_row = checked = None
+    # Which ups across the web are being checked, 0-based; None means every
+    # position the sheet has. It belongs to the reel rather than to the
+    # paperwork -- a four-up sheet run three up has a column of labels that
+    # is simply not there, and holding the row open for it would stop the
+    # line at every row -- so it survives a sheet change and a restart, and
+    # the console's tick boxes are what set it.
+    ups_choice = [{n - 1 for n in prefs.ups} if prefs.ups else None]
+    # --check is the same choice made on the command line. It is applied to
+    # the first sheet that loads, where the sheet's width is known and an up
+    # that is out of range can be said so, and from there the tick boxes
+    # have it.
+    ups_from_cli = [bool(args.check)]
+    code_mix = [(0, 0)]      # (qr payloads, datamatrix payloads) in the sheet
     work_xlsx = [None]           # the expanded copy the window runs against
     # How many rows the coil may move past a row that has not read everything
     # before the line is stopped for it. Kept here rather than read straight
@@ -1046,16 +1176,21 @@ def main():
                   f"codes")
             work_xlsx[0] = args.xlsx
         sheet = ValidationSheet(work_xlsx[0], args.sheet)
+        # How the sheet's payloads divide between the two symbols. A QR DATA
+        # column holds either, and which one a code is printed as is the
+        # row's business, not the column's -- so this is counted off the rows
+        # rather than assumed. Done here, once, because the console asks for
+        # it on every frame and the answer only changes when a sheet is
+        # loaded.
+        dm_codes = sum(1 for cells in sheet.by_text.values()
+                       if any(sheet.rows[i].is_dm for i, _c in cells))
+        code_mix[0] = (len(sheet.by_text) - dm_codes, dm_codes)
         per_row = args.labels_per_row or sheet.per_row
-        checked = parse_check(args.check, per_row)
-        if checked is None:
-            print(f"[validate] checking all {per_row} positions")
-        else:
-            on = ", ".join(up(i) for i in sorted(checked))
-            off = ", ".join(up(i) for i in range(per_row)
-                            if i not in checked)
-            print(f"[validate] checking {on}"
-                  + (f" (ignoring {off})" if off else ""))
+        if ups_from_cli[0]:
+            ups_from_cli[0] = False
+            ups_choice[0] = parse_check(args.check, per_row)
+        checked = fit_ups(ups_choice[0], per_row)
+        print(f"[validate] checking {describe_ups(checked, per_row)}")
 
         size, grace = args.window_size, args.window_grace
         period = sheet_period(sheet)
@@ -1287,6 +1422,54 @@ def main():
                   f"recognises")
         _note[0] = f"Checking {'in reverse' if reverse else 'forward'}"
 
+    def set_ups(cols):
+        """Which ups across the web are being checked, from the tick boxes.
+
+        A reel is not always run as wide as the sheet was written for: three
+        ups off a four-up sheet leaves a column of labels that is simply not
+        on the web, and holding every row open for it would stop the line at
+        every row. Ticking that up off says so — its cell is neither read
+        nor held against the row, and the .xlsx and the CSV both record it
+        as switched off rather than as a label that failed to read.
+
+        Like the check direction, this restarts the pass rather than
+        changing it underneath itself: the rows part-way through the window
+        were being judged against a different set of ups, so the window is
+        rebuilt and re-anchors on the next code it recognises. What the run
+        has already recorded is untouched.
+        """
+        nonlocal checked, window
+        wanted = {int(c) for c in (cols or ())}
+        if not wanted:
+            # The console will not send this — its last tick will not come
+            # off — but a run that checks nothing passes everything, so it
+            # is refused here too rather than only there.
+            print("[ui] at least one up has to be checked")
+            return
+        if not _configurable():
+            print("[ui] stop the machine before changing which ups are "
+                  "checked")
+            return
+        ups_choice[0] = wanted
+        prefs.remember_ups(sorted(n + 1 for n in wanted))
+        if sheet is None:
+            return                  # remembered; it applies when a sheet does
+        fresh_checked = fit_ups(wanted, per_row)
+        if fresh_checked == checked:
+            return
+        checked = fresh_checked
+        print(f"\n[validate] checking {describe_ups(checked, per_row)}")
+        if window is not None:
+            fresh = RollingWindow(sheet, size=window.size, check=checked,
+                                  grace=window.grace, step=check_step[0])
+            # The pass starts again; the run's tally does not.
+            fresh.done, fresh.reads = window.done, window.reads
+            fresh.repeats = window.repeats
+            window = fresh
+            print(f"[window] the window will re-anchor on the next code it "
+                  f"recognises")
+        _note[0] = f"Checking {describe_ups(checked, per_row)}"
+
     def set_winder(auto):
         """AUTO or MANUAL, from the console's toggle. The relay follows it.
 
@@ -1513,7 +1696,11 @@ def main():
     # its copy in the very first block and the whole run starts again.
     resume_hint = [None]
     handled = [[]]           # boxes whose code was accepted on the last frame
-    last_frame = [None]      # most recent frame, for the diagnostic dump
+    # The most recent frame, for the diagnostic dump and for CAPTURE FRAME.
+    # Kept as it came off the camera: the console's boxes and captions are
+    # drawn on the way to the screen, not onto this, so what is written is
+    # the picture rather than a photograph of the screen.
+    last_frame = [None]
     recent = []              # [(payload, verdict)] most recent decodes
     ever_read = set()        # every payload decoded this run, normalised
     verified = {}          # excel row number -> (per-column marks, status)
@@ -2708,187 +2895,199 @@ def main():
                 _dump_miss(frame, det[:4], qr)
                 continue
             marks[0].append((tuple(float(v) for v in det[:4]), who, text))
+            _offer(frame, det[:4], text, label_dets)
 
-            # The first payload the sheet recognises decides where the window
-            # sits; until then there is nothing to hold anything against.
-            if window.start is None:
-                hit = sheet.find(text, near=resume_hint[0])
-                if hit is None:
-                    # This code is nowhere in the sheet, and nothing has
-                    # anchored the window yet -- so not one label read so far
-                    # belongs to this sheet. That is a coil the sheet does not
-                    # describe: a new roll went on and the sheet was not
-                    # changed with it, or the wrong sheet was loaded.
-                    #
-                    # It has to be caught here rather than by the unexpected
-                    # path below, which only exists once the window has
-                    # anchored. Until then every foreign code fell through
-                    # this `continue` and the machine wound the whole roll
-                    # through, reading and validating nothing.
-                    key = normalize(text)
-                    if fault["kind"] is not None or key in forgiven:
-                        handled[0].append(tuple(float(v) for v in det[:4]))
-                        continue
-                    print(f"\n[window] WRONG COIL FOR THIS SHEET: {text}")
-                    print(f"[window]   this code is in no row of "
-                          f"{os.path.basename(args.xlsx)}, and no code read "
-                          f"so far is either")
-                    print(f"[window]   load the sheet that goes with this "
-                          f"roll, or put the right roll on")
-                    if saver is not None:
-                        _save_crop(frame, det[:4], text, label_dets)
-                    _raise_fault("mismatch", text=text,
-                                 belongs="nothing in this sheet",
-                                 seen=time.time(),
-                                 box=tuple(float(v) for v in det[:4]))
-                    voice.alert("Load the sheet for this roll.",
-                                lead="Stopped. These labels are not in the "
-                                     "sheet.", key="mismatch")
-                    stop_machine("labels do not match the sheet")
-                    continue
-                anchored = window.anchor(hit[0])
-                note = ("" if resume_hint[0] is None else
-                        f", carrying on from row "
-                        f"{sheet.rows[resume_hint[0]].number}")
-                print(f"[window] anchored on sheet row {anchored}"
-                      f"{note} — window covers {window.size} rows from there")
+    def _offer(frame, box, text, label_dets=()):
+        """Put one payload to the window, and act on what it says.
 
-            status, row_idx, col, slot = window.offer(text)
-
-            # Keep what was decoded and where it landed, so a row that comes
-            # up short can be explained rather than just reported.
-            ever_read.add(normalize(text))
-            where = (f"row {sheet.rows[row_idx].number} {up(col)}"
-                     if row_idx is not None else "no row in the window")
-            recent.append((text, f"{status} -> {where}"))
-            del recent[:-40]
-
-            if status == RollingWindow.UNKNOWN:
-                key = normalize(text)
-                if key in forgiven:
-                    # The operator pressed START with this code on screen, so
-                    # it has already been judged by a human. Let it pass.
-                    handled[0].append(tuple(float(v) for v in det[:4]))
-                    continue
-
-                if fault["kind"] == "unexpected" and \
-                        normalize(fault["text"]) == key:
-                    # The label that stopped the line is still in front of the
-                    # camera during the rewind. Say nothing, but keep the
-                    # clock alive: the fault only clears once this code has
-                    # been out of frame for --rewind-clear seconds, and that
-                    # is only measurable if it keeps being decoded while it is
-                    # there — so it is deliberately NOT carried forward.
-                    fault["seen"] = time.time()
-                    fault["in_frame"] = True
-                    fault["box"] = tuple(float(v) for v in det[:4])
-                    continue
-
-                if key in credited:
-                    # This exact payload was matched to a cell and signed off
-                    # earlier in this run, and it has now fallen out of the
-                    # window's memory behind the head. That is the coil
-                    # having been wound back further than it needed to be --
-                    # not a wrong label. The row it belongs to was checked
-                    # and recorded, so let it go past.
-                    #
-                    # It has to be `credited` and not merely `ever_read`: a
-                    # genuinely wrong label decodes too, and would otherwise
-                    # excuse itself on the second frame it was seen.
-                    rewound[0] += 1
-                    if rewound[0] == 1 or rewound[0] % 200 == 0:
-                        print(f"\n[rewind] {_tail(text, 30)} was already "
-                              f"read and signed off earlier in this run - "
-                              f"the coil has been wound back past it. Not a "
-                              f"fault ({rewound[0]} so far).")
-                    handled[0].append(tuple(float(v) for v in det[:4]))
-                    continue
-
-                if fault["kind"] is not None:
-                    # Already stopped and being wound back. Winding the coil
-                    # in reverse walks rows that finished long ago past the
-                    # lens again, and once they fall outside the grace span
-                    # they read as codes from nowhere. That is the rewind
-                    # working, not a second fault: one fault at a time.
-                    handled[0].append(tuple(float(v) for v in det[:4]))
-                    continue
-
-                # A real code that belongs to no row inside the window: either
-                # the wrong label is on the web, or the window has been left
-                # far behind. Either way it is not something to tolerate.
-                where = sheet.find(text)
-                belongs = (f"sheet row {sheet.rows[where[0]].number} "
-                           f"{up(where[1])}" if where else
-                           "nothing in the sheet")
-                head = sheet.rows[window.start].number if not window.exhausted else "?"
-                print(f"\n[window] UNEXPECTED code: {text}")
-                print(f"[window]   belongs to {belongs}; window starts at row {head}")
-                window.note_unexpected(text, belongs)
-                if saver is not None:
-                    _save_crop(frame, det[:4], text, label_dets)
-                _raise_fault("unexpected", text=text, belongs=belongs,
-                             seen=time.time(),
-                             box=tuple(float(v) for v in det[:4]))
-                voice.alert("Rotate the coil back and take it off.",
-                            lead="Stopped. Wrong label on the coil.",
-                            key=f"bad-{key}")
-                print(f"[rewind] rotate the coil back — this label stays "
-                      f"outlined in red until it is out of frame, then the "
-                      f"machine starts itself")
-                stop_machine(f"unexpected code ({belongs})")
-                continue
-
-            if status == RollingWindow.REPEAT:
-                handled[0].append(tuple(float(v) for v in det[:4]))
-                continue
-
-            if status == RollingWindow.MATCH:
-                handled[0].append(tuple(float(v) for v in det[:4]))
-                credited[normalize(text)] = row_idx
-                row_no = sheet.rows[row_idx].number
-
-                # Mid-rewind, call each position as it comes in. The operator
-                # is watching the coil, not the screen, and this is how they
-                # know winding back is working before it finishes.
-                if fault["kind"] == "short" and row_idx == fault["row_idx"]:
-                    voice.say(f"Up {col + 1} found.",
-                              key=f"found-{row_no}-{col}")
-                if args.debug:
-                    print(f"[window] row {row_no} {up(col)} ok "
-                          f"(slot {slot})")
-                if saver is not None:
-                    _save_crop(frame, det[:4], text, label_dets)
-
-                # A code this far past the head means the coil has moved
-                # on and the head row is not going to fill in on its own --
-                # what is in front of the camera now is a later row. Rather
-                # than write the head off, hold the line and keep the row
-                # open: the operator winds the coil back, the same labels
-                # come past again, and the row either completes or is judged
-                # a real defect.
+        Everything from the decode onwards, and the same either way the code
+        was found: by the detector, a label at a time, or read straight off
+        the picture. `box` is the label the payload belongs to -- the model's
+        box in the one case, the crop measured out from the code in the other
+        -- and it is what gets saved, what gets outlined on the screen and
+        what the rewind follows about the frame.
+        """
+        box = tuple(float(v) for v in box[:4])
+        # The first payload the sheet recognises decides where the window
+        # sits; until then there is nothing to hold anything against.
+        if window.start is None:
+            hit = sheet.find(text, near=resume_hint[0])
+            if hit is None:
+                # This code is nowhere in the sheet, and nothing has
+                # anchored the window yet -- so not one label read so far
+                # belongs to this sheet. That is a coil the sheet does not
+                # describe: a new roll went on and the sheet was not
+                # changed with it, or the wrong sheet was loaded.
                 #
-                # This used to wait for the whole window (8 rows by default),
-                # which meant the machine wound on through several more rows
-                # before stopping for the one that failed. --hold-after is
-                # how many rows of grace it gets, and it is small because the
-                # point of stopping is to stop at the fault.
-                if (slot >= hold_after[0] and recheck["row"] is None
-                        and fault["kind"] is None):
-                    head_idx = window.start
-                    if head_idx is not None and window.missing(head_idx):
-                        _hold_head_for_recheck(head_idx)
+                # It has to be caught here rather than by the unexpected
+                # path below, which only exists once the window has
+                # anchored. Until then every foreign code fell straight
+                # back out of here and the machine wound the whole roll
+                # through, reading and validating nothing.
+                key = normalize(text)
+                if fault["kind"] is not None or key in forgiven:
+                    handled[0].append(box)
+                    return
+                print(f"\n[window] WRONG COIL FOR THIS SHEET: {text}")
+                print(f"[window]   this code is in no row of "
+                      f"{os.path.basename(args.xlsx)}, and no code read "
+                      f"so far is either")
+                print(f"[window]   load the sheet that goes with this "
+                      f"roll, or put the right roll on")
+                if saver is not None:
+                    _save_crop(frame, box, text, label_dets)
+                _raise_fault("mismatch", text=text,
+                             belongs="nothing in this sheet",
+                             seen=time.time(),
+                             box=box)
+                voice.alert("Load the sheet for this roll.",
+                            lead="Stopped. These labels are not in the "
+                                 "sheet.", key="mismatch")
+                stop_machine("labels do not match the sheet")
+                return
+            anchored = window.anchor(hit[0])
+            note = ("" if resume_hint[0] is None else
+                    f", carrying on from row "
+                    f"{sheet.rows[resume_hint[0]].number}")
+            print(f"[window] anchored on sheet row {anchored}"
+                  f"{note} — window covers {window.size} rows from there")
 
-                for done_idx, _ in window.advance():
-                    passed = sheet.rows[done_idx].number
-                    if recheck["row"] == passed:
-                        print(f"\n[recheck] row {passed} PASSED on "
-                              f"re-inspection — every code read")
-                        recheck["row"] = None
-                        recheck["attempt"] = 0
-                        retire_row(done_idx, complete=True)
-                        _clear_fault(f"row {passed} read clean on the rewind")
-                        continue
+        status, row_idx, col, slot = window.offer(text)
+
+        # Keep what was decoded and where it landed, so a row that comes
+        # up short can be explained rather than just reported.
+        ever_read.add(normalize(text))
+        where = (f"row {sheet.rows[row_idx].number} {up(col)}"
+                 if row_idx is not None else "no row in the window")
+        recent.append((text, f"{status} -> {where}"))
+        del recent[:-40]
+
+        if status == RollingWindow.UNKNOWN:
+            key = normalize(text)
+            if key in forgiven:
+                # The operator pressed START with this code on screen, so
+                # it has already been judged by a human. Let it pass.
+                handled[0].append(box)
+                return
+
+            if fault["kind"] == "unexpected" and \
+                    normalize(fault["text"]) == key:
+                # The label that stopped the line is still in front of the
+                # camera during the rewind. Say nothing, but keep the
+                # clock alive: the fault only clears once this code has
+                # been out of frame for --rewind-clear seconds, and that
+                # is only measurable if it keeps being decoded while it is
+                # there — so it is deliberately NOT carried forward.
+                fault["seen"] = time.time()
+                fault["in_frame"] = True
+                fault["box"] = box
+                return
+
+            if key in credited:
+                # This exact payload was matched to a cell and signed off
+                # earlier in this run, and it has now fallen out of the
+                # window's memory behind the head. That is the coil
+                # having been wound back further than it needed to be --
+                # not a wrong label. The row it belongs to was checked
+                # and recorded, so let it go past.
+                #
+                # It has to be `credited` and not merely `ever_read`: a
+                # genuinely wrong label decodes too, and would otherwise
+                # excuse itself on the second frame it was seen.
+                rewound[0] += 1
+                if rewound[0] == 1 or rewound[0] % 200 == 0:
+                    print(f"\n[rewind] {_tail(text, 30)} was already "
+                          f"read and signed off earlier in this run - "
+                          f"the coil has been wound back past it. Not a "
+                          f"fault ({rewound[0]} so far).")
+                handled[0].append(box)
+                return
+
+            if fault["kind"] is not None:
+                # Already stopped and being wound back. Winding the coil
+                # in reverse walks rows that finished long ago past the
+                # lens again, and once they fall outside the grace span
+                # they read as codes from nowhere. That is the rewind
+                # working, not a second fault: one fault at a time.
+                handled[0].append(box)
+                return
+
+            # A real code that belongs to no row inside the window: either
+            # the wrong label is on the web, or the window has been left
+            # far behind. Either way it is not something to tolerate.
+            where = sheet.find(text)
+            belongs = (f"sheet row {sheet.rows[where[0]].number} "
+                       f"{up(where[1])}" if where else
+                       "nothing in the sheet")
+            head = sheet.rows[window.start].number if not window.exhausted else "?"
+            print(f"\n[window] UNEXPECTED code: {text}")
+            print(f"[window]   belongs to {belongs}; window starts at row {head}")
+            window.note_unexpected(text, belongs)
+            if saver is not None:
+                _save_crop(frame, box, text, label_dets)
+            _raise_fault("unexpected", text=text, belongs=belongs,
+                         seen=time.time(),
+                         box=box)
+            voice.alert("Rotate the coil back and take it off.",
+                        lead="Stopped. Wrong label on the coil.",
+                        key=f"bad-{key}")
+            print(f"[rewind] rotate the coil back — this label stays "
+                  f"outlined in red until it is out of frame, then the "
+                  f"machine starts itself")
+            stop_machine(f"unexpected code ({belongs})")
+            return
+
+        if status == RollingWindow.REPEAT:
+            handled[0].append(box)
+            return
+
+        if status == RollingWindow.MATCH:
+            handled[0].append(box)
+            credited[normalize(text)] = row_idx
+            row_no = sheet.rows[row_idx].number
+
+            # Mid-rewind, call each position as it comes in. The operator
+            # is watching the coil, not the screen, and this is how they
+            # know winding back is working before it finishes.
+            if fault["kind"] == "short" and row_idx == fault["row_idx"]:
+                voice.say(f"Up {col + 1} found.",
+                          key=f"found-{row_no}-{col}")
+            if args.debug:
+                print(f"[window] row {row_no} {up(col)} ok "
+                      f"(slot {slot})")
+            if saver is not None:
+                _save_crop(frame, box, text, label_dets)
+
+            # A code this far past the head means the coil has moved
+            # on and the head row is not going to fill in on its own --
+            # what is in front of the camera now is a later row. Rather
+            # than write the head off, hold the line and keep the row
+            # open: the operator winds the coil back, the same labels
+            # come past again, and the row either completes or is judged
+            # a real defect.
+            #
+            # This used to wait for the whole window (8 rows by default),
+            # which meant the machine wound on through several more rows
+            # before stopping for the one that failed. --hold-after is
+            # how many rows of grace it gets, and it is small because the
+            # point of stopping is to stop at the fault.
+            if (slot >= hold_after[0] and recheck["row"] is None
+                    and fault["kind"] is None):
+                head_idx = window.start
+                if head_idx is not None and window.missing(head_idx):
+                    _hold_head_for_recheck(head_idx)
+
+            for done_idx, _ in window.advance():
+                passed = sheet.rows[done_idx].number
+                if recheck["row"] == passed:
+                    print(f"\n[recheck] row {passed} PASSED on "
+                          f"re-inspection — every code read")
+                    recheck["row"] = None
+                    recheck["attempt"] = 0
                     retire_row(done_idx, complete=True)
+                    _clear_fault(f"row {passed} read clean on the rewind")
+                    continue
+                retire_row(done_idx, complete=True)
 
     # payload -> the sheet row it was matched to. A set would say only "this
     # has been checked", which cannot tell the rows standing ahead of a held
@@ -3490,6 +3689,62 @@ def main():
         _bind_run(new_label_dir=path)
         _note[0] = None
 
+    def _apply_capture_dir(path):
+        """Where CAPTURE FRAME writes.
+
+        Not gated on the machine being idle, the way the sheet and the crops
+        folder are: nothing about the record hangs on it, and a capture that
+        has to wait for the line to stop is a capture of something else.
+        """
+        if not path or (os.path.abspath(path)
+                        == os.path.abspath(args.capture_dir)):
+            return
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            print(f"[capture] cannot write to {path}: {exc}")
+            _note[0] = f"Cannot write to that folder: {exc}"
+            return
+        args.capture_dir = path
+        prefs.remember_capture_dir(path)
+        print(f"[capture] captures now go to {path}/")
+        _note[0] = f"Captures go to {path}"
+
+    def capture_frame():
+        """Write the picture in front of the camera to the capture folder.
+
+        Live whatever the machine is doing: the frame worth keeping is
+        usually the one on the screen at the moment something looks wrong,
+        and stopping the line first would wind it out of shot. What is
+        written is the frame as the camera gave it -- the boxes and captions
+        are drawn on the way to the screen, not onto this -- so it is a
+        picture of the labels rather than a photograph of the console, and
+        it can be run through the reader again.
+        """
+        frame = last_frame[0]
+        if frame is None:
+            print("[capture] no frame to save yet")
+            _note[0] = "No picture to capture yet"
+            return
+        name = f"capture_{timestamp()}.{args.label_format}"
+        path = os.path.join(args.capture_dir, name)
+        params = ([cv2.IMWRITE_JPEG_QUALITY, 95]
+                  if args.label_format in ("jpg", "jpeg") else [])
+        try:
+            os.makedirs(args.capture_dir, exist_ok=True)
+            written = cv2.imwrite(path, frame, params)
+        except (OSError, cv2.error) as exc:
+            print(f"[capture] could not write {path}: {exc}")
+            _note[0] = "Could not save the picture — check the folder"
+            return
+        if not written:
+            print(f"[capture] could not write {path}")
+            _note[0] = "Could not save the picture — check the folder"
+            return
+        h, w = frame.shape[:2]
+        print(f"[capture] {w}x{h} frame saved to {path}")
+        _note[0] = f"Saved {name}"
+
     def _pick_sheet():
         if _configurable():
             _apply_sheet(_ask("sheet"))
@@ -3519,10 +3774,16 @@ def main():
                 _apply_sheet(arg)
             elif name == "labeldir":
                 _apply_label_dir(arg)
+            elif name == "capture":
+                capture_frame()
+            elif name == "capturedir":
+                _apply_capture_dir(arg)
             elif name == "winder":
                 set_winder(arg)
             elif name == "direction":
                 set_direction(arg)
+            elif name == "ups":
+                set_ups(arg)
             elif name == "camera":
                 _set_camera(arg)
             elif name == "debug":
@@ -3601,9 +3862,13 @@ def main():
                 qt_window.showMaximized()
             print("[ui] Qt console - WINDER AUTO/MANUAL, START, STOP, "
                   "LOAD SHEET, OPEN RECENT SHEET and LABEL FOLDER are "
-                  "buttons. Ctrl+Alt+E is the camera (exposure, gain, "
+                  "buttons, CAPTURE FRAME writes the picture as it is to "
+                  "the capture folder, and UPS CHECKED is the ups the reel "
+                  "is running. "
+                  "Ctrl+Alt+E is the camera (exposure, gain, "
                   "brightness), Ctrl+Alt+W the diagnostics, F11 full "
-                  "screen.")
+                  "screen. QUIT, bottom right, shuts the console down "
+                  "whatever the line is doing.")
 
     if not args.no_display and args.ui == "opencv":
         # WINDOW_NORMAL makes the window resizable; without it, imshow opens
@@ -3671,8 +3936,8 @@ def main():
         # Cleared before the scan and set again by it, so it means "the
         # offending code decoded on this frame", not "recently".
         fault["in_frame"] = False
+        last_frame[0] = frame
         if scanning():
-            last_frame[0] = frame
             scan_frame(frame, dets)
             if (starting_at[0] is not None
                     and time.time() - starting_at[0] >= args.start_delay):
@@ -3841,6 +4106,7 @@ def main():
             "sheet_dir": (os.path.dirname(os.path.abspath(args.xlsx))
                           if args.xlsx else ""),
             "labeldir": args.label_dir,
+            "capturedir": args.capture_dir,
             "recent": [p for p in prefs.recent if not args.xlsx
                        or os.path.abspath(p) != os.path.abspath(args.xlsx)],
             "configurable": _configurable(),
@@ -3849,10 +4115,34 @@ def main():
             "loaded": loaded(),
             "winder_auto": winder_is_auto(),
             "reverse": checking_reverse(),
+            # One tick box per up the sheet has, and which of them are on.
+            # No sheet means no boxes: how many ups there are is the
+            # sheet's to say.
+            "ups": {"count": per_row or 0,
+                    "checked": sorted(checked) if checked is not None
+                    else list(range(per_row or 0))},
             # What the sliders behind 's' are built from: the camera's own
             # limits, and where it is set now.
             "camera": {"ranges": camera.ranges, "values": cam_values[0]},
             "debug": show_debug[0],
+            # The three tallies the operator watches to know the run is
+            # actually getting somewhere: how many codes the sheet is asking
+            # for, how many have been read off the coil, and how many crops
+            # are on disk behind them. Saved trails read by whatever is still
+            # waiting for a clean look at its label, and that gap closing is
+            # what says the crops are keeping up.
+            "counts": {
+                "sheet": len(sheet.by_text) if sheet is not None else 0,
+                "read": len(ever_read),
+                "saved": saver.count if saver is not None else 0,
+                "qr": code_mix[0][0],
+                "dm": code_mix[0][1],
+            },
+            # The last crop on disk, named and timed. At startup this is
+            # whatever an earlier run left in the sheet's folder, so the
+            # console opens saying where the roll got to rather than blank.
+            "last_saved": ({"name": saver.last[0], "at": saver.last[1]}
+                           if saver is not None and saver.last else None),
             "fps": fps_state[1], "dets": len(dets),
             "status": _status_line(),
             "window_view": render_window_view() if show_debug[0] else None,

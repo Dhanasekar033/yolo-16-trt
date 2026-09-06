@@ -32,6 +32,8 @@ single-threaded and keeps a 150ms relay write off the GUI thread.
 
 import html
 import os
+import re
+import time
 
 import numpy as np
 
@@ -76,6 +78,20 @@ STATES = {
     # The winder is on hand control, so the console cannot start it.
     "manual": ("WINDER MANUAL", WARN),
 }
+
+
+_UNSET = object()
+
+_STAMP_TAIL = re.compile(r"_\d{8}-\d{6}(?:-\d{3})?(?:_\d+)?$")
+
+
+def _strip_stamp(name):
+    """The payload half of a crop's filename, without the stamp on the end.
+
+    The time is shown on its own line right below, and repeating it inside
+    the name costs the width that the code itself needs.
+    """
+    return _STAMP_TAIL.sub("", name)
 
 
 def _wrap_path(path):
@@ -482,8 +498,13 @@ class InspectorWindow(QtWidgets.QMainWindow):
                 else QtCore.QRect(0, 0, 1280, 800))
         self._area = area
         # Type and padding grow with the screen so a 4K panel does not end up
-        # with 11px captions, held between sane limits either way.
-        self._k = max(0.85, min(area.height() / 900.0, 2.2))
+        # with 11px captions, held between sane limits either way. The
+        # divisor was set when the right-hand column held half of what it
+        # holds now, and type sized for 900 lines of screen ran the foot of
+        # that column off the bottom of a 1080 panel -- so it is scaled a
+        # little more gently, and the column scrolls if even that is not
+        # enough.
+        self._k = max(0.8, min(area.height() / 1000.0, 1.8))
         self._left_w = int(max(280, min(area.width() * 0.20, 460)))
         self._side_w = int(max(210, min(area.width() * 0.16, 380)))
         self.resize(int(area.width() * 0.9), int(area.height() * 0.9))
@@ -496,11 +517,21 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._meta = None
         self._sheet_dir = ""
         self._out_dir = ""
+        self._capture_dir = ""
         self._recent = []
         self._running = False
         self._loaded = None
         self._winder_auto = None
         self._reverse = None
+        self._counts = None
+        # Up while a snapshot is being written into the ups tick boxes, so
+        # their own toggled signal does not bounce that straight back at the
+        # machine as though the operator had clicked it.
+        self._ups_setting = False
+        # Not None: None is a real value here -- it is what a folder with
+        # nothing in it reports -- and starting on it would skip the first
+        # update and leave the card sitting on its placeholder.
+        self._last_saved = _UNSET
         self._fault_text = None
         # What the camera says it can do and where it is set, kept fresh off
         # the snapshot so the dialog opens showing the truth rather than
@@ -533,6 +564,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
             QLabel#caption {{ color: #7d858d; font-size: {int(10 * k)}px;
                               font-weight: 700; letter-spacing: 1px; }}
             QLabel#value {{ color: {TEXT}; font-size: {int(12 * k)}px; }}
+            QLabel#count {{ color: {TEXT}; font-size: {int(15 * k)}px;
+                            font-weight: 600; }}
             QLabel#faulthead {{ background: {BAD}; color: #2a0505;
                                 font-size: {int(15 * k)}px; font-weight: 700;
                                 padding: {int(12 * k)}px;
@@ -564,6 +597,35 @@ class InspectorWindow(QtWidgets.QMainWindow):
                greyed-out buttons keep their blue lettering and still read as
                something you can press. */
             QPushButton#secondary:disabled {{ color: #6d757d; }}
+            QScrollArea#sidescroll {{ background: transparent;
+                                      border: none; }}
+            QScrollBar:vertical {{ background: transparent;
+                                   width: {int(9 * k)}px; margin: 0; }}
+            QScrollBar::handle:vertical {{ background: {LINE};
+                                           border-radius: {int(4 * k)}px;
+                                           min-height: {int(40 * k)}px; }}
+            QScrollBar::handle:vertical:hover {{ background: {MUTED}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent; }}
+            QPushButton#quit {{ font-size: {int(11 * k)}px;
+                                font-weight: 700; color: {MUTED};
+                                padding: {int(5 * k)}px {int(14 * k)}px; }}
+            QPushButton#quit:hover {{ color: {BAD}; border-color: {BAD}; }}
+            QCheckBox {{ color: {TEXT}; font-size: {int(12 * k)}px;
+                         font-weight: 600; spacing: {int(8 * k)}px;
+                         padding: {int(4 * k)}px 0; }}
+            QCheckBox:disabled {{ color: #6d757d; }}
+            QCheckBox::indicator {{ width: {int(18 * k)}px;
+                                    height: {int(18 * k)}px;
+                                    border-radius: {int(4 * k)}px;
+                                    border: 1px solid {LINE};
+                                    background: {PANEL}; }}
+            QCheckBox::indicator:checked {{ background: {OK};
+                                            border-color: {OK}; }}
+            QCheckBox::indicator:disabled {{ background: #262019;
+                                             border-color: #3a332c; }}
             QGroupBox {{ border: 1px solid {LINE}; border-radius: {int(6 * k)}px;
                          margin-top: {int(10 * k)}px;
                          font-size: {int(11 * k)}px; color: {MUTED}; }}
@@ -681,10 +743,29 @@ class InspectorWindow(QtWidgets.QMainWindow):
         return self.left
 
     def _sidebar(self):
+        """The right-hand column: the machine's buttons pinned, the rest
+        scrolled.
+
+        There is more in this column than a short screen has room for, and a
+        panel PC is short -- so everything below the buttons sits in a
+        scroll area rather than running off the bottom of the glass. START,
+        STOP and CAPTURE FRAME never scroll: whatever else is on the screen,
+        those have to be under the operator's hand.
+        """
         side = QtWidgets.QWidget()
         side.setFixedWidth(self._side_w)
-        col = QtWidgets.QVBoxLayout(side)
-        col.setContentsMargins(14, 14, 14, 14)
+        outer = QtWidgets.QVBoxLayout(side)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        pinned = QtWidgets.QWidget()
+        acts = QtWidgets.QVBoxLayout(pinned)
+        acts.setContentsMargins(14, 14, 14, 0)
+        acts.setSpacing(8)
+
+        body = QtWidgets.QWidget()
+        col = QtWidgets.QVBoxLayout(body)
+        col.setContentsMargins(14, 8, 14, 14)
         col.setSpacing(8)
 
         self.start_btn = QtWidgets.QPushButton("START", objectName="start")
@@ -697,21 +778,36 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                                 objectName="secondary")
         self.out_btn = QtWidgets.QPushButton("LABEL FOLDER",
                                              objectName="secondary")
+        # The whole picture, as the camera saw it, whenever somebody wants
+        # one: the frame worth keeping is the one on the screen when
+        # something looks wrong, so unlike the two folder buttons this one
+        # is live while the line runs.
+        self.capture_btn = QtWidgets.QPushButton("CAPTURE FRAME",
+                                                 objectName="secondary")
+        self.capture_dir_btn = QtWidgets.QPushButton("CAPTURE FOLDER",
+                                                     objectName="secondary")
         self.start_btn.clicked.connect(lambda: self.command.emit("start", None))
         self.stop_btn.clicked.connect(lambda: self.command.emit("stop", None))
         self.sheet_btn.clicked.connect(self._choose_sheet)
         self.recent_btn.clicked.connect(self._open_recent)
         self.out_btn.clicked.connect(self._choose_output)
+        self.capture_btn.clicked.connect(
+            lambda: self.command.emit("capture", None))
+        self.capture_dir_btn.clicked.connect(self._choose_capture_dir)
         for b in (self.start_btn, self.stop_btn):
             b.setFixedHeight(int(58 * self._k))
-        col.addWidget(self.start_btn)
-        col.addWidget(self.stop_btn)
-        col.addSpacing(6)
-        col.addWidget(self._rule())
-        col.addSpacing(6)
+        acts.addWidget(self.start_btn)
+        acts.addWidget(self.stop_btn)
+        acts.addSpacing(6)
+        acts.addWidget(self.capture_btn)
+        acts.addSpacing(6)
+        acts.addWidget(self._rule())
+        outer.addWidget(pinned)
+
         col.addWidget(self.sheet_btn)
         col.addWidget(self.recent_btn)
         col.addWidget(self.out_btn)
+        col.addWidget(self.capture_dir_btn)
 
         self.run_box = QtWidgets.QGroupBox("RUN")
         run_col = QtWidgets.QVBoxLayout(self.run_box)
@@ -727,6 +823,12 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.out_label = QtWidgets.QLabel("", objectName="value")
         self.out_label.setWordWrap(True)
         run_col.addWidget(self.out_label)
+        run_col.addSpacing(8)
+        run_col.addWidget(QtWidgets.QLabel("CAPTURE FOLDER",
+                                           objectName="caption"))
+        self.capture_label = QtWidgets.QLabel("", objectName="value")
+        self.capture_label.setWordWrap(True)
+        run_col.addWidget(self.capture_label)
         col.addSpacing(12)
         col.addWidget(self.run_box)
 
@@ -746,6 +848,67 @@ class InspectorWindow(QtWidgets.QMainWindow):
         # reel goes on, while the winder is thrown all shift.
         col.addStretch(1)
 
+        # The tally, immediately above the two selectors. It is the one part
+        # of the column that answers "is this run getting anywhere?", and the
+        # operator reads it at a glance from across the machine -- so the
+        # numbers are set larger than the captions beside them.
+        # "CODES", not "QR": a QR DATA column holds either symbol, and which
+        # one a row is printed as is the row's business. The totals count
+        # both, and the split under them says how the sheet divides -- shown
+        # only when there is a datamatrix in it, because on an all-QR sheet
+        # the line would say nothing the total has not said already.
+        self.count_box = QtWidgets.QGroupBox("CODES")
+        counts = QtWidgets.QGridLayout(self.count_box)
+        counts.setContentsMargins(10, 6, 10, 8)
+        counts.setVerticalSpacing(3)
+        counts.setColumnStretch(0, 1)
+        self.count_labels = {}
+        for row, (key, text) in enumerate((("sheet", "IN EXCEL"),
+                                           ("read", "SCANNED"),
+                                           ("saved", "IMAGES SAVED"))):
+            counts.addWidget(QtWidgets.QLabel(text, objectName="caption"),
+                             row, 0)
+            value = QtWidgets.QLabel("0", objectName="count")
+            value.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            counts.addWidget(value, row, 1)
+            self.count_labels[key] = value
+        self.mix_label = QtWidgets.QLabel("", objectName="meta")
+        counts.addWidget(self.mix_label, 3, 0, 1, 2)
+        self.mix_label.hide()
+        col.addWidget(self.count_box)
+        col.addSpacing(8)
+
+        # The last crop written, directly above the two selectors. It is the
+        # console's answer to "is it still reading?" -- a name that keeps
+        # changing says yes far more plainly than a count going up by one.
+        self.last_box = QtWidgets.QGroupBox("LAST SCANNED")
+        last = QtWidgets.QVBoxLayout(self.last_box)
+        last.setContentsMargins(10, 6, 10, 8)
+        last.setSpacing(2)
+        self.last_name = QtWidgets.QLabel("—", objectName="value")
+        self.last_name.setWordWrap(True)
+        self.last_time = QtWidgets.QLabel("", objectName="meta")
+        last.addWidget(self.last_name)
+        last.addWidget(self.last_time)
+        col.addWidget(self.last_box)
+        col.addSpacing(10)
+
+        # Which ups across the web are being checked, one box per code
+        # column the sheet has. A reel run narrower than the sheet was
+        # written for -- three ups off a four-up sheet -- would otherwise
+        # stop the line at every row for the label that is not on the web,
+        # so the ups that are not running are ticked off here instead. It
+        # starts empty and hidden: how many ups there are is the sheet's
+        # to say, and no sheet is loaded yet.
+        self.ups_box = QtWidgets.QGroupBox("UPS CHECKED")
+        self.ups_grid = QtWidgets.QGridLayout(self.ups_box)
+        self.ups_grid.setContentsMargins(10, 6, 10, 8)
+        self.ups_grid.setVerticalSpacing(2)
+        self.ups_boxes = []
+        col.addWidget(self.ups_box)
+        self.ups_box.hide()
+        col.addSpacing(10)
+
         col.addWidget(QtWidgets.QLabel("CHECK DIRECTION IN EXCEL",
                                        objectName="caption"))
         self.dir_switch = ToggleSwitch("FORWARD", "REVERSE", scale=self._k,
@@ -761,6 +924,21 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.winder_btn.clicked.connect(
             lambda on: self.command.emit("winder", bool(on)))
         col.addWidget(self.winder_btn)
+
+        self.side_scroll = scroll = QtWidgets.QScrollArea(
+            objectName="sidescroll")
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)      # the column keeps the full width
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Dragged as well as wheeled: this is a touchscreen, and a scrollbar
+        # ten pixels wide is not something a finger finds. QScroller only
+        # takes over past a drag threshold, so a press that does not move is
+        # still a press on the button under it.
+        QtWidgets.QScroller.grabGesture(
+            scroll.viewport(), QtWidgets.QScroller.LeftMouseButtonGesture)
+        outer.addWidget(scroll, 1)
         return side
 
     def _footer(self):
@@ -773,6 +951,13 @@ class InspectorWindow(QtWidgets.QMainWindow):
         row.addWidget(self.status)
         row.addStretch(1)
         row.addWidget(QtWidgets.QLabel("[F11] FULL SCREEN", objectName="hint"))
+        # In the corner the window's own close button would be in, because
+        # in full screen there is no title bar to put one in -- and a panel
+        # PC with no keyboard has no other way out of the application.
+        self.quit_btn = QtWidgets.QPushButton("QUIT", objectName="quit")
+        self.quit_btn.clicked.connect(self._quit_clicked)
+        row.addSpacing(14)
+        row.addWidget(self.quit_btn)
         return bar
 
     # -- input ------------------------------------------------------------
@@ -788,6 +973,12 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self, "Choose the folder for the label crops", self._out_dir)
         if path:
             self.command.emit("labeldir", path)
+
+    def _choose_capture_dir(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose the folder for captured frames", self._capture_dir)
+        if path:
+            self.command.emit("capturedir", path)
 
     def _open_recent(self):
         """The sheets loaded before, as a menu under the button.
@@ -810,6 +1001,44 @@ class InspectorWindow(QtWidgets.QMainWindow):
         if menu.isEmpty():
             menu.addAction("No other sheets loaded yet").setEnabled(False)
         return menu
+
+    def _build_ups(self, count):
+        """One tick box per up the sheet has, two to a line.
+
+        Rebuilt rather than hidden and shown, because how many there are is
+        a property of the sheet that is loaded and a sheet can be swapped
+        for a wider or narrower one without the console restarting.
+        """
+        while self.ups_boxes:
+            box = self.ups_boxes.pop()
+            self.ups_grid.removeWidget(box)
+            box.setParent(None)
+            box.deleteLater()
+        for i in range(count):
+            box = QtWidgets.QCheckBox(f"UP{i + 1}")
+            box.setChecked(True)
+            box.setEnabled(self._configurable is not False)
+            box.toggled.connect(self._ups_changed)
+            self.ups_grid.addWidget(box, i // 2, i % 2)
+            self.ups_boxes.append(box)
+        self.ups_box.setVisible(bool(count))
+
+    def _ups_changed(self):
+        if self._ups_setting:
+            return                  # a snapshot being written in, not a click
+        wanted = [i for i, b in enumerate(self.ups_boxes) if b.isChecked()]
+        if not wanted:
+            # Checking no ups at all checks nothing, and a run that checks
+            # nothing passes every row it is given -- so the last tick will
+            # not come off. The operator turns off the ups the reel is not
+            # running, not all of them.
+            box = self.sender()
+            if isinstance(box, QtWidgets.QCheckBox):
+                self._ups_setting = True
+                box.setChecked(True)
+                self._ups_setting = False
+            return
+        self.command.emit("ups", wanted)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self.isFullScreen():
@@ -903,6 +1132,43 @@ class InspectorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.No)
         return answer == QtWidgets.QMessageBox.Yes
 
+    def _quit_clicked(self):
+        """Shut the application down from the screen, whatever the line is
+        doing.
+
+        The window's own close button refuses while the machine is running
+        or a row is held: a stray click on the chrome must not be able to
+        stop a coil mid-inspection. This is the way out that always works,
+        so it says plainly what it is about to do and then does it. Nothing
+        is lost by it -- the shutdown stops the machine, drops the winder
+        relay and writes the workbook out, exactly as an idle close does.
+        """
+        if self._running or self._state in ("rewind", "mismatch", "unread",
+                                            "incomplete"):
+            question = ("Quit while the machine is running?\n\n"
+                        "The line will be stopped and the winder relay "
+                        "released. What has been checked so far is written "
+                        "out."
+                        if self._running else
+                        "Quit with a row still held?\n\n"
+                        "The row will be left unchecked. What has been "
+                        "checked so far is written out.")
+        else:
+            question = ("Quit Label Inspector?\n\n"
+                        "The workbook is written out on the way, so nothing "
+                        "already checked is lost.")
+        answer = QtWidgets.QMessageBox.question(
+            self, "Label Inspector", question,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        # Asked and answered: the close itself must not ask again, and must
+        # not refuse for the state this button exists to get out of.
+        was, self.locked = self.locked, False
+        if not self.close():
+            self.locked = was            # refused after all; leave it as found
+
     def closeEvent(self, event):
         if self.locked and not self._may_close():
             event.ignore()
@@ -977,6 +1243,53 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._camera_ranges = camera.get("ranges") or {}
         self._camera_values = camera.get("values") or {}
 
+        # Redrawn only when a number actually moves. This runs on every
+        # frame, and setText on an unchanged label still costs a repaint.
+        counts = snap.get("counts") or {}
+        if counts != self._counts:
+            self._counts = dict(counts)
+            for key, label in self.count_labels.items():
+                label.setText(f"{counts.get(key, 0):,}")
+            dm = counts.get("dm", 0)
+            self.mix_label.setVisible(bool(dm))
+            if dm:
+                self.mix_label.setText(f"{counts.get('qr', 0):,} QR  ·  "
+                                       f"{dm:,} DATAMATRIX")
+
+        last = snap.get("last_saved")
+        if last != self._last_saved:
+            self._last_saved = last
+            if not last:
+                self.last_name.setText("—")
+                self.last_time.setText("nothing saved yet")
+            else:
+                # The stamp is already in the name and is shown on its own
+                # line below, so what is left is the payload the crop was
+                # filed under -- which is the part the operator reads.
+                name = os.path.splitext(last.get("name") or "")[0]
+                self.last_name.setText(_strip_stamp(name) or name)
+                when = last.get("at")
+                self.last_time.setText(
+                    time.strftime("%H:%M:%S", time.localtime(when))
+                    if when else "")
+
+        # The ups the machine is checking. Compared against the boxes
+        # themselves rather than against the last snapshot: a tick the
+        # machine refused -- the line started between the click and the
+        # command being picked up -- has to go back on, and the snapshot
+        # that says so is identical to the one before it.
+        ups = snap.get("ups") or {}
+        count = int(ups.get("count") or 0)
+        on = tuple(sorted(ups.get("checked") or ()))
+        if count != len(self.ups_boxes):
+            self._build_ups(count)
+        if on != tuple(i for i, b in enumerate(self.ups_boxes)
+                       if b.isChecked()):
+            self._ups_setting = True
+            for i, box in enumerate(self.ups_boxes):
+                box.setChecked(i in on)
+            self._ups_setting = False
+
         reverse = bool(snap.get("reverse", False))
         if reverse != self._reverse:
             self._reverse = reverse
@@ -990,17 +1303,22 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.recent_btn.setEnabled(configurable)
             self.out_btn.setEnabled(configurable)
             self.dir_switch.setEnabled(configurable)
+            for box in self.ups_boxes:
+                box.setEnabled(configurable)
 
         self._sheet_dir = snap.get("sheet_dir", "")
         self._out_dir = snap.get("labeldir", "")
-        meta = (snap.get("sheet", ""), self._out_dir)
+        self._capture_dir = snap.get("capturedir", "")
+        meta = (snap.get("sheet", ""), self._out_dir, self._capture_dir)
         if meta != self._meta:
             self._meta = meta
             self.sheet_label.setText(meta[0])
             self.sheet_label.setToolTip(os.path.join(self._sheet_dir, meta[0]))
-            full = os.path.abspath(meta[1] or ".")
-            self.out_label.setText(_wrap_path(full))
-            self.out_label.setToolTip(full)
+            for label, folder in ((self.out_label, meta[1]),
+                                  (self.capture_label, meta[2])):
+                full = os.path.abspath(folder or ".")
+                label.setText(_wrap_path(full))
+                label.setToolTip(full)
 
         self._show_fault(snap)
 

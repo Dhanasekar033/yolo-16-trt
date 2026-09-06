@@ -38,11 +38,28 @@ class Settings:
     def __init__(self, path=DEFAULT_PATH):
         self.path = path
         self.label_dir = None
+        # Where CAPTURE FRAME writes. A folder of its own, remembered like
+        # the crops folder and for the same reason: it is a place on this
+        # machine's disk, chosen at the machine, and a USB stick that was
+        # plugged in on Monday should still be the folder on Tuesday.
+        self.capture_dir = None
         # Exposure, gain and brightness, as the operator left them. They
         # belong here rather than in config.json: config.json is how an
         # installation is set up, this is what somebody adjusted at the
         # machine, and the two should not be able to overwrite each other.
         self.camera = {}
+        # Which way the codes are being read, and the four margins the label
+        # crop is cut by when they are read straight off the picture. Set at
+        # the machine, against the live picture, so they belong here rather
+        # than in config.json for the same reason the camera does.
+        self.scan = {}
+        # Which ups across the web are being checked, as up numbers -- UP1
+        # is the first label across -- or None for all of them. It is the
+        # reel that decides this, not the sheet: a four-up sheet run three
+        # up would stop the line at every row for the label that is not
+        # there, and the operator would have to tick that up off again
+        # every morning.
+        self.ups = None
         self._recent = []
         self._warned = False
         self._load()
@@ -62,6 +79,9 @@ class Settings:
         folder = data.get("label_dir")
         if isinstance(folder, str) and folder:
             self.label_dir = folder
+        folder = data.get("capture_dir")
+        if isinstance(folder, str) and folder:
+            self.capture_dir = folder
         recent = data.get("recent")
         if isinstance(recent, list):
             self._recent = [p for p in recent if isinstance(p, str) and p]
@@ -69,6 +89,14 @@ class Settings:
         if isinstance(camera, dict):
             self.camera = {k: int(v) for k, v in camera.items()
                            if isinstance(v, (int, float))}
+        scan = data.get("scan")
+        if isinstance(scan, dict):
+            self.scan = scan
+        ups = data.get("ups")
+        if isinstance(ups, list):
+            wanted = sorted({int(n) for n in ups
+                             if isinstance(n, (int, float)) and n >= 1})
+            self.ups = wanted or None
 
     @property
     def recent(self):
@@ -100,6 +128,12 @@ class Settings:
         self.label_dir = os.path.abspath(path)
         self._save()
 
+    def remember_capture_dir(self, path):
+        if not path:
+            return
+        self.capture_dir = os.path.abspath(path)
+        self._save()
+
     def remember_camera(self, values):
         """Where the exposure, gain and brightness sliders were left.
 
@@ -117,9 +151,42 @@ class Settings:
         self.camera = merged
         self._save()
 
+    def remember_scan(self, direct=None, pad=None, scale=None):
+        """How the codes are being read, as the operator left it.
+
+        Written on every change, like the camera and for the same reason:
+        the padding is set by watching the picture and then walking back to
+        the machine, and a console switched off at the wall must not lose
+        what was just dialled in.
+        """
+        scan = dict(self.scan)
+        if direct is not None:
+            scan["direct"] = bool(direct)
+        if pad:
+            scan["pad"] = {k: int(v) for k, v in pad.items()}
+        if scale is not None:
+            scan["scale"] = float(scale)
+        if scan == self.scan:
+            return
+        self.scan = scan
+        self._save()
+
+    def remember_ups(self, numbers):
+        """Which ups the tick boxes were left on, as up numbers.
+
+        None -- or every up the sheet has -- is written as null, which is
+        what a fresh install starts on: check whatever the sheet asks for.
+        """
+        wanted = sorted({int(n) for n in numbers}) if numbers else None
+        if wanted == self.ups:
+            return
+        self.ups = wanted
+        self._save()
+
     def _save(self):
-        data = {"label_dir": self.label_dir, "recent": self._recent,
-                "camera": self.camera}
+        data = {"label_dir": self.label_dir,
+                "capture_dir": self.capture_dir, "recent": self._recent,
+                "camera": self.camera, "scan": self.scan, "ups": self.ups}
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"

@@ -48,6 +48,33 @@ def timestamp():
         f"-{int((now % 1) * 1000):03d}"
 
 
+STAMP = re.compile(r"_(\d{8}-\d{6})(?:-(\d{3}))?(?:_\d+)?$")
+
+IMAGE_EXT = (".jpg", ".jpeg", ".png")
+
+
+def read_stamp(name, path=None):
+    """When the label in this file was read, as epoch seconds.
+
+    Off the filename, because that stamp is the moment the code was decoded
+    -- which is what the console is reporting -- while the file's mtime is
+    only when the write finished, and survives being copied about even less
+    well. A name that was not written by this class falls back to the mtime,
+    and then to nothing.
+    """
+    hit = STAMP.search(os.path.splitext(name)[0])
+    if hit:
+        try:
+            secs = time.mktime(time.strptime(hit.group(1), "%Y%m%d-%H%M%S"))
+            return secs + (int(hit.group(2)) / 1000 if hit.group(2) else 0)
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(path) if path else None
+    except OSError:
+        return None
+
+
 class LabelSaver:
     """Writes one image per decoded label into a per-sheet folder."""
 
@@ -60,12 +87,43 @@ class LabelSaver:
         self.min_pad = min_pad
         self.params = ([cv2.IMWRITE_JPEG_QUALITY, quality]
                        if self.ext in ("jpg", "jpeg") else [])
-        self.count = 0
         # Made on the first write, not here: loading a sheet and then pointing
         # the crops somewhere else is two operations, and the folder for the
-        # in-between combination should not be left behind empty.
-        self._made = False
-        print(f"[crops] saving label crops to {self.dir}/")
+        # in-between combination should not be left behind empty. A folder
+        # that is already there is another matter -- it is this sheet's own
+        # crops from an earlier run, and the console counts them in rather
+        # than reporting nothing saved while a folder of them sits on disk.
+        self.count, self.last = 0, None
+        self._made = os.path.isdir(self.dir)
+        if self._made:
+            self.count, self.last = self._survey()
+        where = f"{self.dir}/"
+        if self.count:
+            print(f"[crops] {self.count} crop(s) already in {where} — "
+                  f"adding to them")
+        else:
+            print(f"[crops] saving label crops to {where}")
+
+    def _survey(self):
+        """What is in the folder already: how many crops, and the last one.
+
+        The last is the newest by the stamp in its own name, not by the order
+        the directory happens to list them in -- a folder is not sorted, and
+        the one written last is the one the console has to name.
+        """
+        newest, count = None, 0
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return 0, None
+        for name in names:
+            if not name.lower().endswith(IMAGE_EXT):
+                continue
+            count += 1
+            when = read_stamp(name, os.path.join(self.dir, name))
+            if when is not None and (newest is None or when > newest[1]):
+                newest = (name, when)
+        return count, newest
 
     @staticmethod
     def _gaps(box, neighbours):
@@ -178,7 +236,8 @@ class LabelSaver:
                 min(int(x2) + pad["right"], w),
                 min(int(y2) + pad["down"], h))
 
-    def save(self, frame, box, text, neighbours=(), motion=(0.0, 0.0)):
+    def save(self, frame, box, text, neighbours=(), motion=(0.0, 0.0),
+             exact=False):
         """Crop `box` out of `frame` and write it. Returns the path, or None
         if the box was degenerate.
 
@@ -186,8 +245,21 @@ class LabelSaver:
         what the crop measures its own margins from. `motion` is how far the
         web moved since the last frame, in pixels, which is what decides how
         much of the trailing edge to reach back for.
+
+        `exact` takes the box as it stands, clipped to the picture and
+        nothing else. That is for a crop measured out from the code itself
+        rather than drawn round a label by the detector: the four margins
+        were set by the operator against this camera and this reel, and
+        widening them here by something measured off the neighbours would
+        be the app quietly overruling what it was told.
         """
-        x1, y1, x2, y2 = self._box(box, frame.shape, neighbours, motion)
+        if exact:
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = (int(round(float(v))) for v in box[:4])
+            x1, y1 = max(x1, 0), max(y1, 0)
+            x2, y2 = min(x2, w), min(y2, h)
+        else:
+            x1, y1, x2, y2 = self._box(box, frame.shape, neighbours, motion)
         if x2 - x1 < 2 or y2 - y1 < 2:
             return None
 
@@ -207,4 +279,5 @@ class LabelSaver:
             print(f"[crops] failed to write {path}")
             return None
         self.count += 1
+        self.last = (os.path.basename(path), time.time())
         return path
