@@ -1,3 +1,2 @@
-label
-qr_code
-logo
+code
+artifact

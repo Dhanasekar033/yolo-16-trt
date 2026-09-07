@@ -56,7 +56,7 @@ DEFAULT_CONF_QR    = None
 
 # ── QR decode config ─────────────────────────────────────────────────────────
 DEFAULT_LABEL_CLASS = "label"      # class whose crossing triggers a decode
-DEFAULT_QR_CLASS    = "qr_code"    # class that is cropped and decoded
+DEFAULT_QR_CLASS    = "code"    # class that is cropped and decoded
 DEFAULT_LINE_POS    = 0.5          # vertical trigger line, fraction of width
 DEFAULT_LINE_WIDTH  = 0            # widen the line into a band, in pixels
 DEFAULT_QR_MARGIN   = 0.15         # quiet zone added around the qr box
@@ -137,11 +137,37 @@ def load_class_names(path):
         return [line.strip() for line in f if line.strip()]
 
 
+# The dataset was renamed when the `label` class was dropped: qr_code became
+# code, logo became artifact. Engines from before and after that rename are both
+# in use — best.engine still says qr_code, anything trained on the stripped
+# dataset says code — so each name carries its other spelling and both are tried.
+CLASS_ALIASES = {
+    "qr_code":  ("qr_code", "code"),
+    "code":     ("code", "qr_code"),
+    "logo":     ("logo", "artifact"),
+    "artifact": ("artifact", "logo"),
+}
+
+
 def class_index(class_names, name, fallback):
-    """Resolve a class name to its id; fall back to a fixed index when no
-    classes.txt was supplied (or the name isn't in it)."""
-    if class_names and name in class_names:
-        return class_names.index(name)
+    """Resolve a class name to its id, trying the rename aliases.
+
+    The fixed fallback is for the case it was always meant for — no classes.txt
+    supplied, so the names are unknown and the index is all there is. When
+    classes.txt IS supplied and the name is not in it under any spelling, this
+    now stops instead of falling back: on a 2-class engine `label` would resolve
+    to index 0, which is `code`, and every decode after that would be cropped
+    from the wrong box with nothing in the output saying so."""
+    for candidate in CLASS_ALIASES.get(name, (name,)):
+        if class_names and candidate in class_names:
+            if candidate != name:
+                print(f"[qr] class '{name}' is '{candidate}' in this classes.txt")
+            return class_names.index(candidate)
+    if class_names:
+        raise SystemExit(
+            f"[qr] class '{name}' is not in --classes ({', '.join(class_names)}). "
+            f"This engine does not have that class — pass the matching "
+            f"--*-class option with a name it does have.")
     print(f"[qr] class '{name}' not found in --classes, using index {fallback}")
     return fallback
 
