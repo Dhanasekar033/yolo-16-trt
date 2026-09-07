@@ -21,14 +21,20 @@ Usage:
     python3 cam-trt.py --engine best.engine --fps 15 --width 1280 --height 972
     python3 cam-trt.py --engine best.engine --index 0        # skip auto-detect
     python3 cam-trt.py --engine best.engine --no-display     # headless, prints detections
+    python3 cam-trt.py --engine best.engine --crop-dir crops     # 's' saves label crops
 
 Keys (window mode):
     q / Esc   quit          space  pause / resume
     n         step one frame while paused
+    s         save every detection in the current frame as a cropped image,
+              into --crop-dir/<class name>/ (works while paused too). Crops
+              are cut from the full-resolution frame before any drawing, and
+              written lossless — see --crop-format
 """
 
 import argparse
 import os
+import re
 import time
 
 import cv2
@@ -38,8 +44,8 @@ from utils.utils import preprocess, postprocess, draw_detections
 
 # ── Stream config (same defaults as cam_view.py) ────────────────────────────
 DEFAULT_CAM_INDEX = 0
-DEFAULT_WIDTH     = 1920 #2592
-DEFAULT_HEIGHT    = 1200 #1944
+DEFAULT_WIDTH     = 2592
+DEFAULT_HEIGHT    = 1944
 DEFAULT_FPS       = 60       # MJPG supports 60fps at full 2592x1944; YUYV only
                               # goes to 35fps at that size (see --list-formats-ext)
 DEFAULT_FORMAT    = "MJPG"
@@ -50,6 +56,8 @@ DEFAULT_ROTATE    = 270      # fixed rotation applied to every frame: 0/90/180/2
 # ── Inference config ─────────────────────────────────────────────────────────
 DEFAULT_IMGSZ      = 640
 DEFAULT_CONF_THRES = 0.25
+DEFAULT_CROP_DIR   = "crops"
+DEFAULT_CROP_FMT   = "png"   # lossless: a crop is training data, not a preview
 
 ROTATE_MAP = {
     0:   None,
@@ -146,6 +154,59 @@ def open_source(args):
             f"/dev/video{index}", "camera")
 
 
+def safe_name(name):
+    """A class name is free text; a directory name is not. Keep it printable."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "unknown"
+
+
+def save_crops(frame, dets, class_names, out_dir, frame_no, pad=0,
+               fmt=DEFAULT_CROP_FMT, quality=100):
+    """Write one image per detection into out_dir/<class name>/.
+
+    frame must be the *clean* frame at full capture resolution — drawing
+    happens in place, so a crop taken after draw_detections would carry a box
+    and a label baked into it, and one taken from the 640x640 inference input
+    would be a resized copy rather than the real pixels.
+
+    The crop is a plain slice: no resize, no interpolation, no re-encode beyond
+    what fmt asks for. png is lossless; jpg at quality<100 is where softness
+    and block artifacts come from, so quality defaults to 100.
+    """
+    if dets is None or len(dets) == 0:
+        return 0
+
+    fmt = fmt.lower().lstrip(".")
+    if fmt == "png":
+        # 3 = a middle zlib level: same pixels as 9, far less time per frame.
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 3]
+    else:
+        params = [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
+
+    h, w = frame.shape[:2]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    saved = 0
+    for i, (x1, y1, x2, y2, conf, cls_id) in enumerate(dets):
+        cls_id = int(cls_id)
+        label = (class_names[cls_id] if class_names and cls_id < len(class_names)
+                 else str(cls_id))
+        x1 = max(0, int(x1) - pad)
+        y1 = max(0, int(y1) - pad)
+        x2 = min(w, int(x2) + pad)
+        y2 = min(h, int(y2) + pad)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue                       # a degenerate box crops to nothing
+        cls_dir = os.path.join(out_dir, safe_name(label))
+        os.makedirs(cls_dir, exist_ok=True)
+        path = os.path.join(
+            cls_dir, f"{safe_name(label)}_{stamp}_f{frame_no:06d}_{i:02d}"
+                     f"_{conf:.2f}.{fmt}")
+        # .copy() hands imwrite a contiguous buffer; the slice itself is a
+        # view into the frame, and the pixels are identical either way.
+        if cv2.imwrite(path, frame[y1:y2, x1:x2].copy(), params):
+            saved += 1
+    return saved
+
+
 def load_class_names(path):
     if not path:
         return None
@@ -183,6 +244,17 @@ def main():
     ap.add_argument("--conf-thres", type=float, default=DEFAULT_CONF_THRES)
     ap.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
     ap.add_argument("--save", default=None, help="optional path to record annotated video")
+    ap.add_argument("--crop-dir", default=DEFAULT_CROP_DIR,
+                     help="folder the 's' key saves label crops into, one "
+                          "sub-folder per class name")
+    ap.add_argument("--crop-pad", type=int, default=0,
+                     help="pixels of context to keep around each saved crop")
+    ap.add_argument("--crop-format", default=DEFAULT_CROP_FMT,
+                     choices=["png", "jpg"],
+                     help="png keeps the source pixels exactly (default); jpg "
+                          "is smaller but re-compresses them")
+    ap.add_argument("--crop-quality", type=int, default=100,
+                     help="jpg quality 1-100 (ignored for png)")
     args = ap.parse_args()
 
     cap, label, kind = open_source(args)
@@ -240,6 +312,8 @@ def main():
     n = total_dets = misses = 0
     paused = step = False
     shown = None
+    clean = None
+    last_dets = None
     # WND_PROP_VISIBLE reads 0 until the window manager has actually mapped the
     # window, which is normally a frame or two after the first imshow. Treating
     # that as "the user closed it" ends the run after one frame — so the close
@@ -272,6 +346,10 @@ def main():
                 inp, ratio, pad = preprocess(frame, model.input_size)
                 raw = model.infer(inp)
                 dets = postprocess(raw, ratio, pad, frame.shape, args.conf_thres)
+                # draw_detections paints onto the frame it is given, so the
+                # copy for cropping has to be taken before it runs.
+                clean = frame.copy()
+                last_dets = dets
                 frame = draw_detections(frame, dets, class_names)
                 total_dets += len(dets)
 
@@ -317,6 +395,16 @@ def main():
                     print(f"\n[run] {'paused' if paused else 'resumed'} at frame {n}")
                 elif key == ord("n"):
                     step = True
+                elif key == ord("s"):
+                    if clean is None:
+                        print("\n[crop] nothing to save yet")
+                    else:
+                        saved = save_crops(clean, last_dets, class_names,
+                                           args.crop_dir, n, args.crop_pad,
+                                           args.crop_format, args.crop_quality)
+                        print(f"\n[crop] frame {n}: saved {saved} crop(s) "
+                              f"to {args.crop_dir}/" if saved else
+                              f"\n[crop] frame {n}: no detections to save")
                 visible = cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) >= 1
                 was_visible = was_visible or visible
                 if was_visible and not visible:
