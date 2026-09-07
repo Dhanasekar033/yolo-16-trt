@@ -54,7 +54,7 @@ import sys
 import cv2
 import numpy as np
 
-CLASSES = ["label", "qr_code", "logo"]
+CLASSES = ["qr_code", "logo"]      # fallback only; classes.txt is authoritative
 IMG_EXT = (".jpg", ".jpeg", ".png")
 
 
@@ -180,6 +180,21 @@ def split_coco(ds, assign, stems):
             for sp in ("train", "val")}
 
 
+def read_classes(ds):
+    """The class names the dataset's own labels were written against.
+
+    make_dataset.py writes classes.txt beside the labels, and the class indices
+    in every .txt mean whatever that file says they mean. Guessing here instead
+    would rename every box in the set — a data.yaml claiming index 0 is `label`
+    over a set where 0 is `qr_code` trains a model on shuffled classes and
+    reports nothing wrong."""
+    path = os.path.join(ds, "classes.txt")
+    if not os.path.exists(path):
+        return None
+    names = [line.strip() for line in open(path) if line.strip()]
+    return names or None
+
+
 def write_yaml(ds, names):
     """data.yaml with an ABSOLUTE path.
 
@@ -286,16 +301,18 @@ def main():
             if os.path.isdir(p) and e not in ("train", "val") and not os.listdir(p):
                 os.rmdir(p)
 
-    names = CLASSES
+    names = read_classes(args.ds)
     yml = os.path.join(args.ds, "data.yaml")
-    if os.path.exists(yml):                    # keep whatever names were in use
-        got = []
-        for line in open(yml):
-            line = line.strip()
-            if line[:1].isdigit() and ":" in line:
-                got.append(line.split(":", 1)[1].strip())
-        if got:
-            names = got
+    if names is None:
+        names = CLASSES
+        if os.path.exists(yml):                # keep whatever names were in use
+            got = []
+            for line in open(yml):
+                line = line.strip()
+                if line[:1].isdigit() and ":" in line:
+                    got.append(line.split(":", 1)[1].strip())
+            if got:
+                names = got
     write_yaml(args.ds, names)
     coco = split_coco(args.ds, assign, stems)
 
