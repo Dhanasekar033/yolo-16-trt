@@ -47,6 +47,8 @@ logs/
 *.jpg
 *.pt
 runs
+*.zip
+*.mp4
 
 # Generated training data (gen_dataset.py) — regenerate it, do not commit it
 dataset/
