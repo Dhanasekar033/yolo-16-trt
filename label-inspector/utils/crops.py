@@ -310,17 +310,23 @@ class LabelSaver:
             os.makedirs(self.dir, exist_ok=True)
             self._made = True
 
-        name = f"{code_id(text)}.{self.ext}"
-        path = os.path.join(self.dir, name)
-        n = 1
-        while os.path.exists(path):          # same code twice inside a ms
-            path = os.path.join(self.dir, f"{name[:-len(self.ext) - 1]}"
-                                          f"_{n}.{self.ext}")
-            n += 1
+        # One file per code, overwritten. A label is photographed on every
+        # frame it is legible in and again on a re-inspection pass, so
+        # numbering the repeats filled the folder with the same label a dozen
+        # times over and made the one question anyone asks of it -- what did
+        # <this code> look like -- into a question about which copy to open.
+        # The file is the code, and the picture in it is the last look the
+        # camera had.
+        path = os.path.join(self.dir, f"{code_id(text)}.{self.ext}")
+        fresh = not os.path.exists(path)
 
         if not cv2.imwrite(path, frame[y1:y2, x1:x2], self.params):
             print(f"[crops] failed to write {path}")
             return None
-        self.count += 1
+        # Counted per file rather than per write, so the tally on the console
+        # says how many crops are in the folder -- which is what _survey()
+        # counts when the same folder is opened again.
+        if fresh:
+            self.count += 1
         self.last = (os.path.basename(path), time.time())
         return path
