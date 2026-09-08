@@ -7,3 +7,5 @@ labels/
 config.json
 build/
 dist/
+
+*.png
