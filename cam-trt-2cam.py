@@ -43,6 +43,7 @@ Keys (window mode):
 
 import argparse
 import os
+import re
 import subprocess
 import shutil
 import time
@@ -136,6 +137,87 @@ def list_cameras():
     return cameras
 
 
+def list_modes(device):
+    """{fmt: {(w, h): [rates, highest first]}} straight from the driver.
+
+    What a format can do is not a number anyone can write down once. MJPG is
+    compressed in the camera and gets whatever rate the sensor will give;
+    YUYV is the sensor's own pixels and is limited by what the USB link will
+    carry, which depends on the size, the camera and the cable it is on. The
+    2MP camera on this rig offers YUYV 1920x1200 at 5 frames a second and
+    nothing faster, because 5 uncompressed frames that size is already 23
+    MB/s and the link is USB 2.0. The 5MP one did 35.
+
+    So the script asks rather than assumes, and a mode nobody can use is
+    reported as such before the pipeline is built.
+    """
+    if not shutil.which("v4l2-ctl"):
+        return {}
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats-ext"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    modes, fmt, size = {}, None, None
+    for line in out.splitlines():
+        hit = re.search(r"\]:\s*'(\w+)'", line)
+        if hit:
+            fmt, size = hit.group(1).upper(), None
+            continue
+        hit = re.search(r"Size:\s*\w+\s*(\d+)x(\d+)", line)
+        if hit:
+            size = (int(hit.group(1)), int(hit.group(2)))
+            continue
+        hit = re.search(r"\(([\d.]+)\s*fps\)", line)
+        if hit and fmt and size:
+            modes.setdefault(fmt, {}).setdefault(size, []).append(
+                float(hit.group(1)))
+    return {f: {sz: sorted(r, reverse=True) for sz, r in sizes.items()}
+            for f, sizes in modes.items()}
+
+
+def pick_mode(device, fmt, width, height, fps):
+    """The mode to actually ask for: (w, h, fps, note).
+
+    v4l2src negotiates fixed caps. Ask for a size or a rate the driver does
+    not enumerate and there is no nearest match -- the pipeline simply fails
+    to start, and OpenCV reports it as `Internal data stream error`, which
+    reads like the camera broke rather than like the mode does not exist.
+    That is the whole of why --format YUYV --fps 35 dies on a camera whose
+    YUYV tops out at 5.
+
+    So the rate is brought down to the fastest the format actually has at
+    this size, rather than refused: somebody choosing YUYV is asking for the
+    sensor's own pixels, and 5 of them a second is what that costs here. The
+    size is left alone -- a picture quietly smaller than the one asked for
+    would change what every measurement downstream means.
+
+    Without v4l2-ctl there is nothing to ask, and the request goes through
+    unchanged.
+    """
+    modes = list_modes(device).get(fmt.upper())
+    if not modes:
+        return width, height, fps, ""
+    rates = modes.get((width, height))
+    if not rates:
+        sizes = ", ".join(f"{w}x{h}" for w, h in sorted(modes, reverse=True)[:6])
+        return width, height, fps, (
+            f"{fmt.upper()} has no {width}x{height} on this camera — it has "
+            f"{sizes}. Pick one with --width/--height")
+    fits = [r for r in rates if r <= fps + 0.01]
+    if fits:
+        best = max(fits)
+        return width, height, int(best), (
+            "" if abs(best - fps) < 0.01 else
+            f"{fmt.upper()} at {width}x{height} has no {fps}/s — using "
+            f"{best:g}/s, the fastest it offers at or below that")
+    best = min(rates)
+    return width, height, int(best), (
+        f"{fmt.upper()} at {width}x{height} tops out at {max(rates):g}/s, "
+        f"well under the {fps}/s asked for — using {best:g}/s")
+
+
 def gstreamer_pipeline(index, width, height, fps, fmt):
     QUEUE = "queue leaky=downstream max-size-buffers=1"
     SINK  = ("videoconvert ! video/x-raw, format=BGR ! "
@@ -162,13 +244,13 @@ class Stream:
         self.inferred = 0
         self.misses = 0
         self.ended = False
+        self.asked = None        # (w, h, fps) the pipeline was built with
 
         self.kind, self.name, self.cap = self._open(spec, args)
         if not self.cap.isOpened():
             raise SystemExit(
                 f"[{tag}] could not open {self.name}"
-                + (" — another process may hold it, or the mode is not one "
-                   "this camera has" if self.kind == "camera"
+                + (self._why_not(args) if self.kind == "camera"
                    else " — unsupported codec, or the file is unreadable"))
 
         if self.kind == "file":
@@ -177,8 +259,9 @@ class Stream:
             self.fps = self.cap.get(cv2.CAP_PROP_FPS) or args.fps
             self.total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         else:
-            self.w, self.h = args.width, args.height
-            self.fps, self.total = float(args.fps), 0
+            self.w, self.h, fps = self.asked or (args.width, args.height,
+                                                 args.fps)
+            self.fps, self.total = float(fps), 0
         # A file was rotated when it was recorded; a camera is rotated here.
         self.rotate = rotate if rotate is not None else (
             0 if self.kind == "file" else DEFAULT_ROTATE)
@@ -186,11 +269,7 @@ class Stream:
     def _open(self, spec, args):
         """A device index, a file, or a camera matched by name."""
         if spec is not None and str(spec).isdigit():
-            index = int(spec)
-            pipeline = gstreamer_pipeline(index, args.width, args.height,
-                                          args.fps, args.format)
-            return ("camera", f"/dev/video{index}",
-                    cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER))
+            return self._open_camera(int(spec), args)
         if spec is not None and os.path.exists(spec):
             if not str(spec).lower().endswith(VIDEO_EXT):
                 print(f"[{self.tag}] {spec} is not a known video extension — "
@@ -206,11 +285,58 @@ class Stream:
             if not hits:
                 raise SystemExit(f"[{self.tag}] no file and no camera matching "
                                  f"'{spec}' — try --list-cameras")
-            pipeline = gstreamer_pipeline(hits[0], args.width, args.height,
-                                          args.fps, args.format)
-            return ("camera", f"/dev/video{hits[0]}",
-                    cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER))
+            return self._open_camera(hits[0], args)
         raise SystemExit(f"[{self.tag}] nothing to open")
+
+    def _open_camera(self, index, args):
+        """One camera, at a mode the driver says it has."""
+        device = f"/dev/video{index}"
+        w, h, fps, note = pick_mode(device, args.format,
+                                    args.width, args.height, args.fps)
+        if note:
+            print(f"[{self.tag}] {note}")
+        self.asked = (w, h, fps)
+        pipeline = gstreamer_pipeline(index, w, h, fps, args.format)
+        return "camera", device, cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+    def _why_not(self, args):
+        """What actually went wrong, as far as the driver will say.
+
+        Three different things arrive here looking identical, because
+        GStreamer reports all of them as `Internal data stream error`:
+
+          * the mode does not exist. Caught before the pipeline is built,
+            so if pick_mode had something to say it is repeated here;
+          * the device is already streaming. V4L2 makes that exclusive --
+            including against this same app, which is why a format change
+            has to release before it opens;
+          * there is not enough USB bandwidth left for a second stream.
+            This is the one that only appears with two cameras, and only on
+            the second one: uncompressed video is reserved up front, so
+            camera A takes what it needs and camera B is refused outright.
+            Two YUYV streams want twice what one wants, and on USB 2.0 --
+            40 MB/s of it -- one full-size stream is already most of that.
+            MJPG asks for a fraction of it, which is why the same pair opens
+            without complaint compressed.
+        """
+        modes = list_modes(self.name)
+        fmt = args.format.upper()
+        w, h, fps = self.asked or (args.width, args.height, args.fps)
+        if modes and fmt in modes and (w, h) not in modes[fmt]:
+            sizes = ", ".join(f"{a}x{b}"
+                              for a, b in sorted(modes[fmt], reverse=True)[:6])
+            return (f" — {fmt} has no {w}x{h} on this camera. It has: "
+                    f"{sizes}")
+        if modes and fmt not in modes:
+            return (f" — this camera does not offer {fmt} at all "
+                    f"(it has {', '.join(sorted(modes))})")
+        return (f" — {fmt} {w}x{h}@{fps} is a mode this camera lists, so "
+                f"either another process holds the device, or there is not "
+                f"enough USB bandwidth left for it. Uncompressed video is "
+                f"reserved up front, so a second YUYV stream on the same "
+                f"controller is refused outright while the first one runs. "
+                f"Try --format MJPG, a smaller --width/--height, or put the "
+                f"two cameras on separate USB controllers")
 
     def read(self, loop):
         """The next frame, or None. Sets .ended when a file runs out."""

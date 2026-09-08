@@ -225,11 +225,21 @@ def nearest_mode(modes, fmt, width, height, fps):
     return best[0], best[1], best[2], min(rates, key=lambda r: abs(r - fps))
 
 
-def gstreamer_pipeline(cam_index, width, height, fps, fmt):
-    """v4l2src -> BGR appsink. The queue and appsink flags keep the reader on
-    the newest frame: without them a slow consumer drifts behind live."""
+def gstreamer_pipeline(cam_index, width, height, fps, fmt, gray=False):
+    """v4l2src -> appsink. The queue and appsink flags keep the reader on
+    the newest frame: without them a slow consumer drifts behind live.
+
+    `gray` asks the pipeline for GRAY8 instead of BGR, and the difference is
+    where the work happens rather than what it produces. Everything upstream
+    is already luminance plus colour kept apart -- MJPG decodes to I420, YUYV
+    is Y with the chroma interleaved -- so GRAY8 is the plane that is already
+    there, handed over as it stands. BGR is the conversion: three channels
+    built for every pixel, of a picture whose colour this camera barely has.
+    Asking the pipeline for grey skips that; converting in Python afterwards
+    pays for it and then throws the result away.
+    """
     QUEUE = "queue leaky=downstream max-size-buffers=1"
-    SINK  = ("videoconvert ! video/x-raw, format=BGR ! "
+    SINK  = (f"videoconvert ! video/x-raw, format={'GRAY8' if gray else 'BGR'} ! "
              "appsink drop=true max-buffers=1 sync=false")
     if fmt.upper() == "MJPG":
         return (f"v4l2src device=/dev/video{cam_index} ! "
@@ -267,6 +277,14 @@ def main():
     ap.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
     ap.add_argument("--format", default=DEFAULT_FORMAT, choices=["MJPG", "YUYV"])
+    ap.add_argument("--gray", action="store_true",
+                     help="take the picture as GRAY8 out of the pipeline "
+                          "rather than BGR. The luminance plane is already "
+                          "there in what the camera sends, so this hands it "
+                          "over instead of building three channels from it. "
+                          "Needs the GStreamer path -- with --v4l2 the "
+                          "backend converts to BGR itself before OpenCV sees "
+                          "a thing.")
     ap.add_argument("--rotate", type=int, default=DEFAULT_ROTATE,
                      choices=[0, 90, 180, 270],
                      help="rotate every frame by a fixed angle (clockwise)")
@@ -342,9 +360,15 @@ def main():
 
     print(f"[camera] using /dev/video{cam_index}")
     if args.v4l2:
+        if args.gray:
+            print("[camera] --gray needs the pipeline: the V4L2 backend "
+                  "hands OpenCV a BGR frame whatever the camera sent, and "
+                  "greying it here would be the conversion you asked to "
+                  "avoid. Running in colour.")
         cap = open_v4l2_direct(cam_index, width, height, fps, fmt)
     else:
-        pipeline = gstreamer_pipeline(cam_index, width, height, fps, fmt)
+        pipeline = gstreamer_pipeline(cam_index, width, height, fps, fmt,
+                                      gray=args.gray)
         print(f"[camera] pipeline: {pipeline}")
         cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         if not cap.isOpened():
@@ -394,9 +418,15 @@ def main():
                 print(f"[camera] frame {n} {frame.shape}  fps={fps_ema:.1f}",
                       end="\r")
             else:
-                cv2.putText(frame, f"{width}x{height} {fmt}  FPS: {fps_ema:.1f}",
+                # A GRAY8 frame has one channel, and a three-number colour
+                # written onto it takes only the first -- which for green is
+                # 0, and draws the caption in black on a dark picture.
+                ink = 255 if frame.ndim == 2 else (0, 255, 0)
+                cv2.putText(frame, f"{width}x{height} {fmt}"
+                            f"{' GRAY' if frame.ndim == 2 else ''}  "
+                            f"FPS: {fps_ema:.1f}",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                            (0, 255, 0), 2, cv2.LINE_AA)
+                            ink, 2, cv2.LINE_AA)
                 cv2.imshow(win_name, frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break

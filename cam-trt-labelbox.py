@@ -184,12 +184,12 @@ def main():
     ap.add_argument("--axis", choices=["auto", "x", "y"], default="auto",
                      help="which way a label's two parts are stacked. Measured "
                           "off the frame by default")
-    ap.add_argument("--pad", type=float, default=0.06,
+    ap.add_argument("--pad", type=float, default=0.12,
                      help="margin round the union of the two parts, as a "
                           "fraction of its size. This is the default shape of "
                           "the box: the two parts and the serial number "
                           "between them, and none of the card around it")
-    ap.add_argument("--pad-px", type=int, default=0,
+    ap.add_argument("--pad-px", type=int, default=40,
                      help="least margin in pixels, whatever --pad works out to")
     ap.add_argument("--gutter", action="store_true",
                      help="take the whole card instead: widen into the gap "
@@ -352,7 +352,7 @@ def main():
             if not args.no_display:
                 if shown is not None:
                     cv2.imshow(win_name, shown)
-                key = cv2.waitKey(30 if paused else 1) & 0xFF
+                key = cv2.waitKey(30 if paused else 0) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 if key == ord(" "):
