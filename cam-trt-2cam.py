@@ -58,8 +58,8 @@ from utils.labelbox import (ARTIFACT_NAMES, CODE_NAMES, LABEL_COLOR,
                             save_shot)
 
 # ── Stream config ────────────────────────────────────────────────────────────
-DEFAULT_WIDTH     = 2592
-DEFAULT_HEIGHT    = 1944 
+DEFAULT_WIDTH     = 1920
+DEFAULT_HEIGHT    = 1200
 DEFAULT_FPS     = 60
 DEFAULT_FORMAT  = "MJPG"
 DISPLAY_MAX_W   = 1600       # two panes, so wider than the one-camera viewer

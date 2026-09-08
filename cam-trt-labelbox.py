@@ -65,9 +65,9 @@ from utils.labelbox import (ARTIFACT_NAMES, CODE_NAMES, LABEL_COLOR,
                             save_shot)
 
 # ── Stream config (same defaults as cam-trt.py) ─────────────────────────────
-DEFAULT_CAM_INDEX = 0
-DEFAULT_WIDTH     = 2592
-DEFAULT_HEIGHT    = 1944   # the 2MP global shutter's full frame
+DEFAULT_CAM_INDEX = 2
+DEFAULT_WIDTH     = 1920
+DEFAULT_HEIGHT    = 1200   # the 2MP global shutter's full frame
 DEFAULT_FPS       = 60
 DEFAULT_FORMAT    = "MJPG"
 DISPLAY_MAX_W     = 1280
