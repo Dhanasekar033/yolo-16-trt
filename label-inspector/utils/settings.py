@@ -64,6 +64,11 @@ class Settings:
         # up order. None is straight through, which is what a fresh install
         # starts on and what nearly every sheet wants.
         self.ups_map = None
+        # MJPG or YUYV -- which the console was last left on. A property of
+        # how this reel is being checked, not of a session: the operator who
+        # chose uncompressed frames for a fine print job should not have to
+        # choose again in the morning.
+        self.format = None
         self._recent = []
         self._warned = False
         self._load()
@@ -96,6 +101,9 @@ class Settings:
         scan = data.get("scan")
         if isinstance(scan, dict):
             self.scan = scan
+        fmt = data.get("format")
+        if isinstance(fmt, str) and fmt.upper() in ("MJPG", "YUYV"):
+            self.format = fmt.upper()
         ups_map = data.get("ups_map")
         if isinstance(ups_map, list):
             cols = [int(n) for n in ups_map
@@ -192,6 +200,14 @@ class Settings:
         self.ups = wanted
         self._save()
 
+    def remember_format(self, name):
+        """Which camera format the console was last left on."""
+        name = (name or "").upper()
+        if name not in ("MJPG", "YUYV") or name == self.format:
+            return
+        self.format = name
+        self._save()
+
     def remember_ups_map(self, numbers):
         """Which column each up was left pointing at, as column numbers.
 
@@ -211,7 +227,7 @@ class Settings:
         data = {"label_dir": self.label_dir,
                 "capture_dir": self.capture_dir, "recent": self._recent,
                 "camera": self.camera, "scan": self.scan, "ups": self.ups,
-                "ups_map": self.ups_map}
+                "ups_map": self.ups_map, "format": self.format}
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"

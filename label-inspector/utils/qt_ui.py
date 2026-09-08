@@ -607,6 +607,9 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._loaded = None
         self._winder_auto = None
         self._reverse = None
+        # _UNSET, not None: the first snapshot has to draw the switch even
+        # when what it says happens to match the default.
+        self._format = _UNSET
         self._counts = None
         # Up while a snapshot is being written into the ups tick boxes, so
         # their own toggled signal does not bounce that straight back at the
@@ -1065,6 +1068,25 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.ups_summary.hide()
         col.addSpacing(10)
 
+        # What the camera sends. Above the check direction because it is set
+        # once for a job, like the direction is, and unlike the winder it does
+        # not act on the machine -- it changes what the pictures are made of.
+        self.format_caption = QtWidgets.QLabel("CAMERA FORMAT",
+                                               objectName="caption")
+        col.addWidget(self.format_caption)
+        self.format_switch = ToggleSwitch("MJPG", "YUYV", scale=self._k,
+                                          on_colour=ACCENT, off_colour=ACCENT)
+        self.format_switch.clicked.connect(
+            lambda on: self.command.emit("format", bool(on)))
+        col.addWidget(self.format_switch)
+        # The rates each one is worth at this size, from the camera itself --
+        # a number written here would be a number about somebody else's
+        # camera. This is what makes the choice a choice and not a guess.
+        self.format_rates = QtWidgets.QLabel("", objectName="meta")
+        self.format_rates.setWordWrap(True)
+        col.addWidget(self.format_rates)
+        col.addSpacing(10)
+
         col.addWidget(QtWidgets.QLabel("CHECK DIRECTION IN EXCEL",
                                        objectName="caption"))
         self.dir_switch = ToggleSwitch("FORWARD", "REVERSE", scale=self._k,
@@ -1519,6 +1541,24 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self._ups_setting = False
             self._say_map()
 
+        fmt = snap.get("format") or {}
+        if fmt != self._format:
+            self._format = fmt
+            live = bool(fmt.get("live", True))
+            for widget in (self.format_caption, self.format_switch,
+                           self.format_rates):
+                widget.setVisible(live)
+            if live:
+                self._ups_setting = True     # a snapshot, not a click
+                self.format_switch.setChecked(fmt.get("name") == "YUYV")
+                self._ups_setting = False
+                rates = fmt.get("rates") or {}
+                self.format_rates.setText(
+                    f"{fmt.get('name', '')} at {fmt.get('fps', '')}/s"
+                    + ("   ·   " + ", ".join(
+                        f"{k} {v:g}/s" for k, v in sorted(rates.items()))
+                       if rates else ""))
+
         reverse = bool(snap.get("reverse", False))
         if reverse != self._reverse:
             self._reverse = reverse
@@ -1532,6 +1572,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.recent_btn.setEnabled(configurable)
             self.out_btn.setEnabled(configurable)
             self.dir_switch.setEnabled(configurable)
+            self.format_switch.setEnabled(configurable)
             for widget in self.ups_boxes + self.ups_combos:
                 widget.setEnabled(configurable)
 

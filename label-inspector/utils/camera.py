@@ -23,7 +23,10 @@ operator a slider and nothing else.
 
 import fcntl
 import os
+import re
+import shutil
 import struct
+import subprocess
 
 # ── the ioctls ───────────────────────────────────────────────────────────
 def _IOWR(kind, nr, size):
@@ -52,6 +55,41 @@ CONTROLS = {
 
 EXPOSURE_AUTO = 0x009A0901       # the menu that has to say manual first
 EXPOSURE_MANUAL = 1              # V4L2_EXPOSURE_MANUAL
+
+
+def list_rates(device, width, height):
+    """{"MJPG": [rates], "YUYV": [rates]} at one size, straight from the driver.
+
+    What a format is worth is not a number anyone can write down once: MJPG
+    is compressed in the camera and gets a high rate; YUYV is the sensor's
+    own pixels and is limited by what the USB link will carry, which depends
+    on the size, the camera and the cable. This rig's 5MP camera did 60 and
+    35; the 2MP one on it now does 90 and 5 at full frame. So the console
+    asks rather than tells, and a format nobody can use at this size shows
+    the rate that says so.
+    """
+    if not shutil.which("v4l2-ctl"):
+        return {}
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats-ext"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    rates, fmt, size = {}, None, None
+    for line in out.splitlines():
+        hit = re.search(r"\]:\s*'(\w+)'", line)
+        if hit:
+            fmt = hit.group(1).upper()
+            continue
+        hit = re.search(r"Size:\s*\w+\s*(\d+)x(\d+)", line)
+        if hit:
+            size = (int(hit.group(1)), int(hit.group(2)))
+            continue
+        hit = re.search(r"\(([\d.]+)\s*fps\)", line)
+        if hit and fmt and size == (int(width), int(height)):
+            rates.setdefault(fmt, []).append(float(hit.group(1)))
+    return {k: sorted(v, reverse=True) for k, v in rates.items()}
 
 
 class CameraControls:

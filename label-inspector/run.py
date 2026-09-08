@@ -176,11 +176,12 @@ import argparse
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 import cv2
 
-from utils.camera import CameraControls
+from utils.camera import CameraControls, list_rates
 from utils.source import FrameSource
 from utils.config import Config, app_dir
 from utils.crops import LabelSaver, code_id, timestamp
@@ -1162,6 +1163,9 @@ def main():
                           "during a rewind before the fault counts as "
                           "cleared and the machine restarts itself.")
     args = ap.parse_args()
+    # A format on the command line outranks the one the console was last left
+    # on, the same way every other setting works here.
+    args.format_given = any(a.startswith("--format") for a in sys.argv[1:])
     if args.window_grace is None:
         args.window_grace = args.window_size
 
@@ -1649,6 +1653,62 @@ def main():
                   f"recognises")
         _note[0] = f"Columns: {describe_map(colmap, per_row)}"
 
+    def set_format(yuyv):
+        """MJPG or YUYV, from the console's toggle.
+
+        MJPG is compressed in the camera: fast, and the frame arrives already
+        thrown away once, which is the one thing a printing check cannot get
+        back. YUYV is the sensor's own pixels, and what it costs is frames a
+        second -- on this camera at this size, 5 of them. Neither is right for
+        every job, which is why it is a switch and not a setting in a file.
+
+        Reopening the stream is the whole of it: the format is negotiated when
+        the pipeline starts and cannot be changed underneath a running one. So
+        it is only allowed while the machine is idle, and if the new format
+        will not open, the old stream is kept rather than leaving the console
+        looking at nothing.
+        """
+        nonlocal cap, rotate_in_loop
+        fmt = "YUYV" if yuyv else "MJPG"
+        if args.source:
+            print("[ui] running from a recording — there is no camera to "
+                  "change the format of")
+            return
+        if fmt == args.format.upper():
+            return
+        if not _configurable():
+            print("[ui] stop the machine before changing the camera format")
+            _note[0] = "Stop the machine to change the camera format"
+            return
+        # THE OLD STREAM GOES FIRST, and it has to. V4L2 makes streaming
+        # exclusive: while this app holds /dev/video0, nothing -- including
+        # this app -- can open it again, so "start the new one and keep the
+        # old if it fails" cannot work. It fails every time, with 'device
+        # busy', and the message blames the format rather than the order.
+        was_fmt, was_rot = args.format, rotate_in_loop
+        cap.release()
+        fresh, rot = open_camera(fmt)
+        if fresh is None:
+            # Put back what was working. Retried, because the device may
+            # still be letting go of the stream that was just torn down.
+            back, back_rot = open_camera(was_fmt, tries=3)
+            if back is None:
+                print(f"[camera] {fmt} would not open at {args.width}x"
+                      f"{args.height}, and {was_fmt} did not come back — "
+                      f"the camera has stopped answering")
+                _note[0] = "Camera stopped answering — restart the app"
+                return
+            cap, rotate_in_loop = back, back_rot
+            print(f"[camera] {fmt} would not open at {args.width}x"
+                  f"{args.height} — staying on {was_fmt}")
+            _note[0] = f"{fmt} not available — still {was_fmt}"
+            return
+        cap, rotate_in_loop, args.format = fresh, rot, fmt
+        prefs.remember_format(fmt)
+        rate = format_fps(fmt)
+        print(f"\n[camera] format {fmt} at {rate}/s")
+        _note[0] = f"Camera {fmt} at {rate}/s"
+
     def set_winder(auto):
         """AUTO or MANUAL, from the console's toggle. The relay follows it.
 
@@ -1775,6 +1835,9 @@ def main():
     # A recording rotates in the loop or not at all: there is no pipeline to
     # do it in, and a file written by capture_video.py already has the
     # rotation baked in, so its default is 0 rather than the camera's.
+    if not args.source and not args.format_given and prefs.format:
+        args.format = prefs.format
+
     if args.rotate is None:
         args.rotate = 0 if args.source else CAM["rotate"]
 
@@ -1793,23 +1856,73 @@ def main():
     else:
         print(f"[camera] using /dev/video{cam_index}")
 
-        # Preferred path: videoflip rotates inside the pipeline, off the loop.
-        # If that pipeline won't open (no videoflip element, say), fall back to
-        # rotating each frame in the loop as before.
-        pipeline = gstreamer_pipeline(cam_index, args.width, args.height,
-                                      args.fps, args.format, rotate=args.rotate)
-        print(f"[camera] pipeline: {pipeline}")
-        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-        rotate_in_loop = 0
-        if not cap.isOpened() and args.rotate:
-            print("[camera] videoflip pipeline would not open — rotating in "
-                  "the loop")
+    # What each format is actually worth at this size, asked of the driver
+    # rather than assumed. Probed once: it is a property of the camera and
+    # the cable, and neither changes while the app runs.
+    cam_rates = ({} if args.source else
+                 list_rates(CAM["device"] or f"/dev/video{cam_index}",
+                            args.width, args.height))
+
+    def format_fps(fmt):
+        """The best rate this format offers at this size, up to --fps.
+
+        A format that cannot do what was asked is run at the fastest it has
+        rather than refused: YUYV at 1920x1200 on this camera is 5/s, and 5
+        uncompressed frames a second is exactly what somebody choosing YUYV
+        is asking for.
+        """
+        rates = cam_rates.get(fmt.upper()) or []
+        if not rates:
+            return int(args.fps)
+        fits = [r for r in rates if r <= args.fps + 0.01]
+        return int(max(fits) if fits else min(rates))
+
+    def open_camera(fmt, tries=1):
+        """(cap, rotate_in_loop) for one format, or (None, 0) if it won't open.
+
+        Preferred path: videoflip rotates inside the pipeline, off the loop.
+        If that pipeline won't open (no videoflip element, say), fall back to
+        rotating each frame in the loop as before.
+
+        `tries` is for reopening a device that has just been released. The
+        driver does not always let go the instant the old pipeline is torn
+        down, and a single attempt a few milliseconds later can still come
+        back busy on a camera that is about to be perfectly available.
+        """
+        fps = format_fps(fmt)
+        for attempt in range(max(1, tries)):
+            if attempt:
+                time.sleep(0.4)
             pipeline = gstreamer_pipeline(cam_index, args.width, args.height,
-                                          args.fps, args.format)
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-            rotate_in_loop = args.rotate
-        if not cap.isOpened():
+                                          fps, fmt, rotate=args.rotate)
+            print(f"[camera] pipeline: {pipeline}")
+            fresh = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            rot = 0
+            if not fresh.isOpened() and args.rotate:
+                # Released before the second attempt: a VideoCapture that
+                # failed to start still holds its handle on the device, and
+                # leaving it about is one more thing making the camera busy.
+                fresh.release()
+                print("[camera] videoflip pipeline would not open — rotating "
+                      "in the loop")
+                pipeline = gstreamer_pipeline(cam_index, args.width,
+                                              args.height, fps, fmt)
+                fresh = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                rot = args.rotate
+            if fresh.isOpened():
+                return fresh, rot
+            fresh.release()
+        return None, 0
+
+    if not args.source:
+        cap, rotate_in_loop = open_camera(args.format)
+        if cap is None:
             raise RuntimeError("Failed to open camera via GStreamer pipeline")
+        print(f"[camera] {args.format} at {format_fps(args.format)}/s"
+              + ("  (" + ", ".join(
+                  f"{k} up to {max(v):g}/s" for k, v in sorted(cam_rates.items()))
+                 + ")" if cam_rates else ""))
+
 
     # Exposure, gain and brightness, on the same device the pipeline is
     # streaming from. Whatever the operator set last time goes back on now:
@@ -4033,6 +4146,8 @@ def main():
                 capture_frame()
             elif name == "capturedir":
                 _apply_capture_dir(arg)
+            elif name == "format":
+                set_format(arg)
             elif name == "winder":
                 set_winder(arg)
             elif name == "direction":
@@ -4403,6 +4518,12 @@ def main():
             # What the sliders behind 's' are built from: the camera's own
             # limits, and where it is set now.
             "camera": {"ranges": camera.ranges, "values": cam_values[0]},
+            # The format switch: which one is live, what each is worth at
+            # this size, and whether there is a camera to switch at all.
+            "format": {"live": not bool(args.source),
+                       "name": args.format.upper(),
+                       "rates": {k: max(v) for k, v in cam_rates.items()},
+                       "fps": format_fps(args.format)},
             "debug": show_debug[0],
             # The three tallies the operator watches to know the run is
             # actually getting somewhere: how many codes the sheet is asking
