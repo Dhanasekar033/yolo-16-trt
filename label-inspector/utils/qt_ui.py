@@ -703,6 +703,17 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                 font-weight: 700; color: {MUTED};
                                 padding: {int(5 * k)}px {int(14 * k)}px; }}
             QPushButton#quit:hover {{ color: {BAD}; border-color: {BAD}; }}
+            /* RESET is lettered rather than filled: it sits beside QUIT in a
+               corner nobody looks at until something is wrong, and a bar with
+               two loud buttons in it teaches the operator to stop reading
+               either. It colours in under the pointer, where the press is
+               already deliberate. */
+            QPushButton#reset {{ font-size: {int(11 * k)}px;
+                                 font-weight: 700; color: {WARN};
+                                 border-color: #6a5a2e;
+                                 padding: {int(5 * k)}px {int(14 * k)}px; }}
+            QPushButton#reset:hover {{ color: #2a2205; background: {WARN};
+                                       border-color: {WARN}; }}
             QCheckBox {{ color: {TEXT}; font-size: {int(12 * k)}px;
                          font-weight: 600; spacing: {int(8 * k)}px;
                          padding: {int(4 * k)}px 0; }}
@@ -1121,6 +1132,21 @@ class InspectorWindow(QtWidgets.QMainWindow):
         row.addWidget(self.status)
         row.addStretch(1)
         row.addWidget(QtWidgets.QLabel("[F11] FULL SCREEN", objectName="hint"))
+        # RESET is here for the same reason QUIT is, and next to it because
+        # the two answer the same question: the machine will not go and the
+        # operator needs a way out of it. That means it cannot be a button
+        # the machine's own state is allowed to disable -- a fault that
+        # greys out the control for clearing faults is the one arrangement
+        # guaranteed to strand somebody.
+        #
+        # Hidden unless the application says it handles the command. This
+        # console is shared by four run scripts, and a button that does
+        # nothing on three of them is worse than no button at all.
+        self.reset_btn = QtWidgets.QPushButton("RESET", objectName="reset")
+        self.reset_btn.clicked.connect(self._reset_clicked)
+        self.reset_btn.setVisible(False)
+        row.addSpacing(14)
+        row.addWidget(self.reset_btn)
         # In the corner the window's own close button would be in, because
         # in full screen there is no title bar to put one in -- and a panel
         # PC with no keyboard has no other way out of the application.
@@ -1353,6 +1379,46 @@ class InspectorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         return answer == QtWidgets.QMessageBox.Yes
+
+    def allow_reset(self, on=True):
+        """Show the RESET button. For applications that handle the command."""
+        self.reset_btn.setVisible(bool(on))
+
+    def _reset_clicked(self):
+        """Put the application back to how it opened, whatever it is doing.
+
+        Asked first, and asked in the words of whatever is on the screen
+        now, because this throws away the run in progress. The record is not
+        thrown away -- it is closed properly on the way out, the same as
+        quitting -- but the window, the sheet and everything read off this
+        coil are, and on a panel PC the button is one stray sleeve away from
+        being pressed by accident.
+        """
+        if self._state in ("rewind", "mismatch", "unread", "incomplete"):
+            question = ("Reset the console?\n\n"
+                        "The fault is cleared, the machine is stopped and "
+                        "the sheet is unloaded. What has been checked so far "
+                        "is written out first, so nothing already verified "
+                        "is lost -- but this coil starts again from the "
+                        "beginning.")
+        elif self._running:
+            question = ("Reset while the machine is running?\n\n"
+                        "The line will be stopped and the winder relay "
+                        "released, then the console goes back to how it "
+                        "opened. What has been checked so far is written "
+                        "out.")
+        else:
+            question = ("Reset the console?\n\n"
+                        "The sheet is unloaded and the counters cleared, "
+                        "back to how the application opens. What has been "
+                        "checked is written out first.")
+        answer = QtWidgets.QMessageBox.question(
+            self, "Label Inspector", question,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        self.command.emit("reset", None)
 
     def _quit_clicked(self):
         """Shut the application down from the screen, whatever the line is

@@ -947,6 +947,12 @@ def main():
                           f"Default {CAM['rotate']} for the camera and 0 for "
                           f"--source, because a recording made by this rig "
                           f"already has the rotation in it.")
+    ap.add_argument("--no-reset", action="store_true",
+                     help="hide the console's RESET button. It puts the app "
+                          "back to how it opened -- machine stopped, fault "
+                          "cleared, sheet unloaded, record written out -- "
+                          "which is the way out of a fault nothing on the "
+                          "coil can clear")
     ap.add_argument("--ui", default="qt", choices=["qt", "opencv"],
                      help="which console. 'qt' is a real window: the chrome "
                           "is widgets rather than pixels burnt into the "
@@ -4403,6 +4409,114 @@ def main():
     commands = queue.Queue()
     quitting = threading.Event()
 
+    def reset_run():
+        """Put the whole application back to the state it opens in.
+
+        The way out when the machine will not go. A fault that cannot be
+        cleared by the coil -- the wrong sheet on a roll nobody can find, a
+        row held open on labels that have already been cut off and thrown
+        away, a stop nobody can account for -- leaves the console waiting for
+        something that is never going to happen, and the only honest answer
+        is to start the job again. That was a restart of the application
+        until now, which on a panel PC means finding a keyboard.
+
+        Back to opening state means exactly that, and the sheet goes with it.
+        This app will not carry a sheet across a reset for the same reason it
+        does not load yesterday's at start-up: which roll is on the machine
+        is something only the operator knows, and a coil checked against
+        paperwork somebody else chose is worse than one not checked at all.
+        Whatever was loaded is one press of OPEN RECENT SHEET away.
+
+        NOTHING ALREADY CHECKED IS LOST. The books are closed properly on the
+        way out -- the workbook written, the journal flushed, the scan log
+        closed -- exactly as they are when the sheet is changed or the
+        application quits. Load the same sheet again and the record is picked
+        up where it was left: the journal says which rows were verified, and
+        the window resumes from the far end of them.
+
+        What is NOT touched, on purpose:
+
+          the camera streams   Reopening them buys nothing and risks the one
+                               failure that would leave the console looking
+                               at a black pane -- V4L2 streaming is
+                               exclusive, so a stream released is a stream
+                               that may not come back while something else is
+                               quick enough to take it.
+          exposure, gain,      Properties of this camera in this light, not
+          format, ups, folders of this run. They are remembered between runs
+                               precisely so they survive a restart, and a
+                               reset that threw them away would send the
+                               operator back through the camera dialog every
+                               time the line stopped.
+
+        The winder goes back to AUTO with the contact open. That is the one
+        physical thing this does, and it is the safe direction: an open start
+        input drives nothing. A winder left in MANUAL through a reset would
+        be a console showing a freshly opened, idle machine with a closed
+        contact behind it.
+        """
+        nonlocal sheet, window, per_row, checked, colmap
+        was_sheet = os.path.basename(args.xlsx) if args.xlsx else None
+        print(f"\n[reset] putting the console back to how it opened"
+              + (f" — closing the record for {was_sheet}" if was_sheet else ""))
+
+        # Stop first, and stop for real: the relay is dropped whatever the
+        # console thought the machine was doing. A reset is reached from
+        # states this app does not have a name for, so nothing here asks
+        # what the last one was.
+        stop_machine("reset", open_relay=True)
+        starting_at[0] = None
+        start_reason[0] = ""
+        if not winder_auto[0]:
+            print(f"[reset] winder back to AUTO — relay {args.start_relay} OFF")
+        winder_auto[0] = True
+        relay.off(args.start_relay)
+        fault.update(_NO_FAULT)
+
+        # Closes the books, then clears everything a run accumulates. With
+        # the sheet taken out of args first it stops there rather than
+        # opening the next one, which is the whole difference between this
+        # and loading a different sheet.
+        args.xlsx = None
+        args.out_xlsx = None
+        _bind_run()
+        sheet = window = per_row = checked = colmap = None
+        code_mix[0] = (0, 0)
+        work_xlsx[0] = None
+        hold_after[0] = 1
+        # Back to what the command line asked for, not what the console was
+        # last set to: --reverse and --check are opening state, and neither
+        # is remembered between runs.
+        check_step[0] = RollingWindow.REVERSE if args.reverse \
+            else RollingWindow.FORWARD
+        ups_from_cli[0] = bool(args.check)
+        show_debug[0] = args.debug
+
+        # Everything measured from a picture, for both cameras. The globals
+        # are whichever camera was last swapped in, so they are cleared as
+        # well as the two state dicts -- clearing only the dicts would leave
+        # the live set to be swapped straight back out over them.
+        last_labels[0] = []
+        motion[0] = (0.0, 0.0)
+        marks[0] = []
+        parts[0] = []
+        handled[0] = []
+        pending_crops.clear()
+        tracks[:] = []
+        for cam in cams:
+            cam.state.update({"last_labels": [], "motion": (0.0, 0.0),
+                              "marks": [], "parts": [], "handled": [],
+                              "pending_crops": [], "tracks": []})
+        waive_until[0] = 0.0
+        last_read[0] = time.time()
+        zb_reads[0] = 0
+        rewound[0] = 0
+
+        _note[0] = None
+        print(f"[reset] done — no sheet loaded. LOAD SHEET, or OPEN RECENT "
+              f"SHEET, for the roll on the machine")
+        voice.say("Console reset. Load the sheet.", key="reset")
+
     def _run_commands():
         while True:
             try:
@@ -4437,6 +4551,8 @@ def main():
                 show_debug[0] = not show_debug[0]
                 print(f"[ui] diagnostics "
                       f"{'on' if show_debug[0] else 'off'}")
+            elif name == "reset":
+                reset_run()
             elif name == "quit":
                 quitting.set()
 
@@ -4524,6 +4640,10 @@ def main():
                 or QtWidgets.QApplication([])
             qt_window = InspectorWindow()
             qt_window.locked = not args.unlock_window
+            # This build handles the reset command, so the console may show
+            # the button for it. The other run scripts share this window and
+            # do not, which is why it is asked for rather than assumed.
+            qt_window.allow_reset(not args.no_reset)
             qt_window.command.connect(lambda name, arg:
                                       commands.put((name, arg)))
             # It fills the screen it is on -- the console is the only thing
