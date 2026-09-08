@@ -28,11 +28,23 @@ labels are missing a part. Two cameras see two different pictures, and mixing
 those measurements would have the machine reasoning about a web that does not
 exist. So each camera carries its own set, swapped in around its own frame.
 
-The two streams are grabbed by a thread each, so neither waits for the other,
-and the newest frame from each is what the pass works on. Inference is one
-engine run twice: a TensorRT context cannot execute two inferences at once,
-and a second context would cost another copy of the weights on the card for
-nothing.
+The streams are grabbed by a thread each, so neither waits for the other, and
+the newest frame from each is what the pass works on. Inference is one engine
+run over each in turn: a TensorRT context cannot execute two inferences at
+once, and a second context would cost another copy of the weights on the card
+for nothing.
+
+ONE CAMERA IS A STATE THIS RUNS IN, not a reason to refuse. How many streams
+there are is counted at start-up: two when the machine has them, one when it
+does not -- a camera away for repair, a rig being commissioned, a bench with
+one on it. Nothing downstream is told which: the pass walks the streams it was
+given, the console draws a pane for each, and one pane at full width is the
+ordinary single-camera picture. Half a web checked is worth having; a console
+that will not open is not.
+
+Camera B is only dropped when nobody asked for it. Name it with --index-b or
+--source-b and it is opened, and it fails loudly if it cannot be -- an
+operator who named a device is owed an error, not a quiet run on one camera.
 
 A single-purpose build of run.py: rolling-window mode only. Every QR the
 detector finds anywhere in the frame is decoded once and offered, on its own,
@@ -381,9 +393,14 @@ class Cam:
     stops offering frames, and the other one carries on.
     """
 
-    def __init__(self, tag, cap, rotate=0, name=""):
+    def __init__(self, tag, cap, rotate=0, name="", index=None):
         self.tag = tag                 # "A" / "B", what the console calls it
         self.name = name or tag
+        # The /dev/videoN this streams from, or None when it is a recording.
+        # Held on the camera rather than in a list beside it because the two
+        # lists stopped being the same length the moment one camera became a
+        # thing this build runs with.
+        self.index = index
         self.cap = cap
         self.rotate = rotate
         self.frame = None              # the frame this pass is working on
@@ -913,7 +930,9 @@ def main():
                      help="/dev/videoN for camera B. Default: the second "
                           "capture device found, grouped by the USB device it "
                           "hangs off so one camera's picture and metadata "
-                          "nodes are never counted as two cameras.")
+                          "nodes are never counted as two cameras. With no "
+                          "second device and none named, the run is on camera "
+                          "A alone rather than refused.")
     ap.add_argument("--source-b", default=None,
                      help="a recording to stand in for camera B, the way "
                           "--source does for camera A. Two files is how this "
@@ -1818,7 +1837,7 @@ def main():
         will not open, the old stream is kept rather than leaving the console
         looking at nothing.
         """
-        if args.source or args.source_b:
+        if not any(cam.index is not None for cam in cams):
             print("[ui] running from a recording — there is no camera to "
                   "change the format of")
             return
@@ -1847,8 +1866,8 @@ def main():
             cam.cap.release()
 
         opened, failed = [], None
-        for cam, index in zip(cams, (index_a, index_b)):
-            fresh, rot = open_camera(index, fmt, tries=2)
+        for cam in cams:
+            fresh, rot = open_camera(cam.index, fmt, tries=2)
             if fresh is None:
                 failed = cam.tag
                 break
@@ -1858,8 +1877,8 @@ def main():
             for _cam, fresh, _rot in opened:
                 fresh.release()
             back = []
-            for cam, index in zip(cams, (index_a, index_b)):
-                again, rot = open_camera(index, was_fmt, tries=3)
+            for cam in cams:
+                again, rot = open_camera(cam.index, was_fmt, tries=3)
                 if again is None:
                     print(f"[cam{cam.tag}] {fmt} would not open, and "
                           f"{was_fmt} did not come back — the camera has "
@@ -1872,7 +1891,9 @@ def main():
                 cam.stop.clear()
                 cam.start()
             print(f"[camera] {fmt} would not open on cam{failed} at "
-                  f"{args.width}x{args.height} — both staying on {was_fmt}")
+                  f"{args.width}x{args.height} — "
+                  + ("both staying" if len(cams) > 1 else "staying")
+                  + f" on {was_fmt}")
             _note[0] = f"{fmt} not available — still {was_fmt}"
             return
 
@@ -1883,8 +1904,10 @@ def main():
         args.format = fmt
         prefs.remember_format(fmt)
         rate = format_fps(fmt)
-        print(f"\n[camera] both cameras on {fmt} at {rate}/s")
-        _note[0] = f"Cameras {fmt} at {rate}/s"
+        print(f"\n[camera] "
+              + (f"both cameras on" if len(cams) > 1 else "camera on")
+              + f" {fmt} at {rate}/s")
+        _note[0] = f"Camera{'s' if len(cams) > 1 else ''} {fmt} at {rate}/s"
 
     def set_winder(auto):
         """AUTO or MANUAL, from the console's toggle. The relay follows it.
@@ -2118,9 +2141,10 @@ def main():
             raise SystemExit(
                 f"[cam{tag}] no camera for it. This machine has "
                 f"{len(devices)} capture device(s) "
-                f"({', '.join(f'/dev/video{i}' for i in devices) or 'none'}); "
-                f"two are needed. Plug the second one in, pin it with "
-                f"--index-b, or stand one in with --source-b clip.mp4")
+                f"({', '.join(f'/dev/video{i}' for i in devices) or 'none'}). "
+                f"Plug it in, pin it with --index{'-b' if tag == 'B' else ''}, "
+                f"or stand one in with --source{'-b' if tag == 'B' else ''} "
+                f"clip.mp4")
         print(f"[cam{tag}] using /dev/video{index}")
         cap, rot = open_camera(index, args.format)
         if cap is None:
@@ -2131,12 +2155,32 @@ def main():
                   f"{k} up to {max(v):g}/s"
                   for k, v in sorted(cam_rates.items())) + ")"
                  if cam_rates else ""))
-        return Cam(tag, cap, rot, f"/dev/video{index}")
+        return Cam(tag, cap, rot, f"/dev/video{index}", index=index)
 
-    cams = [open_stream("A", args.source, index_a),
-            open_stream("B", args.source_b, index_b)]
+    # HOW MANY STREAMS THIS RUN HAS. Two is what the rig is built for, but
+    # one is a state it has to run in rather than refuse: a camera away for
+    # repair, a rig being commissioned with the second one not yet mounted, a
+    # bench with one camera on it. Half a web checked is worth having; a
+    # console that will not open is not.
+    #
+    # Camera B is dropped only when nobody asked for it -- no --index-b, no
+    # --source-b, and no second capture device on the machine. Pin either and
+    # it is opened, and it fails loudly if it cannot be: an operator who named
+    # a device is owed an error, not a quiet run on one camera.
+    slots = [("A", args.source, index_a)]
+    if args.source_b or index_b is not None:
+        slots.append(("B", args.source_b, index_b))
+    else:
+        print(f"[camB] no second camera found — running on camera A alone. "
+              f"Everything works the same; the console shows one pane, and "
+              f"only the ups camera A can see will read.")
+
+    cams = [open_stream(tag, source, index) for tag, source, index in slots]
     for cam in cams:
         cam.start()
+    if len(cams) > 1:
+        print(f"[run] {len(cams)} streams: "
+              + ", ".join(f"cam{c.tag} {c.name}" for c in cams))
 
 
     # Exposure, gain and brightness, on the same device the pipeline is
@@ -2144,15 +2188,18 @@ def main():
     # these are a property of this camera in this light, not of a session,
     # and having to set them again every morning -- in a separate tool --
     # is how a reel gets run under a setting nobody chose.
-    # The sliders drive BOTH cameras. Two cameras over one web are looking at
-    # the same reel in the same light, and an exposure set on one of them is a
-    # setting only half applied -- the crops from the other half of the web
-    # would be brighter or darker than their neighbours for no reason anyone
-    # could see on the screen.
-    cameras = [CameraControls(f"/dev/video{i}", limits=CAM.get("limits"),
-                              enabled=not source)
-               for i, source in ((index_a, args.source), (index_b, args.source_b))
-               if i is not None or not source]
+    # The sliders drive EVERY camera in the run. Two cameras over one web are
+    # looking at the same reel in the same light, and an exposure set on one of
+    # them is a setting only half applied -- the crops from the other half of
+    # the web would be brighter or darker than their neighbours for no reason
+    # anyone could see on the screen. With one camera it is the same code
+    # reaching one device.
+    # One per stream that is actually a camera. A recording standing in for a
+    # camera has no exposure to set, and with one camera there is one set of
+    # sliders driving one device -- the same code, a shorter list.
+    cameras = [CameraControls(f"/dev/video{cam.index}",
+                              limits=CAM.get("limits"), enabled=True)
+               for cam in cams if cam.index is not None]
     camera = cameras[0] if cameras else CameraControls("/dev/null",
                                                        enabled=False)
     remembered = prefs.camera
@@ -2189,7 +2236,8 @@ def main():
             print(f"[camera] {name} would not take {value}")
             return
         if not all(took):
-            print(f"[camera] {name} took on only one of the two cameras")
+            print(f"[camera] {name} took on only {sum(1 for t in took if t)} "
+                  f"of the {len(took)} cameras")
         cam_values[0] = camera.snapshot()
         # Written on every move rather than on close: the operator adjusts
         # these and then walks back to the machine, and a console that is
@@ -4587,10 +4635,12 @@ def main():
     # the console is what the main thread runs. `scale` is how far the frame
     # is shrunk on its way to the screen, and both consoles need it.
     qt_app = qt_window = None
-    # Two panes side by side, so the width to fit is both of them. Sized off
-    # the pair rather than off one camera: fitting one and letting the other
-    # run off the glass is the one arrangement nobody can work with.
-    scale = min(DISP["max_width"] / (2 * disp_w),
+    # One pane per stream, side by side, so the width to fit is all of them.
+    # Sized off the set rather than off one camera: fitting one and letting
+    # the rest run off the glass is the one arrangement nobody can work with.
+    # With a single camera this is the ordinary full-width picture, which is
+    # what makes one console serve both.
+    scale = min(DISP["max_width"] / (len(cams) * disp_w),
                 DISP["max_height"] / disp_h, 1.0)
     pane_w = int(disp_w * scale)         # a pane's width on the screen
 
@@ -4819,7 +4869,7 @@ def main():
         s["tracks"] = list(tracks)
 
     def process_frame():
-        """One pass over both cameras. Returns the cameras that had a frame.
+        """One pass over every stream. Returns the cameras that had a frame.
 
         Each camera is grabbed, inferred and validated in turn. Sequential
         because a TensorRT context cannot execute two inferences at once --
@@ -4843,7 +4893,10 @@ def main():
 
         if not grabbed:
             if all(cam.misses > 50 for cam in cams):
-                print("[camera] neither camera is delivering frames")
+                print("[camera] "
+                      + ("neither camera is" if len(cams) > 1
+                         else "the camera is not")
+                      + " delivering frames")
             time.sleep(0.002)            # nothing new; do not spin on it
             return None
 
@@ -5010,9 +5063,10 @@ def main():
         decision about what to show is made here and handed over as a box, a
         colour and a caption.
 
-        With two cameras the picture is two panes, and each camera's boxes
-        are shifted into its own: the machine measures everything in the
-        coordinates of the frame it saw, and the console draws on the pair.
+        The picture is one pane per stream, and each camera's boxes are
+        shifted into its own: the machine measures everything in the
+        coordinates of the frame it saw, and the console draws on the set.
+        With one camera the shift is zero and this is the plain picture.
         """
         boxes, part_boxes, tags = [], [], []
         lines, banner = [], None
