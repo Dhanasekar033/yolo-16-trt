@@ -1116,13 +1116,13 @@ def main():
                           "as the camera gave them; jpg re-encodes them, "
                           "which smooths the very detail that says whether a "
                           "code was printed well.")
-    ap.add_argument("--box-pad", type=float, default=0.06,
+    ap.add_argument("--box-pad", type=float, default=0.12,
                      help="how far the label box reaches past the two parts "
                           "it is built from, as a fraction of their span. The "
                           "default takes in the serial number printed beside "
                           "them and nothing else. Only used on an engine with "
                           "no label class of its own.")
-    ap.add_argument("--box-pad-px", type=int, default=0,
+    ap.add_argument("--box-pad-px", type=int, default=40,
                      help="least margin in pixels, whatever --box-pad works "
                           "out to.")
     ap.add_argument("--box-gutter", action="store_true",
