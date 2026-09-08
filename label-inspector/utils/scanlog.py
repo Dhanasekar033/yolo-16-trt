@@ -42,9 +42,14 @@ NUMBERED = re.compile(r"^(.*)_(\d+)\.csv$", re.IGNORECASE)
 class ScanLog:
     """The run's CSVs, and which one is open now."""
 
-    def __init__(self, root="labels", name="run", prefix="scan"):
+    def __init__(self, root="labels", name="run", prefix="scan", fields=FIELDS):
         self.dir = os.path.join(root, name)
         self.prefix = prefix
+        # The columns this run writes. A build with two cameras adds one for
+        # which of them read the code; a one-camera run has nothing to say
+        # there, and a column of blanks in its record would be a question
+        # nobody asked.
+        self.fields = tuple(fields)
         self.total = 0           # lines written by this run, across all files
         self.count = 0           # lines in the file that is open
         self.files = 0           # files this run has opened
@@ -80,13 +85,13 @@ class ScanLog:
         self.files += 1
         self.count = 0
         self._fh = open(self.path, "w", newline="")
-        self._writer = csv.DictWriter(self._fh, fieldnames=FIELDS)
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.fields)
         self._writer.writeheader()
         self._fh.flush()
         print(f"[scanlog] writing {self.path}")
 
     def log(self, kind, value, code_id="", sheet_row=None, up=None,
-            column=None, image=""):
+            column=None, image="", **extra):
         """Write one code. `kind` is QR or DATAMATRIX.
 
         Returns the line as a dict, which is what the console shows as the
@@ -108,6 +113,10 @@ class ScanLog:
                "up": "" if up is None else f"UP{up + 1}",
                "column": "" if column is None else f"QR DATA{column + 1}",
                "image": image or ""}
+        # Only the columns this log declared: an extra a caller passes that
+        # this run has no column for is dropped rather than breaking the file.
+        row.update({k: v for k, v in extra.items() if k in self.fields})
+        row = {k: row.get(k, "") for k in self.fields}
         self._writer.writerow(row)
         # Flushed line by line: see the note at the top of the file.
         self._fh.flush()
