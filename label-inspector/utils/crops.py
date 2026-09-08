@@ -18,9 +18,23 @@ there, measured off the labels either side, so a code the box clipped comes
 out whole without any of the neighbour coming with it. --label-pad and
 --label-pad-px override that with a fixed margin on every side.
 
-The payload is slugified — a QR carries a URL, and '/' and ':' can't go in a
-filename — but stays readable enough to match a file back to the code it
-holds.
+A file is named by the ID THE CODE CARRIES and by nothing else. The QR on
+these labels holds a URL -- HTTPS://SCAN.SMARTQR.IO/LS5/7016 -- of which only
+the last segment differs from one label to the next, so a folder named by the
+whole payload sorts by the part that never changes and has to be read to the
+end to tell two files apart. The datamatrix holds the value itself, and that
+is kept exactly as it was read.
+
+There is no timestamp in the name: the name is the code, so it says which
+label the picture is of, which is the only question anyone asks a folder of
+these. When the same code is photographed twice -- a re-inspection pass over
+the same coil -- the second file takes a _1, so nothing is overwritten and the
+first read stays the one with the plain name.
+
+PNG, and stored rather than deflated: the crop is evidence of what was
+printed, so nothing about it should be a re-encode of the picture the camera
+gave. JPEG would smooth exactly the detail that decides whether a code was
+printed badly, and that cannot be undone afterwards.
 """
 
 import os
@@ -29,16 +43,35 @@ import time
 
 import cv2
 
-UNSAFE = re.compile(r"[^A-Za-z0-9]+")
+# Only what a filesystem actually refuses, so a value is altered as little as
+# it can be: a name that has been tidied up is a name that no longer matches
+# the sheet the value came from.
+UNSAFE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
+URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 
 
-def slugify(text, max_len=80):
-    """Filename-safe form of a payload, e.g.
-    'https://scan.smartqr.io/LS5/7016' -> 'https_scan_smartqr_io_LS5_7016'."""
-    slug = UNSAFE.sub("_", (text or "").strip()).strip("_")
-    if len(slug) > max_len:                  # keep the tail: that's the part
-        slug = slug[-max_len:].lstrip("_")   # that differs between codes
-    return slug or "unknown"
+def code_id(text, max_len=120):
+    """What to call the file for this payload.
+
+    A URL is cut to its last path segment, which is the id and the only part
+    of it that identifies the label:
+
+        HTTPS://SCAN.SMARTQR.IO/LS5/7016              -> 7016
+        HTTPS://NONCLONE.PHARMASECURE.US/22/ZNR2PS..  -> ZNR2PSTVGXT8Z
+
+    Anything else -- a datamatrix, which carries the value and not a link --
+    is kept as it stands. Query and fragment go first so that a URL with
+    either still ends at its id rather than at the parameters after it.
+    """
+    text = (text or "").strip()
+    if URL_SCHEME.match(text):
+        parts = [p for p in text.split("?")[0].split("#")[0].split("/") if p]
+        if parts:
+            text = parts[-1]
+    text = UNSAFE.sub("_", text).strip(". ")
+    if len(text) > max_len:                  # keep the tail: that's the part
+        text = text[-max_len:]               # that differs between codes
+    return text or "unknown"
 
 
 def timestamp():
@@ -78,15 +111,25 @@ def read_stamp(name, path=None):
 class LabelSaver:
     """Writes one image per decoded label into a per-sheet folder."""
 
-    def __init__(self, root="labels", name="run", subdir=None, ext="jpg",
-                 pad=0.0, min_pad=0, quality=95):
+    def __init__(self, root="labels", name="run", subdir=None, ext="png",
+                 pad=0.0, min_pad=0, quality=95, png_compress=0):
         self.dir = os.path.join(root, name, subdir) if subdir \
             else os.path.join(root, name)
         self.ext = ext.lstrip(".")
         self.pad = pad
         self.min_pad = min_pad
-        self.params = ([cv2.IMWRITE_JPEG_QUALITY, quality]
-                       if self.ext in ("jpg", "jpeg") else [])
+        # PNG at compression 0 stores the pixels instead of deflating them.
+        # Every PNG level is lossless -- the level only trades file size for
+        # the time spent packing -- and on a crop this size the packing costs
+        # more than the disk does, on a thread that is also running the
+        # camera. JPEG's quality is a different thing entirely: it throws
+        # detail away, which is why it is not the default here.
+        if self.ext in ("jpg", "jpeg"):
+            self.params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+        elif self.ext == "png":
+            self.params = [cv2.IMWRITE_PNG_COMPRESSION, int(png_compress)]
+        else:
+            self.params = []
         # Made on the first write, not here: loading a sheet and then pointing
         # the crops somewhere else is two operations, and the folder for the
         # in-between combination should not be left behind empty. A folder
@@ -267,7 +310,7 @@ class LabelSaver:
             os.makedirs(self.dir, exist_ok=True)
             self._made = True
 
-        name = f"{slugify(text)}_{timestamp()}.{self.ext}"
+        name = f"{code_id(text)}.{self.ext}"
         path = os.path.join(self.dir, name)
         n = 1
         while os.path.exists(path):          # same code twice inside a ms
