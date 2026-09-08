@@ -4325,6 +4325,23 @@ def main():
 
     _note = [None]        # what the status bar is saying, for either console
 
+    def _busy(text=None, detail=""):
+        """Put the console's spinner up, or take it down with no argument.
+
+        Everything worth showing this for happens on THIS thread, which is
+        the thread that posts the frames -- so while it runs the console
+        keeps whatever picture it last had and answers nothing. That reads
+        as a hung application, and the operator's next move is to press the
+        button again, which queues a second load behind the first.
+
+        The spinner is put up before the slow call and taken down after it,
+        and it goes up through a queued signal, so it is on the glass before
+        this thread stops answering rather than after it starts again.
+        """
+        if qt_window is not None:
+            qt_window.set_busy(text, detail)
+
+
     def _configurable():
         """Both pickers repoint the whole record, so they are only live when
         nothing is part-way through being checked.
@@ -4345,14 +4362,37 @@ def main():
         if not path or (args.xlsx
                         and os.path.abspath(path) == os.path.abspath(args.xlsx)):
             return
+        # A big workbook is read three times over before the window can run
+        # against it: once here to prove it is a validation sheet at all,
+        # once by utils/prepare.py to expand the datamatrix rows into the
+        # physical rows they are printed as, and once more to load the copy
+        # that made. None of it is work that can be skipped, and on a sheet
+        # of a few thousand rows it is long enough that a console with no
+        # spinner on it looks broken.
+        name = os.path.basename(path)
         try:
-            ValidationSheet(path, args.sheet)     # prove it before committing
-        except Exception as exc:
-            print(f"[ui] {path} is not a validation sheet: {exc}")
-            _note[0] = f"Not a validation sheet: {exc}"
-            return
-        _bind_run(new_xlsx=path)
-        _note[0] = None
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        _busy(f"Loading {name}",
+              ("Reading the workbook, expanding its datamatrix rows and "
+               "opening the record. A large sheet takes a moment."
+               + (f"\n{size / 1048576:.1f} MB" if size > 1048576 else "")))
+        try:
+            try:
+                ValidationSheet(path, args.sheet)  # prove it before committing
+            except Exception as exc:
+                print(f"[ui] {path} is not a validation sheet: {exc}")
+                _note[0] = f"Not a validation sheet: {exc}"
+                return
+            _bind_run(new_xlsx=path)
+            _note[0] = None
+        finally:
+            # In a finally because every way out of here -- loaded, refused
+            # as not a sheet, or an exception nobody expected -- has to take
+            # the spinner down with it. A console left spinning is worse
+            # than one that never spun: it cannot be pressed.
+            _busy(None)
 
     def _apply_label_dir(path):
         if not _configurable():
@@ -4367,8 +4407,16 @@ def main():
             print(f"[ui] cannot write to {path}: {exc}")
             _note[0] = f"Cannot write to that folder: {exc}"
             return
-        _bind_run(new_label_dir=path)
-        _note[0] = None
+        # The same wait, for the same reason: repointing the folder closes
+        # the old record -- which writes the workbook out -- and opens a new
+        # one against the sheet.
+        _busy("Moving the record",
+              "Writing out what has been checked and opening the new folder.")
+        try:
+            _bind_run(new_label_dir=path)
+            _note[0] = None
+        finally:
+            _busy(None)
 
     def _apply_capture_dir(path):
         """Where CAPTURE FRAME writes.
@@ -4503,10 +4551,31 @@ def main():
         be a console showing a freshly opened, idle machine with a closed
         contact behind it.
         """
-        nonlocal sheet, window, per_row, checked, colmap
         was_sheet = os.path.basename(args.xlsx) if args.xlsx else None
         print(f"\n[reset] putting the console back to how it opened"
               + (f" — closing the record for {was_sheet}" if was_sheet else ""))
+        try:
+            _reset_run()
+        finally:
+            # However this ended -- done, or a workbook that would not
+            # write -- the console gets its buttons back. One left spinning
+            # is one that cannot be pressed, which is the state RESET
+            # exists to get out of.
+            _busy(None)
+        print(f"[reset] done — no sheet loaded. LOAD SHEET, or OPEN RECENT "
+              f"SHEET, for the roll on the machine")
+        voice.say("Console reset. Load the sheet.", key="reset")
+
+    def _reset_run():
+        """The reset itself. reset_run above owns the spinner around it."""
+        nonlocal sheet, window, per_row, checked, colmap
+
+        # Raised here as well as on the click, so the whole of this is
+        # covered however it was reached, and taken down in the finally at
+        # the bottom rather than after the record closes -- the clearing
+        # that follows is quick, but "quick" is not a thing to leave the
+        # console uncovered on the strength of.
+        _busy("Resetting", "Stopping the machine and dropping the relay.")
 
         # Stop first, and stop for real: the relay is dropped whatever the
         # console thought the machine was doing. A reset is reached from
@@ -4527,7 +4596,19 @@ def main():
         # and loading a different sheet.
         args.xlsx = None
         args.out_xlsx = None
+        # THE LONG PART. Closing the books writes the annotated workbook,
+        # and that waits up to six seconds for any background save already
+        # running before it starts its own. On a sheet of a few thousand
+        # rows with a shift's worth of verified ones on it, this is the
+        # whole of the wait -- and the operator has just pressed a button
+        # marked RESET, so a console that then sits still is one they will
+        # press again.
+        _busy("Resetting",
+              "Writing out what has been checked. On a large sheet, and "
+              "with a save already running, this takes a moment.")
         _bind_run()
+
+        _busy("Resetting", "Unloading the sheet and clearing the run.")
         sheet = window = per_row = checked = colmap = None
         code_mix[0] = (0, 0)
         work_xlsx[0] = None
@@ -4561,9 +4642,6 @@ def main():
         rewound[0] = 0
 
         _note[0] = None
-        print(f"[reset] done — no sheet loaded. LOAD SHEET, or OPEN RECENT "
-              f"SHEET, for the roll on the machine")
-        voice.say("Console reset. Load the sheet.", key="reset")
 
     def _run_commands():
         while True:
@@ -4571,38 +4649,51 @@ def main():
                 name, arg = commands.get_nowait()
             except queue.Empty:
                 return
-            if name == "start":
-                start_machine("start button")
-            elif name == "stop":
-                stop_machine("stop button")
-            elif name == "sheet":
-                _apply_sheet(arg)
-            elif name == "labeldir":
-                _apply_label_dir(arg)
-            elif name == "capture":
-                capture_frame()
-            elif name == "capturedir":
-                _apply_capture_dir(arg)
-            elif name == "format":
-                set_format(arg)
-            elif name == "winder":
-                set_winder(arg)
-            elif name == "direction":
-                set_direction(arg)
-            elif name == "ups":
-                set_ups(arg)
-            elif name == "upsmap":
-                set_ups_map(arg)
-            elif name == "camera":
-                _set_camera(arg)
-            elif name == "debug":
-                show_debug[0] = not show_debug[0]
-                print(f"[ui] diagnostics "
-                      f"{'on' if show_debug[0] else 'off'}")
-            elif name == "reset":
-                reset_run()
-            elif name == "quit":
-                quitting.set()
+            try:
+                _dispatch(name, arg)
+            finally:
+                # Whatever the command was and however it ended, this thread
+                # is answering again -- so anything the console put up while
+                # waiting for it comes down. Here rather than in each slow
+                # handler because the early returns are the ones that would
+                # be forgotten: a load refused because the machine is running
+                # never reaches the handler's own finally, and a console left
+                # spinning cannot be pressed.
+                _busy(None)
+
+    def _dispatch(name, arg):
+        if name == "start":
+            start_machine("start button")
+        elif name == "stop":
+            stop_machine("stop button")
+        elif name == "sheet":
+            _apply_sheet(arg)
+        elif name == "labeldir":
+            _apply_label_dir(arg)
+        elif name == "capture":
+            capture_frame()
+        elif name == "capturedir":
+            _apply_capture_dir(arg)
+        elif name == "format":
+            set_format(arg)
+        elif name == "winder":
+            set_winder(arg)
+        elif name == "direction":
+            set_direction(arg)
+        elif name == "ups":
+            set_ups(arg)
+        elif name == "upsmap":
+            set_ups_map(arg)
+        elif name == "camera":
+            _set_camera(arg)
+        elif name == "debug":
+            show_debug[0] = not show_debug[0]
+            print(f"[ui] diagnostics "
+                  f"{'on' if show_debug[0] else 'off'}")
+        elif name == "reset":
+            reset_run()
+        elif name == "quit":
+            quitting.set()
 
     def ui_state():
         """What the console's status pill is showing."""

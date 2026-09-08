@@ -545,11 +545,138 @@ class CameraDialog(QtWidgets.QDialog):
             box.blockSignals(False)
 
 
+class BusyOverlay(QtWidgets.QWidget):
+    """A spinner over the console while the worker thread is blocked.
+
+    WHY THIS IS DRAWN BY THE GUI AND NOT SENT IN A SNAPSHOT. Loading a
+    workbook happens on the capture thread, because everything it leads to --
+    closing the old record, expanding the sheet, opening the new books -- is
+    that thread's to touch. While it runs, that thread posts no snapshots at
+    all, so anything driven off them would go up only once the wait it was
+    meant to cover was already over. The GUI thread meanwhile has nothing to
+    do, which is exactly why the spinner turns smoothly through a load that
+    freezes everything else.
+
+    So the app says "busy" and "done" directly, either side of the slow call,
+    and this paints in between. It also swallows clicks: a console that looks
+    frozen invites a second press of the button that froze it, and the second
+    workbook would queue up behind the first.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._angle = 0
+        self._text = ""
+        self._detail = ""
+        self._t0 = 0.0
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(33)          # ~30/s, enough to look alive
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 10) % 360
+        self.update()
+
+    def start(self, text, detail=""):
+        # The clock is not restarted when only the wording changes. A long
+        # job that names its phases -- closing the record, then clearing the
+        # run -- is one job to the person waiting on it, and a counter that
+        # went back to zero at each phase would be the one part of this
+        # screen actively misleading them about how long they have waited.
+        if not self.isVisible():
+            self._t0 = time.monotonic()
+            self._angle = 0
+        self._text, self._detail = text, detail
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    # Nothing gets through: the point is that the console cannot be pressed
+    # while the thread that would act on the press is not listening.
+    def mousePressEvent(self, event):
+        event.accept()
+
+    def keyPressEvent(self, event):
+        event.accept()
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        # Dimmed rather than covered, so the operator can still see which
+        # console this is and that the picture behind it has not gone away.
+        p.fillRect(self.rect(), QtGui.QColor(10, 8, 6, 205))
+
+        k = max(1.0, self.width() / 1280.0)
+        cx, cy = self.width() / 2.0, self.height() / 2.0 - 30 * k
+        r = 26 * k
+
+        # The track, then the arc that runs round it. An arc rather than a
+        # bar because there is no progress to report honestly: openpyxl does
+        # not say how far through a workbook it is, and a bar that invented a
+        # percentage would be a bar that lies at exactly the moment somebody
+        # is watching it to decide whether to give up.
+        pen = QtGui.QPen(QtGui.QColor(78, 70, 62), 4 * k)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawEllipse(QtCore.QRectF(cx - r, cy - r, 2 * r, 2 * r))
+        pen.setColor(QtGui.QColor(ACCENT))
+        p.setPen(pen)
+        p.drawArc(QtCore.QRectF(cx - r, cy - r, 2 * r, 2 * r),
+                  int(-self._angle * 16), int(100 * 16))
+
+        font = QtGui.QFont("DejaVu Sans", 0, QtGui.QFont.Bold)
+        font.setPointSizeF(max(9.0, 13.0 * k))
+        p.setFont(font)
+        p.setPen(QtGui.QColor(TEXT))
+        p.drawText(QtCore.QRectF(0, cy + r + 18 * k, self.width(), 34 * k),
+                   Qt.AlignHCenter | Qt.AlignTop, self._text)
+        if self._detail:
+            font.setPointSizeF(max(8.0, 10.5 * k))
+            font.setBold(False)
+            p.setFont(font)
+            p.setPen(QtGui.QColor(MUTED))
+            # Held to a column rather than run across the glass. On a wide
+            # panel a full-width line of small grey text is one the eye has
+            # to track back along, and this is read at a glance by somebody
+            # deciding whether the console has hung.
+            w = min(self.width() - 80 * k, 520 * k)
+            p.drawText(QtCore.QRectF((self.width() - w) / 2,
+                                     cy + r + 54 * k, w, 90 * k),
+                       Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
+                       self._detail)
+
+        # How long it has been going, once it has been going long enough to
+        # be worth asking. The turning arc says the application is alive;
+        # only a number says whether this is the usual two seconds or
+        # something that has been stuck for a minute -- which is the whole
+        # of what somebody standing at the machine wants to know before
+        # deciding to reach for the power switch.
+        waited = time.monotonic() - self._t0
+        if waited >= 2.0:
+            font.setPointSizeF(max(8.0, 10.0 * k))
+            font.setBold(True)
+            p.setFont(font)
+            p.setPen(QtGui.QColor(MUTED if waited < 20 else WARN))
+            p.drawText(QtCore.QRectF(0, cy - 8 * k, self.width(), 20 * k),
+                       Qt.AlignHCenter | Qt.AlignTop, f"{waited:.0f}s")
+
+
 class InspectorWindow(QtWidgets.QMainWindow):
     """The console. Emits `command(name, argument)` and nothing else."""
 
     command = QtCore.pyqtSignal(str, object)
     _incoming = QtCore.pyqtSignal(object)
+    # Busy comes in on its own signal rather than in a snapshot, because the
+    # thread that sends it is about to stop sending snapshots -- that being
+    # the whole reason there is something to wait for.
+    _busy_in = QtCore.pyqtSignal(object)
 
     # Only the diagnostics toggle. Everything that moves the machine or
     # repoints the run is a button you have to look at and click: a stray
@@ -637,6 +764,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
         # Queued by default across threads, so the worker can post a snapshot
         # without touching a widget.
         self._incoming.connect(self._apply, Qt.QueuedConnection)
+        self._busy_in.connect(self._set_busy, Qt.QueuedConnection)
+        self.busy = BusyOverlay(self)
 
     # -- construction -----------------------------------------------------
     def _build(self, title):
@@ -1157,18 +1286,40 @@ class InspectorWindow(QtWidgets.QMainWindow):
         return bar
 
     # -- input ------------------------------------------------------------
+    def _send_slow(self, name, arg, text, detail=""):
+        """A command that will stop the worker answering for a while.
+
+        The spinner goes up HERE, on the click, rather than waiting for the
+        worker to raise it. The worker only sees the command on its next
+        pass through the loop, and on a busy pass that is long enough to
+        read as a button that did nothing -- which is the moment an operator
+        presses it again. Raising it on the GUI thread costs nothing and is
+        instant; the worker takes it down when it has finished, whatever it
+        finished doing.
+        """
+        self.busy.start(text, detail)
+        self.command.emit(name, arg)
+
+    def _load_sheet(self, path):
+        self._send_slow(
+            "sheet", path, f"Loading {os.path.basename(path)}",
+            "Reading the workbook, expanding its datamatrix rows and "
+            "opening the record. A large sheet takes a moment.")
+
     def _choose_sheet(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Choose the validation sheet", self._sheet_dir,
             "Excel workbook (*.xlsx *.xlsm);;All files (*)")
         if path:
-            self.command.emit("sheet", path)
+            self._load_sheet(path)
 
     def _choose_output(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Choose the folder for the label crops", self._out_dir)
         if path:
-            self.command.emit("labeldir", path)
+            self._send_slow("labeldir", path, "Moving the record",
+                            "Writing out what has been checked and opening "
+                            "the new folder.")
 
     def _choose_capture_dir(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
@@ -1193,7 +1344,7 @@ class InspectorWindow(QtWidgets.QMainWindow):
             act = menu.addAction(os.path.basename(path))
             act.setToolTip(path)
             act.triggered.connect(
-                lambda _checked=False, p=path: self.command.emit("sheet", p))
+                lambda _checked=False, p=path: self._load_sheet(p))
         if menu.isEmpty():
             menu.addAction("No other sheets loaded yet").setEnabled(False)
         return menu
@@ -1418,7 +1569,9 @@ class InspectorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.No)
         if answer != QtWidgets.QMessageBox.Yes:
             return
-        self.command.emit("reset", None)
+        self._send_slow("reset", None, "Resetting",
+                        "Writing out what has been checked, then unloading "
+                        "the sheet.")
 
     def _quit_clicked(self):
         """Shut the application down from the screen, whatever the line is
@@ -1469,6 +1622,27 @@ class InspectorWindow(QtWidgets.QMainWindow):
         """Called from the capture thread. Hands the snapshot to the GUI
         thread through a queued signal and returns at once."""
         self._incoming.emit(snap)
+
+    def set_busy(self, text=None, detail=""):
+        """Raise or drop the spinner. Called from the capture thread.
+
+        `text` None drops it. Queued, so it returns at once and the caller
+        can go straight on to the slow thing it is announcing -- which is
+        the point: this has to be on screen BEFORE the thread stops
+        answering, not after.
+        """
+        self._busy_in.emit((text, detail) if text else None)
+
+    def _set_busy(self, what):
+        if what is None:
+            self.busy.stop()
+            return
+        self.busy.start(what[0], what[1])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.busy.isVisible():
+            self.busy.setGeometry(self.rect())
 
     def _set_pill(self, state):
         label, colour = STATES.get(state, STATES["idle"])
