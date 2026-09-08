@@ -269,6 +269,9 @@ GS_CAMERA_NAME      = CAM["name"]
 # are. The console can open with no sheet loaded, and rendering a phrase at
 # the moment it is needed is the one thing the warm-up exists to avoid.
 MAX_UPS             = MACHINE["max_ups"]
+# The class list this build is for: the engine with no label class. Looked for
+# beside the app before config.json's, which run.py shares.
+PAIRED_CLASSES      = "classes-2.txt"
 
 ROTATE_MAP = {
     0:   None,
@@ -890,8 +893,17 @@ def main():
                           f"expected to detect three classes: the label, the "
                           f"qr_code inside it and the logo inside it.")
     ap.add_argument("--classes", default=None,
-                     help="txt file, one class name per line "
-                          "(default: classes.txt beside run.py, if present)")
+                     help=f"txt file, one class name per line. Default: "
+                          f"{PAIRED_CLASSES} beside this script if it is "
+                          f"there, otherwise config.json's. It must be the "
+                          f"list THIS engine was built against -- a mismatch "
+                          f"does not error, it just reads every index as the "
+                          f"wrong thing.")
+    ap.add_argument("--pair-labels", choices=["auto", "on", "off"],
+                     default="auto",
+                     help="build the label box from the code and artifact. "
+                          "auto: whenever the class list has no label class "
+                          "in it. on/off force it either way.")
     ap.add_argument("--conf-thres", type=float, default=MODEL["conf"],
                      help="confidence threshold for classes without their own.")
     ap.add_argument("--conf-label", type=float, default=MODEL["conf_label"],
@@ -2011,12 +2023,22 @@ def main():
         # switched off at the wall must not lose them.
         prefs.remember_camera(cam_values[0])
 
+    # THE CLASS LIST HAS TO DESCRIBE THE ENGINE, and getting that wrong is
+    # silent: hand a two-class engine the three-class list and index 0 --
+    # which the engine means as the code -- is read as the label, index 1 as
+    # the code, and the app runs on happily with the QR box standing in for
+    # the whole label. Nothing errors. The boxes are just wrong.
+    #
+    # So this build looks for its own list first. It exists for the engine
+    # with no label class, and config.json's is shared with run.py, which
+    # does not.
     classes_path = args.classes
     if classes_path is None:
-        beside = CFG.asset(MODEL["classes"])
-        if beside and os.path.exists(beside):
-            classes_path = beside
-            print(f"[model] using {beside}")
+        for candidate in (CFG.asset(PAIRED_CLASSES), CFG.asset(MODEL["classes"])):
+            if candidate and os.path.exists(candidate):
+                classes_path = candidate
+                print(f"[model] using {candidate}")
+                break
     class_names = load_class_names(classes_path)
     if args.engine is None:
         args.engine = CFG.asset(MODEL["engine"])
@@ -2034,7 +2056,9 @@ def main():
     # Does this engine know where a label is, or only what is printed on one?
     # Asked of the class list rather than of the engine file, because the
     # class list is what the indices coming out of the engine mean.
-    paired = bool(class_names) and args.label_class not in class_names
+    paired = (args.pair_labels == "on" or
+              (args.pair_labels == "auto" and bool(class_names)
+               and args.label_class not in class_names))
     if paired:
         qr_cls = class_index(class_names, args.qr_class, 0)
         logo_cls = class_index(class_names, args.logo_class, 1)
@@ -4367,6 +4391,45 @@ def main():
         # the wrong reason.
         no_singles = False
 
+    # Evidence for the one mistake this build cannot detect at startup: the
+    # three-class list handed to a two-class engine. It resolves, it runs, and
+    # every index is one class out.
+    #
+    # What gives it away is NOT that the label class is missing -- index 0 is
+    # emitted either way, it just means the code rather than the label. It is
+    # that the LAST class the list declares never arrives at all: a two-class
+    # engine cannot emit a 2, and on a three-class engine the logo turns up on
+    # every label. So the test is the highest index ever seen against the
+    # length of the list, over enough detections that a blank stretch of web
+    # cannot be the explanation.
+    seen_classes = set()
+    checked = [0, 0]              # frames looked at, detections counted
+
+    def _check_class_list(dets):
+        if paired or checked[0] < 0:
+            return
+        checked[0] += 1
+        checked[1] += len(dets)
+        seen_classes.update(int(d[5]) for d in dets)
+        if checked[0] < 60 or checked[1] < 100:
+            return
+        checked[0] = -1           # asked and answered, either way
+        if not class_names or not seen_classes:
+            return
+        if max(seen_classes) >= len(class_names) - 1:
+            return
+        print(f"\n[model] WARNING: {checked[1]} detections over "
+              f"{checked[0] if checked[0] > 0 else 60} frames and never once "
+              f"class {len(class_names) - 1} "
+              f"({class_names[-1]}) — only {sorted(seen_classes)}.")
+        print(f"[model]   This engine has fewer classes than "
+              f"{os.path.basename(classes_path or 'the class list')} declares, "
+              f"so every index is being read as the wrong thing: what the "
+              f"engine means as the code is being taken for the label.")
+        print(f"[model]   Restart with --classes {PAIRED_CLASSES} (or "
+              f"--pair-labels on) to build the label box from the two parts.")
+        _note[0] = "Wrong class list for this engine — see the terminal"
+
     def _with_label_boxes(dets, shape):
         """`dets` plus one label detection per pair, on a two-class engine.
 
@@ -4375,6 +4438,7 @@ def main():
         check counts. All that is added is the label they sit on.
         """
         if not paired:
+            _check_class_list(dets)
             return dets
         labels = find_labels(dets, qr_cls, logo_cls, shape, _BoxOpts)
         if not labels:
