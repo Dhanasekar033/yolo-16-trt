@@ -181,8 +181,10 @@ import time
 import cv2
 
 from utils.camera import CameraControls
+from utils.source import FrameSource
 from utils.config import Config, app_dir
-from utils.crops import LabelSaver, timestamp
+from utils.crops import LabelSaver, code_id, timestamp
+from utils.scanlog import DATAMATRIX, QR, ScanLog
 from utils.prepare import prepare as prepare_sheet
 from utils.qr import decode_qr, decode_qr_at, decode_qr_pyzbar, \
     pick_qr_for_label, read_datamatrix, scan_codes
@@ -685,6 +687,80 @@ def fit_ups(wanted, per_row):
     return fitted
 
 
+def parse_map(spec, per_row):
+    """Turn "2,1,3,4" into the sheet column each up on the machine holds.
+
+    Given as up order: the first number is the column UP1 is held against.
+    1-based in, 0-based out, because the operator counts columns the way the
+    spreadsheet heads them -- QR DATA1 is 1.
+    """
+    if not spec:
+        return None
+    wanted = []
+    for part in str(spec).replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip().upper()
+        part = part[2:] if part.startswith("UP") else part.lstrip("CD")
+        if not part:
+            continue
+        if not part.isdigit():
+            raise SystemExit(f"--ups-map: '{part}' is not a column number")
+        n = int(part)
+        if not 1 <= n <= per_row:
+            raise SystemExit(f"--ups-map: column {n} is out of range — the "
+                             f"sheet has {per_row} code columns")
+        wanted.append(n - 1)
+    if not wanted:
+        return None
+    if len(set(wanted)) != len(wanted):
+        raise SystemExit("--ups-map: two ups cannot be checked against the "
+                         "same column — every up reads a different label")
+    return wanted
+
+
+def fit_map(wanted, per_row):
+    """The mapping, cut to the sheet that is loaded. None is straight through.
+
+    A mapping is only meaningful over the columns the sheet actually has, and
+    it is remembered across sheets -- so one written for a four-up sheet must
+    not be left pointing at a column a three-up sheet does not have. Anything
+    that does not survive the trim falls back to straight through rather than
+    to a half-mapping, which would be a mapping nobody chose.
+    """
+    if not wanted:
+        return None
+    fitted = [c for c in wanted[:per_row] if 0 <= c < per_row]
+    if len(fitted) != min(len(wanted), per_row) \
+            or len(set(fitted)) != len(fitted):
+        return None
+    fitted += [c for c in range(per_row) if c not in fitted]
+    return None if fitted == list(range(per_row)) else fitted
+
+
+def columns_checked(ups, colmap, per_row):
+    """The sheet columns to hold a row against, from the ups that are ticked.
+
+    The tick boxes are named for the ups on the machine, but what the window
+    wants is columns of the sheet, and the two are only the same thing while
+    the die lays the labels down in the order somebody typed the columns.
+    Where it does not, this is the one place that knows -- so ticking off the
+    up that is not on the web switches off the column that up's labels
+    actually come from, rather than the column that happens to share its
+    number.
+    """
+    if ups is None:
+        return None
+    cols = {(colmap[u] if colmap and u < len(colmap) else u) for u in ups}
+    return None if len(cols) >= per_row else cols
+
+
+def describe_map(colmap, per_row):
+    """The mapping in the operator's words."""
+    if not colmap:
+        return f"straight through, UP1-UP{per_row} against QR DATA1-{per_row}"
+    return "  ".join(f"UP{i + 1}\u2192QR DATA{c + 1}"
+                     for i, c in enumerate(colmap[:per_row]))
+
+
 def describe_ups(checked, per_row):
     """What is being checked, in the operator's words."""
     if checked is None:
@@ -725,8 +801,35 @@ def main():
     ap.add_argument("--height", type=int, default=CAM["height"])
     ap.add_argument("--fps", type=int, default=CAM["fps"])
     ap.add_argument("--format", default=CAM["format"], choices=["MJPG", "YUYV"])
-    ap.add_argument("--rotate", type=int, default=CAM["rotate"], choices=[0, 90, 180, 270],
-                     help="Rotate every frame by a fixed angle (clockwise).")
+    ap.add_argument("--source", default=None,
+                     help="run against a recording instead of the camera: a "
+                          "video file, an image, or a folder of images. For "
+                          "testing off the machine -- everything else behaves "
+                          "as it does on the line, and the camera path is not "
+                          "touched.")
+    ap.add_argument("--source-fps", type=float, default=None,
+                     help="frames a second to feed from --source. Default: "
+                          "the video's own rate, or 10 for stills. The "
+                          "machine measures the web's speed and how long "
+                          "nothing has read off the time between frames, so "
+                          "a recording played at the wrong rate is a "
+                          "recording it reasons wrongly about.")
+    ap.add_argument("--source-speed", type=float, default=1.0,
+                     help="multiplier on that rate, to run a recording faster "
+                          "or slower on purpose.")
+    ap.add_argument("--source-loop", action="store_true",
+                     help="start the recording again when it ends.")
+    ap.add_argument("--auto-start", action="store_true",
+                     help="press START as soon as the sheet is loaded. Only "
+                          "allowed with --source, and deliberately: on the "
+                          "machine, START energises a winder, and a switch "
+                          "that does that without a hand on it is not one "
+                          "this app should own. A recording moves nothing.")
+    ap.add_argument("--rotate", type=int, default=None, choices=[0, 90, 180, 270],
+                     help=f"Rotate every frame by a fixed angle (clockwise). "
+                          f"Default {CAM['rotate']} for the camera and 0 for "
+                          f"--source, because a recording made by this rig "
+                          f"already has the rotation in it.")
     ap.add_argument("--ui", default="qt", choices=["qt", "opencv"],
                      help="which console. 'qt' is a real window: the chrome "
                           "is widgets rather than pixels burnt into the "
@@ -878,8 +981,15 @@ def main():
                           f"between runs. Default: {DEFAULT_CAPTURE_DIR}.")
     ap.add_argument("--no-save-labels", action="store_true",
                      help="don't save a crop of each decoded label.")
-    ap.add_argument("--label-format", default="jpg", choices=["jpg", "png"],
-                     help="image format for the saved label crops.")
+    ap.add_argument("--no-scan-log", action="store_true",
+                     help="don't write the CSV of what was read into the "
+                          "label folder beside the crops.")
+    ap.add_argument("--label-format", default="png", choices=["jpg", "png"],
+                     help="image format for the saved label crops. png is "
+                          "stored uncompressed and keeps the pixels exactly "
+                          "as the camera gave them; jpg re-encodes them, "
+                          "which smooths the very detail that says whether a "
+                          "code was printed well.")
     ap.add_argument("--label-pad", type=float, default=0.0,
                      help="fixed padding around the saved label crop, as a "
                           "fraction of the box size, on every side. Only for "
@@ -926,6 +1036,15 @@ def main():
     ap.add_argument("--labels-per-row", type=int, default=None,
                      help="ups across the web (default: the number of QR DATA "
                           "columns found in the sheet).")
+    ap.add_argument("--ups-map", default=None,
+                     help="which sheet column each up on the machine holds, "
+                          "in up order and 1-based: --ups-map 2,1,3,4 says "
+                          "UP1 carries the labels in QR DATA2 and UP2 those "
+                          "in QR DATA1. Codes are matched by payload, so this "
+                          "does not change which cell a code ticks off -- it "
+                          "decides which column is switched off when an up is "
+                          "ticked off, and what the console calls each "
+                          "column. Default: straight through.")
     ap.add_argument("--check", default=None,
                      help="which ups to validate, across the web, e.g. "
                           "'UP2,UP3' or '2,3' (D2,D3 still works). The rest "
@@ -1119,6 +1238,7 @@ def main():
     # All None until one is chosen: nothing is read, nothing is recorded and
     # START does nothing while there is no sheet to check the roll against.
     sheet = window = per_row = checked = None
+    scanlog = None           # the CSV of what was read, beside the crops
     # Which ups across the web are being checked, 0-based; None means every
     # position the sheet has. It belongs to the reel rather than to the
     # paperwork -- a four-up sheet run three up has a column of labels that
@@ -1126,6 +1246,9 @@ def main():
     # line at every row -- so it survives a sheet change and a restart, and
     # the console's tick boxes are what set it.
     ups_choice = [{n - 1 for n in prefs.ups} if prefs.ups else None]
+    # Which sheet column each up is held against; None is straight through.
+    map_choice = [list(prefs.ups_map) if prefs.ups_map else None]
+    colmap = None
     # --check is the same choice made on the command line. It is applied to
     # the first sheet that loads, where the sheet's width is known and an up
     # that is out of range can be said so, and from there the tick boxes
@@ -1157,7 +1280,7 @@ def main():
         that the operator's sheet has nowhere to put. utils/prepare.py writes
         it, beside the record for this sheet, and never touches the original.
         """
-        nonlocal sheet, per_row, checked, window
+        nonlocal sheet, per_row, checked, colmap, window
         run_dir = os.path.join(
             args.result_dir,
             os.path.splitext(os.path.basename(args.xlsx))[0])
@@ -1189,7 +1312,10 @@ def main():
         if ups_from_cli[0]:
             ups_from_cli[0] = False
             ups_choice[0] = parse_check(args.check, per_row)
+        if args.ups_map:
+            map_choice[0] = parse_map(args.ups_map, per_row)
         checked = fit_ups(ups_choice[0], per_row)
+        colmap = fit_map(map_choice[0], per_row)
         print(f"[validate] checking {describe_ups(checked, per_row)}")
 
         size, grace = args.window_size, args.window_grace
@@ -1203,11 +1329,13 @@ def main():
                       f"window of {size} would see each code twice — "
                       f"using {max(1, room)} instead")
                 size = max(1, room)
-        window = RollingWindow(sheet, size=size, check=checked,
+        window = RollingWindow(sheet, size=size,
+                               check=columns_checked(checked, colmap, per_row),
                                grace=grace, step=check_step[0])
         hold_after[0] = max(1, min(args.hold_after, window.size - 1))
         # Only once it has parsed: the recent list is for sheets that worked.
         prefs.remember_sheet(args.xlsx)
+        print(f"[window] columns: {describe_map(colmap, per_row)}")
         print(f"[window] rolling window of {window.size} sheet rows "
               f"(+{window.grace} kept behind for re-reads), walking the "
               f"sheet "
@@ -1412,7 +1540,9 @@ def main():
                  "FORWARD — first row of the sheet first, as printed")
         print(f"\n[window] checking {which}")
         if window is not None:
-            fresh = RollingWindow(sheet, size=window.size, check=checked,
+            fresh = RollingWindow(sheet, size=window.size,
+                                  check=columns_checked(checked, colmap,
+                                                        per_row),
                                   grace=window.grace, step=check_step[0])
             # The pass starts again; the run's tally does not.
             fresh.done, fresh.reads = window.done, window.reads
@@ -1438,7 +1568,7 @@ def main():
         rebuilt and re-anchors on the next code it recognises. What the run
         has already recorded is untouched.
         """
-        nonlocal checked, window
+        nonlocal checked, colmap, window
         wanted = {int(c) for c in (cols or ())}
         if not wanted:
             # The console will not send this — its last tick will not come
@@ -1460,7 +1590,9 @@ def main():
         checked = fresh_checked
         print(f"\n[validate] checking {describe_ups(checked, per_row)}")
         if window is not None:
-            fresh = RollingWindow(sheet, size=window.size, check=checked,
+            fresh = RollingWindow(sheet, size=window.size,
+                                  check=columns_checked(checked, colmap,
+                                                        per_row),
                                   grace=window.grace, step=check_step[0])
             # The pass starts again; the run's tally does not.
             fresh.done, fresh.reads = window.done, window.reads
@@ -1469,6 +1601,53 @@ def main():
             print(f"[window] the window will re-anchor on the next code it "
                   f"recognises")
         _note[0] = f"Checking {describe_ups(checked, per_row)}"
+
+    def set_ups_map(cols):
+        """Which sheet column each up on the machine holds, from the console.
+
+        A code identifies its own row and column, so this does not decide
+        which cell a payload ticks off and cannot make a good roll fail. What
+        it decides is what UP1 MEANS: with three ups running off a four-up
+        sheet, ticking off the up that is not on the web has to switch off the
+        column that up's labels come from, and the number on the tick box is
+        only the same as the column number while the die lays the labels down
+        in the order somebody typed the sheet in.
+
+        Restarts the pass for the same reason ticking an up off does: the rows
+        part-way through the window were judged against a different set of
+        columns.
+        """
+        nonlocal colmap, window
+        wanted = [int(c) for c in (cols or ())]
+        if len(set(wanted)) != len(wanted):
+            # The console swaps rather than duplicating, so this is a guard
+            # against a bad command rather than against a bad click.
+            print("[ui] two ups cannot be checked against the same column")
+            return
+        if not _configurable():
+            print("[ui] stop the machine before changing the column mapping")
+            return
+        map_choice[0] = wanted or None
+        prefs.remember_ups_map([c + 1 for c in wanted] if wanted else None)
+        if sheet is None:
+            return                  # remembered; it applies when a sheet does
+        fresh_map = fit_map(map_choice[0], per_row)
+        if fresh_map == colmap:
+            return
+        colmap = fresh_map
+        print(f"\n[validate] columns: {describe_map(colmap, per_row)}")
+        if window is not None:
+            fresh = RollingWindow(sheet, size=window.size,
+                                  check=columns_checked(checked, colmap,
+                                                        per_row),
+                                  grace=window.grace, step=check_step[0])
+            # The pass starts again; the run's tally does not.
+            fresh.done, fresh.reads = window.done, window.reads
+            fresh.repeats = window.repeats
+            window = fresh
+            print(f"[window] the window will re-anchor on the next code it "
+                  f"recognises")
+        _note[0] = f"Columns: {describe_map(colmap, per_row)}"
 
     def set_winder(auto):
         """AUTO or MANUAL, from the console's toggle. The relay follows it.
@@ -1583,31 +1762,54 @@ def main():
                   name=args.voice_name, rate=args.voice_rate,
                   tone=not args.no_tone, warm=SPOKEN)
 
+    if args.auto_start and not args.source:
+        raise SystemExit("--auto-start is for testing against --source. On "
+                         "the machine, press START.")
+
     # A previous run that was killed rather than closed can leave the motor
     # energised, so start from a state this file knows rather than inheriting
     # a coil that is on for no reason.
     relay.off(args.start_relay)
     panel = None
 
-    cam_index = args.index if args.index is not None else find_camera_index()
-    print(f"[camera] using /dev/video{cam_index}")
+    # A recording rotates in the loop or not at all: there is no pipeline to
+    # do it in, and a file written by capture_video.py already has the
+    # rotation baked in, so its default is 0 rather than the camera's.
+    if args.rotate is None:
+        args.rotate = 0 if args.source else CAM["rotate"]
 
-    # Preferred path: videoflip rotates inside the pipeline, off the loop. If
-    # that pipeline won't open (no videoflip element, say), fall back to
-    # rotating each frame in the loop as before.
-    pipeline = gstreamer_pipeline(cam_index, args.width, args.height, args.fps,
-                                  args.format, rotate=args.rotate)
-    print(f"[camera] pipeline: {pipeline}")
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-    rotate_in_loop = 0
-    if not cap.isOpened() and args.rotate:
-        print("[camera] videoflip pipeline would not open — rotating in the loop")
-        pipeline = gstreamer_pipeline(cam_index, args.width, args.height,
-                                      args.fps, args.format)
-        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    cam_index = args.index if args.index is not None else \
+        (0 if args.source else find_camera_index())
+
+    if args.source:
+        # Testing off the machine. Everything past this point is the same
+        # code the line runs -- only where the frames come from differs.
+        cap = FrameSource(args.source, fps=args.source_fps,
+                          speed=args.source_speed, loop=args.source_loop)
         rotate_in_loop = args.rotate
-    if not cap.isOpened():
-        raise RuntimeError("Failed to open camera via GStreamer pipeline")
+        print(f"[source] {cap.describe()}")
+        if rotate_in_loop:
+            print(f"[source] rotating each frame by {rotate_in_loop}")
+    else:
+        print(f"[camera] using /dev/video{cam_index}")
+
+        # Preferred path: videoflip rotates inside the pipeline, off the loop.
+        # If that pipeline won't open (no videoflip element, say), fall back to
+        # rotating each frame in the loop as before.
+        pipeline = gstreamer_pipeline(cam_index, args.width, args.height,
+                                      args.fps, args.format, rotate=args.rotate)
+        print(f"[camera] pipeline: {pipeline}")
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        rotate_in_loop = 0
+        if not cap.isOpened() and args.rotate:
+            print("[camera] videoflip pipeline would not open — rotating in "
+                  "the loop")
+            pipeline = gstreamer_pipeline(cam_index, args.width, args.height,
+                                          args.fps, args.format)
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            rotate_in_loop = args.rotate
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open camera via GStreamer pipeline")
 
     # Exposure, gain and brightness, on the same device the pipeline is
     # streaming from. Whatever the operator set last time goes back on now:
@@ -1615,7 +1817,8 @@ def main():
     # and having to set them again every morning -- in a separate tool --
     # is how a reel gets run under a setting nobody chose.
     camera = CameraControls(CAM["device"] or f"/dev/video{cam_index}",
-                            limits=CAM.get("limits"))
+                            limits=CAM.get("limits"),
+                            enabled=not args.source)
     remembered = prefs.camera
     if remembered:
         applied = camera.apply(remembered)
@@ -2156,7 +2359,7 @@ def main():
 
     def _start_record():
         """Open the books for the sheet and output folder now in `args`."""
-        nonlocal run_name, saver, results, xlsx_path, journal_path
+        nonlocal run_name, saver, scanlog, results, xlsx_path, journal_path
         run_name = os.path.splitext(os.path.basename(args.xlsx))[0]
         xlsx_path = args.out_xlsx or os.path.join(
             args.result_dir, run_name, f"checked_{run_name}.xlsx")
@@ -2167,6 +2370,13 @@ def main():
             saver = LabelSaver(root=args.label_dir, name=run_name,
                                subdir=None, ext=args.label_format,
                                pad=args.label_pad, min_pad=args.label_pad_px)
+        # The record of what was read, in the same folder as the pictures of
+        # it. Separate from the crop saver because a run can want the log
+        # without the images, and because the log is what the console reads
+        # its LAST SCANNED line from.
+        scanlog = None
+        if not args.no_scan_log:
+            scanlog = ScanLog(root=args.label_dir, name=run_name)
         results = None
         if not args.no_result_log:
             results = ResultLog(root=args.result_dir, name=run_name,
@@ -2192,7 +2402,12 @@ def main():
     def _close_record():
         """Shut the current record's books, so nothing is left half written
         when the run is repointed at another sheet or folder."""
-        nonlocal saver, results
+        nonlocal saver, results, scanlog
+        if scanlog is not None:
+            scanlog.close()
+            print(f"[scanlog] {scanlog.total} line(s) over "
+                  f"{scanlog.files} file(s) in {scanlog.dir}/")
+            scanlog = None
         if journal[0] is not None:
             journal[0].close()
             journal[0] = None
@@ -3023,8 +3238,12 @@ def main():
             print(f"\n[window] UNEXPECTED code: {text}")
             print(f"[window]   belongs to {belongs}; window starts at row {head}")
             window.note_unexpected(text, belongs)
-            if saver is not None:
-                _save_crop(frame, box, text, label_dets)
+            # Not logged: this code belongs to no row in the window, so there
+            # is no row, up or column to file it under -- and it is about to
+            # stop the line, which is a louder record than a CSV line. The
+            # log is what was read AND accepted, which is what makes it
+            # readable as the job that ran.
+            _save_crop(frame, box, text, label_dets)
             _raise_fault("unexpected", text=text, belongs=belongs,
                          seen=time.time(),
                          box=box)
@@ -3055,8 +3274,16 @@ def main():
             if args.debug:
                 print(f"[window] row {row_no} {up(col)} ok "
                       f"(slot {slot})")
-            if saver is not None:
-                _save_crop(frame, box, text, label_dets)
+            # A datamatrix is not another code to check -- it is the mark
+            # between one job and the next, and the log is split on it. Which
+            # a code is comes from the row it matched, not from the decoder:
+            # the reader is handed both symbologies at once, and the sheet is
+            # what says how this row is printed.
+            _save_crop(frame, box, text, label_dets,
+                       log={"kind": DATAMATRIX if sheet.rows[row_idx].is_dm
+                            else QR,
+                            "value": text, "code_id": code_id(text),
+                            "sheet_row": row_no, "up": col, "column": col})
 
             # A code this far past the head means the coil has moved
             # on and the head row is not going to fill in on its own --
@@ -3156,15 +3383,33 @@ def main():
         full_h = heights[len(heights) // 2] * PART_OF_FULL
         return (box[2] - box[0]) >= full_w and (box[3] - box[1]) >= full_h
 
-    def _save_crop(frame, box, text, label_dets):
-        """Write the crop, or hold it until the label is all in the picture."""
+    def _log_read(fields, image):
+        """One CSV line for one accepted code, naming the picture of it."""
+        if scanlog is not None:
+            scanlog.log(image=image, **fields)
+
+    def _save_crop(frame, box, text, label_dets, log=None):
+        """Write the crop, or hold it until the label is all in the picture.
+
+        `log` is what the CSV line for this read should say. It travels with
+        the crop rather than being written the moment the code decoded,
+        because the picture is usually taken a frame or two later -- when the
+        label has come whole into view -- and a line that named a file before
+        it existed would name the wrong one whenever the crop was held back
+        or dropped. Written where the picture is written, the two always
+        agree.
+        """
         if saver is None:
+            if log:
+                _log_read(log, "")       # the read still happened
             return
         box = tuple(float(v) for v in box[:4])
         if _whole_label(box, frame, label_dets):
-            saver.save(frame, box, text, label_dets, motion[0])
+            path = saver.save(frame, box, text, label_dets, motion[0])
+            if log:
+                _log_read(log, os.path.basename(path) if path else "")
             return
-        pending_crops.append({"box": box, "text": text, "seen": 0})
+        pending_crops.append({"box": box, "text": text, "seen": 0, "log": log})
 
     def _flush_crops(frame, label_dets):
         """Take the crops that have been waiting, off this frame if it will
@@ -3182,13 +3427,23 @@ def main():
                     best, score = other, lap
             item["seen"] += 1
             if best is None:
+                if item.get("log"):
+                    _log_read(item["log"], "(no crop)")
                 continue                 # gone from the picture; let it go
             if _whole_label(best, frame, label_dets):
-                saver.save(frame, best, item["text"], label_dets, motion[0])
+                path = saver.save(frame, best, item["text"], label_dets,
+                                  motion[0])
+                if item.get("log"):
+                    _log_read(item["log"],
+                              os.path.basename(path) if path else "")
                 continue
             item["box"] = best           # follow it while it is still here
             if item["seen"] < CROP_PATIENCE:
                 keep.append(item)
+            elif item.get("log"):
+                # Never came whole into the picture. The code was read and
+                # belongs in the record; there is simply no photograph of it.
+                _log_read(item["log"], "(no crop)")
         pending_crops[:] = keep
 
     def _clear_look(box, frame, full):
@@ -3784,6 +4039,8 @@ def main():
                 set_direction(arg)
             elif name == "ups":
                 set_ups(arg)
+            elif name == "upsmap":
+                set_ups_map(arg)
             elif name == "camera":
                 _set_camera(arg)
             elif name == "debug":
@@ -4027,6 +4284,23 @@ def main():
             return f"web {'right' if dx > 0 else 'left'} {abs(dx):.0f} px/frame"
         return f"web {'down' if dy > 0 else 'up'} {abs(dy):.0f} px/frame"
 
+    def _last_scanned():
+        """The last code accepted, for the console's LAST SCANNED panel."""
+        if scanlog is not None and scanlog.last:
+            row = scanlog.last
+            return {"name": row["id"] or row["value"],
+                    "value": row["value"],
+                    "kind": row["kind"],
+                    "row": row["sheet_row"],
+                    "up": row["up"],
+                    "file": row["file"],
+                    # The time as the log wrote it, so the two always read
+                    # the same. `at` stays for the saver's fallback below.
+                    "when": row["time"][11:19]}
+        if saver is not None and saver.last:
+            return {"name": saver.last[0], "at": saver.last[1]}
+        return None
+
     def _status_line():
         if not loaded():
             return f"no sheet loaded\n{_web_line()}"
@@ -4120,6 +4394,11 @@ def main():
             # sheet's to say.
             "ups": {"count": per_row or 0,
                     "checked": sorted(checked) if checked is not None
+                    else list(range(per_row or 0)),
+                    # Straight through is sent as the explicit list rather
+                    # than as nothing, so the console never has to know what
+                    # the default is to draw the selectors.
+                    "map": list(colmap) if colmap
                     else list(range(per_row or 0))},
             # What the sliders behind 's' are built from: the camera's own
             # limits, and where it is set now.
@@ -4141,8 +4420,11 @@ def main():
             # The last crop on disk, named and timed. At startup this is
             # whatever an earlier run left in the sheet's folder, so the
             # console opens saying where the roll got to rather than blank.
-            "last_saved": ({"name": saver.last[0], "at": saver.last[1]}
-                           if saver is not None and saver.last else None),
+            # Read out of the log rather than off the crop saver, so what
+            # the screen says and what the record says cannot disagree --
+            # and so the line still fills in on a run with the images turned
+            # off. The saver is the fallback for --no-scan-log.
+            "last_saved": _last_scanned(),
             "fps": fps_state[1], "dets": len(dets),
             "status": _status_line(),
             "window_view": render_window_view() if show_debug[0] else None,
@@ -4301,6 +4583,10 @@ def main():
         else:
             print("[ui] waiting for a sheet — LOAD SHEET, or OPEN RECENT "
                   "SHEET for one that has been run before")
+        if args.auto_start and loaded():
+            print("[source] --auto-start: starting as if START had been "
+                  "pressed")
+            start_machine("auto-start (recording)")
         if qt_window is not None:
             _loop_qt()
         else:

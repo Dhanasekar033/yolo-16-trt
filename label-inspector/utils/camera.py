@@ -61,8 +61,12 @@ class CameraControls:
     does not leave the console holding a dead descriptor.
     """
 
-    def __init__(self, device="/dev/video0", limits=None):
+    def __init__(self, device="/dev/video0", limits=None, enabled=True):
         self.device = device
+        # Off when the frames are coming from a recording: there is no device
+        # behind them, and probing one would print a warning about a camera
+        # nobody asked for.
+        self.enabled = enabled
         # What the console may offer, narrower than what the device allows.
         # A camera's full exposure range runs far past anything usable on a
         # moving web -- see config.json's camera.limits.
@@ -70,10 +74,13 @@ class CameraControls:
         self.ranges = {}         # name -> {min, max, step, default}
         self._fd = None
         self._warned = False
-        self.probe()
+        if enabled:
+            self.probe()
 
     # ── the device ───────────────────────────────────────────────────────
     def _open(self):
+        if not self.enabled:
+            return None
         if self._fd is not None:
             return self._fd
         try:

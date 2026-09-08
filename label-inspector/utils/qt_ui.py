@@ -331,6 +331,90 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
         return QtCore.QSize(int(150 * self._k), int(44 * self._k))
 
 
+class ColumnBox(QtWidgets.QComboBox):
+    """A drop-down that looks like a drop-down.
+
+    Qt draws a combo's arrow from the widget style, and under this dark
+    stylesheet what arrives is a dark arrow on a dark field -- so the
+    selector reads as a label with a column name written in it, and nobody
+    presses it. Painting the chevron here rather than styling it keeps the
+    app one file with no image to ship, and lets it follow the text: the
+    same grey as the caption, dimmer while the line is running and the
+    selector is locked.
+
+    The chevron is drawn over the styled frame rather than instead of it, so
+    the background, border and text all stay in the stylesheet with
+    everything else.
+    """
+
+    def __init__(self, parent=None, scale=1.0):
+        super().__init__(parent)
+        self._k = scale
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(int(32 * scale))
+        # The popup is a top-level window in its own right, not a child of
+        # this widget, so `QComboBox QAbstractItemView` in the main
+        # stylesheet never reaches it: the list came up in the stock palette
+        # with the column already in force unmarked, which is the one thing
+        # somebody opening it needs to see. Styling the view itself is what
+        # makes the rules land.
+        view = QtWidgets.QListView()
+        view.setStyleSheet(f"""
+            QListView {{ background: {PANEL}; color: {TEXT};
+                         border: 1px solid {LINE}; outline: 0;
+                         padding: {int(2 * scale)}px;
+                         font-size: {int(11 * scale)}px;
+                         font-weight: 600; }}
+            QListView::item {{ min-height: {int(26 * scale)}px;
+                               padding: 0 {int(8 * scale)}px;
+                               border-radius: {int(3 * scale)}px; }}
+            QListView::item:hover {{ background: #3a332c; }}
+            QListView::item:selected {{ background: {ACCENT};
+                                        color: #12100e; }}
+        """)
+        self.setView(view)
+        # A combo ships with a delegate that measures rows its own way and
+        # ignores what the stylesheet asks for, which draws the list with its
+        # rows overlapping and the text clipped. The standard delegate takes
+        # the metrics from the sheet, so the rows come out the height they
+        # were asked to be.
+        self.setItemDelegate(QtWidgets.QStyledItemDelegate(self))
+        self._row_h = int(28 * scale)
+
+    def addItems(self, texts):
+        """Add the columns, and say how tall a row is while doing it.
+
+        The popup sizes itself from the model, not from the stylesheet, so a
+        row height asked for in QSS alone leaves the list the height Qt would
+        have made it anyway -- with the rows drawn taller than the space they
+        were given and every line of text overlapping the next. The size hint
+        is the part the popup actually reads.
+        """
+        super().addItems(texts)
+        for i in range(self.count()):
+            self.setItemData(i, QtCore.QSize(0, self._row_h),
+                             Qt.SizeHintRole)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        colour = QtGui.QColor(MUTED if self.isEnabled() else "#5a534b")
+        pen = QtGui.QPen(colour, max(1.6, 1.8 * self._k))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        arm = max(3.5, 4.0 * self._k)
+        cx = self.width() - max(12.0, 13.0 * self._k)
+        cy = self.height() / 2.0
+        path = QtGui.QPainterPath()
+        path.moveTo(cx - arm, cy - arm / 2.0)
+        path.lineTo(cx, cy + arm / 2.0)
+        path.lineTo(cx + arm, cy - arm / 2.0)
+        p.drawPath(path)
+        p.end()
+
+
 class CameraDialog(QtWidgets.QDialog):
     """Exposure, gain and brightness, over the live picture.
 
@@ -528,6 +612,9 @@ class InspectorWindow(QtWidgets.QMainWindow):
         # their own toggled signal does not bounce that straight back at the
         # machine as though the operator had clicked it.
         self._ups_setting = False
+        # What each up was pointing at before the current click, so a
+        # duplicate can be swapped back into the column this one just left.
+        self._ups_map = {}
         # Not None: None is a real value here -- it is what a folder with
         # nothing in it reports -- and starting on it would skip the first
         # update and leave the card sitting on its placeholder.
@@ -626,6 +713,35 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                             border-color: {OK}; }}
             QCheckBox::indicator:disabled {{ background: #262019;
                                              border-color: #3a332c; }}
+            /* A locked tick is still a tick. Qt takes the LAST matching rule
+               of equal specificity, so without this one the :disabled fill
+               above paints over :checked and every up reads as switched off
+               the moment the machine starts -- which is exactly when the
+               operator looks at them. Dimmed, not grey: it says "on, and not
+               yours to change while the line runs". */
+            QCheckBox::indicator:checked:disabled {{ background: #2d6b41;
+                                                     border-color: #2d6b41; }}
+            /* Right padding leaves the gutter the chevron is painted in;
+               the lighter fill and the border are what separate a control
+               that can be pressed from the captions around it. */
+            QComboBox {{ background: {PANEL}; color: {TEXT};
+                         border: 1px solid {LINE};
+                         border-radius: {int(4 * k)}px;
+                         padding: {int(4 * k)}px {int(24 * k)}px
+                                  {int(4 * k)}px {int(8 * k)}px;
+                         font-size: {int(11 * k)}px; font-weight: 600; }}
+            QComboBox:hover {{ border-color: {ACCENT}; }}
+            QComboBox:on {{ border-color: {ACCENT}; background: #3a332c; }}
+            QComboBox:disabled {{ color: #6d757d; background: #201b17;
+                                  border-color: #3a332c; }}
+            /* The native button is turned off entirely: it paints a raised
+               square on some styles and nothing at all on others, and the
+               chevron is drawn by the widget either way. */
+            QComboBox::drop-down {{ border: 0; width: 0; }}
+            QComboBox::down-arrow {{ image: none; width: 0; height: 0; }}
+            /* The open list is styled on the view itself, in ColumnBox --
+               a popup is a window of its own and a descendant selector from
+               here does not reach it. */
             QGroupBox {{ border: 1px solid {LINE}; border-radius: {int(6 * k)}px;
                          margin-top: {int(10 * k)}px;
                          font-size: {int(11 * k)}px; color: {MUTED}; }}
@@ -730,16 +846,56 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.setContentsMargins(14, 14, 14, 14)
         col.setSpacing(0)
 
+        # The fault text is the only thing here that comes and goes, so it is
+        # a block of its own: the column itself stays, because the controls
+        # under it are the ones somebody reaches for with a hand already on
+        # the machine, and a control that moves when a fault appears is a
+        # control that gets pressed by mistake.
+        self.fault_block = QtWidgets.QWidget()
+        fault_col = QtWidgets.QVBoxLayout(self.fault_block)
+        fault_col.setContentsMargins(0, 0, 0, 0)
+        fault_col.setSpacing(0)
         self.fault_head = QtWidgets.QLabel("", objectName="faulthead")
         self.fault_head.setWordWrap(True)
         self.fault_body = QtWidgets.QLabel("", objectName="faultbody")
         self.fault_body.setWordWrap(True)
         self.fault_body.setTextFormat(Qt.RichText)
         self.fault_body.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        col.addWidget(self.fault_head)
-        col.addWidget(self.fault_body)
+        fault_col.addWidget(self.fault_head)
+        fault_col.addWidget(self.fault_body)
+        col.addWidget(self.fault_block)
+        self.fault_block.hide()
+
         col.addStretch(1)
-        self.left.hide()
+
+        # The whole picture, as the camera saw it, whenever somebody wants
+        # one: the frame worth keeping is the one on the screen when
+        # something looks wrong, so unlike the folder buttons opposite this
+        # one is live while the line runs.
+        self.capture_btn = QtWidgets.QPushButton("CAPTURE FRAME",
+                                                 objectName="secondary")
+        self.capture_dir_btn = QtWidgets.QPushButton("CAPTURE FOLDER",
+                                                     objectName="secondary")
+        self.capture_btn.clicked.connect(
+            lambda: self.command.emit("capture", None))
+        self.capture_dir_btn.clicked.connect(self._choose_capture_dir)
+        col.addWidget(self.capture_btn)
+        col.addSpacing(6)
+        col.addWidget(self.capture_dir_btn)
+
+        # The winder at the very bottom of the column, on its own under a
+        # rule. It is the one switch on this screen that moves the machine
+        # rather than the software, and it is thrown all shift -- so it sits
+        # where a hand falls, apart from anything it could be confused with.
+        col.addSpacing(12)
+        col.addWidget(self._rule())
+        col.addSpacing(8)
+        col.addWidget(QtWidgets.QLabel("WINDER", objectName="caption"))
+        self.winder_btn = ToggleSwitch("MANUAL", "AUTO", scale=self._k,
+                                       on_colour=OK, off_colour=WARN)
+        self.winder_btn.clicked.connect(
+            lambda on: self.command.emit("winder", bool(on)))
+        col.addWidget(self.winder_btn)
         return self.left
 
     def _sidebar(self):
@@ -748,9 +904,10 @@ class InspectorWindow(QtWidgets.QMainWindow):
 
         There is more in this column than a short screen has room for, and a
         panel PC is short -- so everything below the buttons sits in a
-        scroll area rather than running off the bottom of the glass. START,
-        STOP and CAPTURE FRAME never scroll: whatever else is on the screen,
-        those have to be under the operator's hand.
+        scroll area rather than running off the bottom of the glass. START
+        and STOP never scroll: whatever else is on the screen, those have to
+        be under the operator's hand. CAPTURE FRAME, CAPTURE FOLDER and the
+        winder switch are in the left column, which never scrolls at all.
         """
         side = QtWidgets.QWidget()
         side.setFixedWidth(self._side_w)
@@ -778,28 +935,15 @@ class InspectorWindow(QtWidgets.QMainWindow):
                                                 objectName="secondary")
         self.out_btn = QtWidgets.QPushButton("LABEL FOLDER",
                                              objectName="secondary")
-        # The whole picture, as the camera saw it, whenever somebody wants
-        # one: the frame worth keeping is the one on the screen when
-        # something looks wrong, so unlike the two folder buttons this one
-        # is live while the line runs.
-        self.capture_btn = QtWidgets.QPushButton("CAPTURE FRAME",
-                                                 objectName="secondary")
-        self.capture_dir_btn = QtWidgets.QPushButton("CAPTURE FOLDER",
-                                                     objectName="secondary")
         self.start_btn.clicked.connect(lambda: self.command.emit("start", None))
         self.stop_btn.clicked.connect(lambda: self.command.emit("stop", None))
         self.sheet_btn.clicked.connect(self._choose_sheet)
         self.recent_btn.clicked.connect(self._open_recent)
         self.out_btn.clicked.connect(self._choose_output)
-        self.capture_btn.clicked.connect(
-            lambda: self.command.emit("capture", None))
-        self.capture_dir_btn.clicked.connect(self._choose_capture_dir)
         for b in (self.start_btn, self.stop_btn):
             b.setFixedHeight(int(58 * self._k))
         acts.addWidget(self.start_btn)
         acts.addWidget(self.stop_btn)
-        acts.addSpacing(6)
-        acts.addWidget(self.capture_btn)
         acts.addSpacing(6)
         acts.addWidget(self._rule())
         outer.addWidget(pinned)
@@ -807,7 +951,6 @@ class InspectorWindow(QtWidgets.QMainWindow):
         col.addWidget(self.sheet_btn)
         col.addWidget(self.recent_btn)
         col.addWidget(self.out_btn)
-        col.addWidget(self.capture_dir_btn)
 
         self.run_box = QtWidgets.QGroupBox("RUN")
         run_col = QtWidgets.QVBoxLayout(self.run_box)
@@ -888,6 +1031,9 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.last_name = QtWidgets.QLabel("—", objectName="value")
         self.last_name.setWordWrap(True)
         self.last_time = QtWidgets.QLabel("", objectName="meta")
+        # Wrapped: the line now carries the row, the up and the log file, and
+        # a panel PC's sidebar is narrower than all three end to end.
+        self.last_time.setWordWrap(True)
         last.addWidget(self.last_name)
         last.addWidget(self.last_time)
         col.addWidget(self.last_box)
@@ -905,8 +1051,18 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.ups_grid.setContentsMargins(10, 6, 10, 8)
         self.ups_grid.setVerticalSpacing(2)
         self.ups_boxes = []
+        self.ups_combos = []
+        # The mapping written out in words under the selectors. Two ways of
+        # saying the same thing on purpose: the selectors are how it is set,
+        # this is how it is read back at a glance from across the machine --
+        # and it is the line somebody photographs when they want to record
+        # how the job was set up.
+        self.ups_summary = QtWidgets.QLabel("", objectName="meta")
+        self.ups_summary.setWordWrap(True)
         col.addWidget(self.ups_box)
+        col.addWidget(self.ups_summary)
         self.ups_box.hide()
+        self.ups_summary.hide()
         col.addSpacing(10)
 
         col.addWidget(QtWidgets.QLabel("CHECK DIRECTION IN EXCEL",
@@ -916,14 +1072,6 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self.dir_switch.clicked.connect(
             lambda on: self.command.emit("direction", bool(on)))
         col.addWidget(self.dir_switch)
-
-        col.addSpacing(10)
-        col.addWidget(QtWidgets.QLabel("WINDER", objectName="caption"))
-        self.winder_btn = ToggleSwitch("MANUAL", "AUTO", scale=self._k,
-                                       on_colour=OK, off_colour=WARN)
-        self.winder_btn.clicked.connect(
-            lambda on: self.command.emit("winder", bool(on)))
-        col.addWidget(self.winder_btn)
 
         self.side_scroll = scroll = QtWidgets.QScrollArea(
             objectName="sidescroll")
@@ -1003,29 +1151,81 @@ class InspectorWindow(QtWidgets.QMainWindow):
         return menu
 
     def _build_ups(self, count):
-        """One tick box per up the sheet has, two to a line.
+        """One row per up the sheet has: the tick box, and the sheet column
+        that up is checked against.
 
         Rebuilt rather than hidden and shown, because how many there are is
         a property of the sheet that is loaded and a sheet can be swapped
         for a wider or narrower one without the console restarting.
+
+        A row rather than two boxes to a line, which is what this was before
+        the selector arrived: an up and the column it answers to have to be
+        readable as one thing, and side by side they are.
         """
-        while self.ups_boxes:
-            box = self.ups_boxes.pop()
-            self.ups_grid.removeWidget(box)
-            box.setParent(None)
-            box.deleteLater()
+        for widget in self.ups_boxes + self.ups_combos:
+            self.ups_grid.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self.ups_boxes, self.ups_combos = [], []
         for i in range(count):
             box = QtWidgets.QCheckBox(f"UP{i + 1}")
             box.setChecked(True)
             box.setEnabled(self._configurable is not False)
             box.toggled.connect(self._ups_changed)
-            self.ups_grid.addWidget(box, i // 2, i % 2)
+            self.ups_grid.addWidget(box, i, 0)
             self.ups_boxes.append(box)
+
+            combo = ColumnBox(scale=self._k)
+            combo.addItems([f"QR DATA{c + 1}" for c in range(count)])
+            combo.setCurrentIndex(i)
+            combo.setEnabled(self._configurable is not False)
+            combo.currentIndexChanged.connect(
+                lambda _idx, up=i: self._map_changed(up))
+            self.ups_grid.addWidget(combo, i, 1)
+            self.ups_combos.append(combo)
+        self.ups_grid.setColumnStretch(1, 1)
         self.ups_box.setVisible(bool(count))
+        self.ups_summary.setVisible(bool(count))
+        self._say_map()
+
+    def _map_changed(self, up):
+        """One up was pointed at a different column.
+
+        The column it has just taken is given up by whoever held it, so the
+        mapping is always a permutation and never has two ups reading the
+        same cell -- there is one label at each position on the web, and a
+        mapping that says otherwise is one nobody meant to make. Swapping
+        also means the operator can never be left half way through setting
+        one up, with a state the machine would refuse.
+        """
+        if self._ups_setting:
+            return                  # a snapshot being written in, not a click
+        want = self.ups_combos[up].currentIndex()
+        self._ups_setting = True
+        for other, combo in enumerate(self.ups_combos):
+            if other != up and combo.currentIndex() == want:
+                combo.setCurrentIndex(self._ups_map.get(up, up))
+                break
+        self._ups_map = {i: c.currentIndex()
+                         for i, c in enumerate(self.ups_combos)}
+        self._ups_setting = False
+        self._say_map()
+        self.command.emit("upsmap", [c.currentIndex()
+                                     for c in self.ups_combos])
+
+    def _say_map(self):
+        """The mapping as one line of text, with the ups that are off named."""
+        parts = []
+        for i, combo in enumerate(self.ups_combos):
+            on = self.ups_boxes[i].isChecked() if i < len(self.ups_boxes) else True
+            parts.append(f"UP{i + 1}\u2192C{combo.currentIndex() + 1}"
+                         + ("" if on else " off"))
+        self.ups_summary.setText("  ".join(parts))
 
     def _ups_changed(self):
         if self._ups_setting:
             return                  # a snapshot being written in, not a click
+        self._say_map()
         wanted = [i for i, b in enumerate(self.ups_boxes) if b.isChecked()]
         if not wanted:
             # Checking no ups at all checks nothing, and a run that checks
@@ -1201,8 +1401,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
         banner = snap.get("banner") or ""
         lines = snap.get("lines") or ()
         if not banner and not lines:
-            if self.left.isVisible():
-                self.left.hide()
+            if self.fault_block.isVisible():
+                self.fault_block.hide()
             self._fault_text = None
             return
 
@@ -1214,8 +1414,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
         self._fault_text = (banner, body)
         self.fault_head.setText(banner)
         self.fault_body.setText(body)
-        if not self.left.isVisible():
-            self.left.show()
+        if not self.fault_block.isVisible():
+            self.fault_block.show()
 
     def _apply(self, snap):
         self.video.set_snapshot(snap)
@@ -1263,15 +1463,32 @@ class InspectorWindow(QtWidgets.QMainWindow):
                 self.last_name.setText("—")
                 self.last_time.setText("nothing saved yet")
             else:
-                # The stamp is already in the name and is shown on its own
-                # line below, so what is left is the payload the crop was
-                # filed under -- which is the part the operator reads.
+                # The id the code was filed under -- the part the operator
+                # reads and the part the crop is named after.
                 name = os.path.splitext(last.get("name") or "")[0]
                 self.last_name.setText(_strip_stamp(name) or name)
-                when = last.get("at")
-                self.last_time.setText(
-                    time.strftime("%H:%M:%S", time.localtime(when))
-                    if when else "")
+                # Where it belongs and which log file it went into, under
+                # the id. A code on its own says what was read; the row and
+                # the up say where it was, which is what somebody standing
+                # at the machine is actually asking.
+                where = " · ".join(
+                    str(bit) for bit in
+                    (last.get("when"),
+                     f"row {last['row']}" if last.get("row") not in (None, "")
+                     else None,
+                     last.get("up"),
+                     "DATAMATRIX" if last.get("kind") == "datamatrix" else None,
+                     last.get("file"))
+                    if bit)
+                if where:
+                    self.last_time.setText(where)
+                else:
+                    # No log running (--no-scan-log): fall back to the crop
+                    # saver, which knows only when it wrote the file.
+                    when = last.get("at")
+                    self.last_time.setText(
+                        time.strftime("%H:%M:%S", time.localtime(when))
+                        if when else "")
 
         # The ups the machine is checking. Compared against the boxes
         # themselves rather than against the last snapshot: a tick the
@@ -1289,6 +1506,18 @@ class InspectorWindow(QtWidgets.QMainWindow):
             for i, box in enumerate(self.ups_boxes):
                 box.setChecked(i in on)
             self._ups_setting = False
+            self._say_map()
+
+        colmap = list(ups.get("map") or range(len(self.ups_combos)))
+        if colmap != [c.currentIndex() for c in self.ups_combos]:
+            self._ups_setting = True
+            for i, combo in enumerate(self.ups_combos):
+                if i < len(colmap):
+                    combo.setCurrentIndex(colmap[i])
+            self._ups_map = {i: c.currentIndex()
+                             for i, c in enumerate(self.ups_combos)}
+            self._ups_setting = False
+            self._say_map()
 
         reverse = bool(snap.get("reverse", False))
         if reverse != self._reverse:
@@ -1303,8 +1532,8 @@ class InspectorWindow(QtWidgets.QMainWindow):
             self.recent_btn.setEnabled(configurable)
             self.out_btn.setEnabled(configurable)
             self.dir_switch.setEnabled(configurable)
-            for box in self.ups_boxes:
-                box.setEnabled(configurable)
+            for widget in self.ups_boxes + self.ups_combos:
+                widget.setEnabled(configurable)
 
         self._sheet_dir = snap.get("sheet_dir", "")
         self._out_dir = snap.get("labeldir", "")

@@ -60,6 +60,10 @@ class Settings:
         # there, and the operator would have to tick that up off again
         # every morning.
         self.ups = None
+        # Which sheet column each up is checked against, as column numbers in
+        # up order. None is straight through, which is what a fresh install
+        # starts on and what nearly every sheet wants.
+        self.ups_map = None
         self._recent = []
         self._warned = False
         self._load()
@@ -92,6 +96,11 @@ class Settings:
         scan = data.get("scan")
         if isinstance(scan, dict):
             self.scan = scan
+        ups_map = data.get("ups_map")
+        if isinstance(ups_map, list):
+            cols = [int(n) for n in ups_map
+                    if isinstance(n, (int, float)) and int(n) >= 1]
+            self.ups_map = cols if len(set(cols)) == len(cols) and cols else None
         ups = data.get("ups")
         if isinstance(ups, list):
             wanted = sorted({int(n) for n in ups
@@ -183,10 +192,26 @@ class Settings:
         self.ups = wanted
         self._save()
 
+    def remember_ups_map(self, numbers):
+        """Which column each up was left pointing at, as column numbers.
+
+        Straight through is written as null: it is the default, and a file
+        that spells it out would freeze today's number of ups into a setting
+        that is meant to follow the sheet.
+        """
+        wanted = [int(n) for n in numbers] if numbers else None
+        if wanted and wanted == list(range(1, len(wanted) + 1)):
+            wanted = None
+        if wanted == self.ups_map:
+            return
+        self.ups_map = wanted
+        self._save()
+
     def _save(self):
         data = {"label_dir": self.label_dir,
                 "capture_dir": self.capture_dir, "recent": self._recent,
-                "camera": self.camera, "scan": self.scan, "ups": self.ups}
+                "camera": self.camera, "scan": self.scan, "ups": self.ups,
+                "ups_map": self.ups_map}
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"
