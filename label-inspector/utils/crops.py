@@ -280,7 +280,7 @@ class LabelSaver:
                 min(int(y2) + pad["down"], h))
 
     def save(self, frame, box, text, neighbours=(), motion=(0.0, 0.0),
-             exact=False):
+             exact=False, up=None):
         """Crop `box` out of `frame` and write it. Returns the path, or None
         if the box was degenerate.
 
@@ -288,6 +288,12 @@ class LabelSaver:
         what the crop measures its own margins from. `motion` is how far the
         web moved since the last frame, in pixels, which is what decides how
         much of the trailing edge to reach back for.
+
+        `up` is which position across the web this label was printed at,
+        0-based, and it goes into the file name. Optional: a code that
+        belongs to no row of the window -- an unexpected label, or one read
+        before the window anchored -- has no up to name, and a number
+        guessed for it would be a claim the app cannot stand behind.
 
         `exact` takes the box as it stands, clipped to the picture and
         nothing else. That is for a crop measured out from the code itself
@@ -317,7 +323,16 @@ class LabelSaver:
         # <this code> look like -- into a question about which copy to open.
         # The file is the code, and the picture in it is the last look the
         # camera had.
-        path = os.path.join(self.dir, f"{code_id(text)}.{self.ext}")
+        #
+        # The up goes in the name because the code alone does not say where
+        # across the web the label was printed, and that is the first thing
+        # asked of a folder of them: a die position printing badly shows up
+        # as a run of poor crops all carrying the same _upN, which a folder
+        # named only by code cannot be sorted or globbed to show.
+        name = code_id(text)
+        if up is not None:
+            name = f"{name}_up{int(up) + 1}"
+        path = os.path.join(self.dir, f"{name}.{self.ext}")
         fresh = not os.path.exists(path)
 
         if not cv2.imwrite(path, frame[y1:y2, x1:x2], self.params):

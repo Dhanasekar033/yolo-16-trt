@@ -3579,11 +3579,18 @@ def main():
             # a code is comes from the row it matched, not from the decoder:
             # the reader is handed both symbologies at once, and the sheet is
             # what says how this row is printed.
-            _save_crop(frame, box, text, label_dets,
+            # The up is the position across the web, which is not the
+            # same as the sheet column whenever the operator has mapped the
+            # two. It names the crop and it fills the log's own up field --
+            # a field that was always meant to hold this and was being
+            # handed the column instead.
+            up_no = up_for_column(col)
+            _save_crop(frame, box, text, label_dets, up=up_no,
                        log={"kind": DATAMATRIX if sheet.rows[row_idx].is_dm
                             else QR,
                             "value": text, "code_id": code_id(text),
-                            "sheet_row": row_no, "up": col, "column": col,
+                            "sheet_row": row_no, "up": up_no,
+                            "column": col,
                             "camera": (f"cam{cam_now[0].tag}"
                                        if cam_now[0] else "")})
 
@@ -3685,12 +3692,30 @@ def main():
         full_h = heights[len(heights) // 2] * PART_OF_FULL
         return (box[2] - box[0]) >= full_w and (box[3] - box[1]) >= full_h
 
+    def up_for_column(col):
+        """Which up on the machine printed a label belonging to sheet column
+        `col`. 0-based, like everything else that counts positions here.
+
+        Straight through unless the operator has mapped the ups to columns,
+        in which case the map is read backwards: it is written as "the
+        column UP1 is held against", and this asks the opposite question.
+        Naming a crop by its column instead would put the wrong number on
+        every file the moment a mapping is in force -- which is exactly the
+        rig where knowing the up matters most.
+        """
+        if colmap:
+            try:
+                return colmap.index(col)
+            except ValueError:
+                pass
+        return col
+
     def _log_read(fields, image):
         """One CSV line for one accepted code, naming the picture of it."""
         if scanlog is not None:
             scanlog.log(image=image, **fields)
 
-    def _save_crop(frame, box, text, label_dets, log=None):
+    def _save_crop(frame, box, text, label_dets, log=None, up=None):
         """Write the crop, or hold it until the label is all in the picture.
 
         `log` is what the CSV line for this read should say. It travels with
@@ -3707,11 +3732,13 @@ def main():
             return
         box = tuple(float(v) for v in box[:4])
         if _whole_label(box, frame, label_dets):
-            path = saver.save(frame, box, text, label_dets, motion[0])
+            path = saver.save(frame, box, text, label_dets, motion[0],
+                              up=up)
             if log:
                 _log_read(log, os.path.basename(path) if path else "")
             return
-        pending_crops.append({"box": box, "text": text, "seen": 0, "log": log})
+        pending_crops.append({"box": box, "text": text, "seen": 0,
+                              "log": log, "up": up})
 
     def _flush_crops(frame, label_dets):
         """Take the crops that have been waiting, off this frame if it will
@@ -3734,7 +3761,7 @@ def main():
                 continue                 # gone from the picture; let it go
             if _whole_label(best, frame, label_dets):
                 path = saver.save(frame, best, item["text"], label_dets,
-                                  motion[0])
+                                  motion[0], up=item.get("up"))
                 if item.get("log"):
                     _log_read(item["log"],
                               os.path.basename(path) if path else "")
